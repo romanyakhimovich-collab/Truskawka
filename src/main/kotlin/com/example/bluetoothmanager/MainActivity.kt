@@ -1,0 +1,1331 @@
+package com.example.bluetoothmanager
+
+import android.Manifest
+import android.app.Activity
+import android.app.Dialog
+import android.bluetooth.BluetoothManager
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.ImageDecoder
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.PorterDuff
+import android.graphics.RectF
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.provider.MediaStore
+import android.provider.Settings
+import android.provider.OpenableColumns
+import android.text.Editable
+import android.text.InputFilter
+import android.text.InputType
+import android.text.TextWatcher
+import android.view.Gravity
+import android.view.KeyEvent
+import android.view.View
+import android.view.ViewGroup
+import android.view.Window
+import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
+import android.widget.BaseAdapter
+import android.widget.EditText
+import android.widget.ImageView
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ListView
+import android.widget.TextView
+import android.widget.Toast
+import mesh.SendResult
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.util.UUID
+import kotlin.concurrent.thread
+
+class MainActivity : Activity() {
+    private var meshService: MeshNetworkService? = null
+    private var serviceBound = false
+    private var selectedRecipientId: UUID? = null
+    private var selectedRecipientLabel: String = "everyone"
+    private var savedMessagesSelected = false
+    private var normalizingNickname = false
+    private var currentNickname = "@jachimowicz"
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val messages = mutableListOf(
+        ChatMessage("system", "offline mesh ready", false),
+        ChatMessage("@relay", "waiting for nearby nodes", false)
+    )
+    private val meshMessages = messages.toMutableList()
+    private val savedMessages = mutableListOf<ChatMessage>()
+    private lateinit var chatAdapter: ChatAdapter
+
+    private lateinit var usernameField: EditText
+    private lateinit var statusGroup: LinearLayout
+    private lateinit var counterView: TextView
+    private lateinit var chatTitleView: TextView
+    private lateinit var chatList: ListView
+    private lateinit var transferStatusView: TextView
+    private lateinit var messageInput: EditText
+    private lateinit var actionButton: TextView
+
+    private val logListener: (String) -> Unit = { line ->
+        runOnUiThread {
+            if (line.startsWith("image from ")) {
+                addReceivedImage(line)
+            } else if (line.startsWith("image progress:")) {
+                updateImageProgress(line.substringAfter("image progress:").trim())
+            } else if (!line.isScanNoise()) {
+                addMessage("mesh", line, false)
+            }
+            refreshHeader()
+        }
+    }
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            meshService = (service as MeshNetworkService.LocalBinder).service()
+            meshService?.addLogListener(logListener)
+            currentNickname = meshService?.getNickname()?.take(MAX_NICKNAME_LENGTH) ?: "@jachimowicz"
+            usernameField.setText(currentNickname)
+            refreshHeader()
+            addMessage("system", "service connected", false)
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            meshService?.removeLogListener(logListener)
+            meshService = null
+            serviceBound = false
+            addMessage("system", "mesh service disconnected", false)
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        loadSavedMessages()
+        buildUi()
+
+        if (hasRequiredPermissions()) {
+            startAppAfterPermissions()
+        } else {
+            requestMissingPermissions()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (hasRequiredPermissions() && !serviceBound) {
+            startAppAfterPermissions()
+        }
+    }
+
+    override fun onDestroy() {
+        meshService?.removeLogListener(logListener)
+        if (serviceBound) {
+            unbindService(connection)
+            serviceBound = false
+        }
+        super.onDestroy()
+    }
+
+    private fun buildUi() {
+        window.statusBarColor = CREAM_BACKGROUND
+        window.navigationBarColor = CREAM_BACKGROUND
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(44), dp(12), dp(8))
+            setBackgroundColor(CREAM_BACKGROUND)
+        }
+
+        root.addView(buildHeader())
+
+        chatAdapter = ChatAdapter(messages)
+        chatList = ListView(this).apply {
+            divider = null
+            cacheColorHint = Color.TRANSPARENT
+            setBackgroundColor(CREAM_BACKGROUND)
+            setSelector(android.R.color.transparent)
+            transcriptMode = ListView.TRANSCRIPT_MODE_ALWAYS_SCROLL
+            isStackFromBottom = false
+            adapter = chatAdapter
+        }
+        root.addView(chatList, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            0,
+            1f
+        ))
+
+        transferStatusView = buildTransferStatus()
+        root.addView(transferStatusView)
+
+        val inputBar = buildInputBar()
+        root.addView(inputBar)
+        applySafeArea(root, inputBar)
+        setContentView(root)
+    }
+
+    private fun buildHeader(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, dp(10))
+
+            val topRow = FrameLayout(this@MainActivity)
+            val leftGroup = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+
+                addView(ImageView(this@MainActivity).apply {
+                    setImageResource(R.drawable.truskawka_logo)
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    background = roundedDrawable(Color.WHITE, dp(8), PINK_SHADOW_STROKE)
+                    clipToOutline = false
+                    setPadding(dp(2), dp(2), dp(2), dp(2))
+                }, LinearLayout.LayoutParams(dp(30), dp(30)).apply {
+                    marginEnd = dp(8)
+                })
+
+                addView(terminalText("Truskawka/").apply {
+                    textSize = 18f
+                    setTextColor(STRAWBERRY_RED)
+                    setPadding(0, dp(6), dp(4), dp(6))
+                    setOnClickListener {
+                        addMessage("system", "chat list placeholder", false)
+                    }
+                })
+
+                usernameField = EditText(this@MainActivity).apply {
+                    setText("@jachimowicz")
+                    setSingleLine(true)
+                    typeface = Typeface.MONOSPACE
+                    textSize = 16f
+                    setTextColor(BERRY_TEXT)
+                    setHintTextColor(BERRY_TEXT_DIM)
+                    setBackgroundColor(Color.TRANSPARENT)
+                    inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                    filters = arrayOf(InputFilter.LengthFilter(MAX_NICKNAME_LENGTH))
+                    minWidth = dp(118)
+                    setPadding(0, 0, dp(4), 0)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        textCursorDrawable = cursorDrawable()
+                    }
+                    setOnFocusChangeListener { _, hasFocus ->
+                        if (!hasFocus) saveUsername()
+                    }
+                    setOnEditorActionListener { _, _, event ->
+                        if (event == null || event.keyCode == KeyEvent.KEYCODE_ENTER) {
+                            saveUsername()
+                            clearFocus()
+                            hideKeyboard()
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    setOnClickListener {
+                        requestFocus()
+                        setSelection(text.length.coerceAtLeast(1))
+                        showKeyboard(this)
+                    }
+                    addTextChangedListener(object : TextWatcher {
+                        override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                        override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+                        override fun afterTextChanged(s: Editable?) {
+                            keepNicknamePrefix()
+                        }
+                    })
+                }
+                addView(usernameField)
+            }
+            topRow.addView(leftGroup, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.LEFT or Gravity.CENTER_VERTICAL
+            ))
+
+            statusGroup = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(8), dp(4), dp(8), dp(4))
+                background = roundedDrawable(ACCENT_PINK, dp(14))
+                addView(terminalText("Nearby").apply {
+                    textSize = 12f
+                    setTextColor(BERRY_TEXT)
+                    setPadding(dp(2), 0, dp(6), 0)
+                })
+                counterView = terminalText("0").apply {
+                    textSize = 13f
+                    setTextColor(BERRY_TEXT)
+                }
+                addView(counterView)
+                setOnClickListener { showMeshPanel(scanFirst = true) }
+            }
+            topRow.addView(statusGroup, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.RIGHT or Gravity.CENTER_VERTICAL
+            ))
+            addView(topRow, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(34)
+            ))
+
+            chatTitleView = terminalText(selectedRecipientLabel.toDisplayTitle()).apply {
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+                gravity = Gravity.CENTER
+                maxLines = 1
+                setPadding(dp(24), dp(8), dp(24), 0)
+            }
+            addView(chatTitleView, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
+    }
+
+    private fun buildInputBar(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+
+            addView(ImageView(this@MainActivity).apply {
+                minimumWidth = dp(40)
+                minimumHeight = dp(40)
+                background = circleDrawable(ACCENT_PINK)
+                setImageResource(android.R.drawable.ic_menu_gallery)
+                setColorFilter(BERRY_TEXT, PorterDuff.Mode.SRC_IN)
+                scaleType = ImageView.ScaleType.CENTER
+                setPadding(dp(9), dp(9), dp(9), dp(9))
+                setOnClickListener { openImagePicker() }
+            })
+
+            messageInput = EditText(this@MainActivity).apply {
+                hint = "type a message..."
+                setSingleLine(false)
+                maxLines = 4
+                setHorizontallyScrolling(false)
+                typeface = Typeface.MONOSPACE
+                textSize = 15f
+                setTextColor(BERRY_TEXT)
+                setHintTextColor(BERRY_TEXT_DIM)
+                background = roundedDrawable(INPUT_SURFACE, dp(22), PINK_SHADOW_STROKE)
+                elevation = dp(2).toFloat()
+                inputType = InputType.TYPE_CLASS_TEXT or
+                    InputType.TYPE_TEXT_FLAG_CAP_SENTENCES or
+                    InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(14), dp(10), dp(14), dp(10))
+                addTextChangedListener(object : TextWatcher {
+                    override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                    override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                        updateActionButton()
+                    }
+                    override fun afterTextChanged(s: Editable?) = Unit
+                })
+            }
+            addView(messageInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dp(8)
+                marginEnd = dp(8)
+            })
+
+            actionButton = terminalAction(">").apply {
+                background = circleDrawable(STRAWBERRY_RED)
+                setTextColor(CREAM_BACKGROUND)
+                gravity = Gravity.CENTER
+                minWidth = dp(42)
+                minHeight = dp(42)
+                setOnClickListener { handleInputAction() }
+            }
+            addView(actionButton)
+        }
+    }
+
+    private fun buildTransferStatus(): TextView =
+        terminalText("").apply {
+            visibility = View.GONE
+            textSize = 12f
+            setTextColor(BERRY_TEXT_DIM)
+            setPadding(dp(12), dp(4), dp(12), dp(2))
+            background = roundedDrawable(SERVICE_BUBBLE, dp(14), SERVICE_BUBBLE_STROKE)
+        }
+
+    private fun triggerMeshScan() {
+        val count = meshService?.searchPeople() ?: 0
+        counterView.text = count.toString()
+
+        mainHandler.postDelayed({
+            counterView.text = (meshService?.peerCount() ?: count).toString()
+        }, 3_000)
+    }
+
+    private fun saveUsername() {
+        keepNicknamePrefix()
+        val raw = usernameField.text.toString().trim()
+        val previous = currentNickname
+        val requested = raw.ifBlank { "@jachimowicz" }.prefixAt().take(MAX_NICKNAME_LENGTH)
+        val service = meshService
+        if (service == null) {
+            usernameField.setText(previous)
+            usernameField.setSelection(usernameField.text.length)
+            Toast.makeText(this, "Nickname can be changed when mesh is online", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val display = service.setNickname(requested).take(MAX_NICKNAME_LENGTH)
+        if (usernameField.text.toString() != display) {
+            usernameField.setText(display)
+            usernameField.setSelection(usernameField.text.length)
+        }
+        if (requested != display) {
+            Toast.makeText(this, "Nickname can be changed once a week", Toast.LENGTH_SHORT).show()
+        }
+        if (previous != display) {
+            currentNickname = display
+            renameLocalMessages(previous, display)
+        }
+    }
+
+    private fun handleInputAction() {
+        val text = messageInput.text.toString().trim()
+        if (text.isEmpty()) {
+            addMessage("system", "voice placeholder", false)
+            return
+        }
+
+        val author = usernameField.text.toString().prefixAt()
+        val targetId = selectedRecipientId
+        if (savedMessagesSelected) {
+            saveLocalMessage(ChatMessage(author, text, true))
+            messageInput.text.clear()
+            return
+        }
+
+        addMessage(author, text, true)
+        messageInput.text.clear()
+        val result = if (targetId == null) {
+            meshService?.broadcastMessage(text)
+        } else {
+            meshService?.sendMessage(targetId.toString(), text)
+        } ?: SendResult.Failed("service offline")
+        if (result is SendResult.Failed) {
+            addMessage("mesh", result.toUiText(), false)
+        }
+    }
+
+    private fun openImagePicker() {
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Intent(MediaStore.ACTION_PICK_IMAGES).apply {
+                type = "image/*"
+            }
+        } else {
+            Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI).apply {
+                type = "image/*"
+            }
+        }
+        startActivityForResult(intent, IMAGE_PICK_REQUEST)
+    }
+
+    @Deprecated("Deprecated Android callback is enough for this minimal Activity.")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != IMAGE_PICK_REQUEST || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        takePersistableUriPermissionIfPossible(uri, data.flags)
+        sendSelectedImage(uri)
+    }
+
+    private fun sendSelectedImage(uri: Uri) {
+        val fileName = queryDisplayName(uri)
+        showImageProgress("preparing image...")
+
+        thread(name = "image-compress-send") {
+            val prepared = prepareImageForTransfer(uri, fileName)
+            if (prepared == null) {
+                runOnUiThread {
+                    hideImageProgress()
+                    Toast.makeText(this, "Could not read image", Toast.LENGTH_SHORT).show()
+                }
+                return@thread
+            }
+
+            if (prepared.bytes.size > MAX_IMAGE_BYTES) {
+                runOnUiThread {
+                    hideImageProgress()
+                    Toast.makeText(this, "Image is too large", Toast.LENGTH_SHORT).show()
+                }
+                return@thread
+            }
+
+            val localPath = copyImageToLocalFile(prepared.fileName, prepared.bytes).absolutePath
+            val author = usernameField.text.toString().prefixAt()
+
+            runOnUiThread {
+                if (savedMessagesSelected) {
+                    saveLocalMessage(ChatMessage(author, "", true, localPath))
+                    hideImageProgress()
+                } else {
+                    addImageMessage(author, localPath, mine = true)
+                    showImageProgress("sending image...")
+                }
+            }
+
+            if (savedMessagesSelected) return@thread
+
+            val result = meshService?.sendImage(
+                selectedRecipientId?.toString(),
+                prepared.fileName,
+                prepared.mimeType,
+                prepared.bytes
+            ) ?: SendResult.Failed("service offline")
+            runOnUiThread {
+                if (result is SendResult.Failed) {
+                    hideImageProgress()
+                    addMessage("mesh", result.toUiText(), false)
+                } else {
+                    showImageProgress("image sent")
+                    mainHandler.postDelayed({ hideImageProgress() }, 1_200)
+                }
+            }
+        }
+    }
+
+    private fun updateActionButton() {
+        actionButton.text = if (messageInput.text.toString().isBlank()) "^" else ">"
+    }
+
+    private fun showMeshPanel(scanFirst: Boolean) {
+        val count = if (scanFirst) {
+            meshService?.searchPeople() ?: 0
+        } else {
+            meshService?.peerCount() ?: 0
+        }
+        counterView.text = count.toString()
+
+        val dialog = Dialog(this).apply {
+            requestWindowFeature(Window.FEATURE_NO_TITLE)
+        }
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(18), dp(18), dp(18))
+            setBackgroundColor(SOFT_PINK_PANEL)
+        }
+
+        val nearbyTitle = terminalText("Nearby ${meshService?.peerCount() ?: 0}").apply {
+            textSize = 20f
+            setTextColor(BERRY_TEXT)
+        }
+        val peopleContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        fun refreshPeopleRows() {
+            val peerCount = meshService?.peerCount() ?: 0
+            nearbyTitle.text = "Nearby $peerCount"
+            counterView.text = peerCount.toString()
+            peopleContainer.removeAllViews()
+
+            val peers = meshService?.knownPeers().orEmpty()
+            if (peers.isEmpty()) {
+                peopleContainer.addView(terminalText("Searching nearby...").apply {
+                    textSize = 14f
+                    setTextColor(BERRY_TEXT_DIM)
+                })
+            } else {
+                peers.forEach { peer ->
+                    val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
+                    peopleContainer.addView(networkActionRow(label, "tap to chat", !savedMessagesSelected && selectedRecipientId == peer.nodeId) {
+                        savedMessagesSelected = false
+                        selectedRecipientId = peer.nodeId
+                        selectedRecipientLabel = label
+                        meshService?.prepareChatWith(peer.nodeId.toString())
+                        showMeshMessages()
+                        updateRecipientHint()
+                        updateChatTitle()
+                        dialog.dismiss()
+                    })
+                }
+            }
+        }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(nearbyTitle, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(terminalAction("qr").apply {
+                textSize = 13f
+                setOnClickListener { addMessage("system", "qr placeholder", false) }
+            })
+            addView(terminalAction("X").apply {
+                textSize = 18f
+                setOnClickListener { dialog.dismiss() }
+            })
+        }
+        root.addView(header)
+
+        root.addView(networkActionRow("Everyone", "broadcast mode", !savedMessagesSelected && selectedRecipientId == null) {
+            savedMessagesSelected = false
+            selectedRecipientId = null
+            selectedRecipientLabel = "everyone"
+            showMeshMessages()
+            updateRecipientHint()
+            updateChatTitle()
+            dialog.dismiss()
+        })
+
+        root.addView(networkActionRow("Saved messages", "private local chat", savedMessagesSelected) {
+            savedMessagesSelected = true
+            selectedRecipientId = null
+            selectedRecipientLabel = "saved"
+            showSavedMessages()
+            updateRecipientHint()
+            updateChatTitle()
+            dialog.dismiss()
+        })
+
+        root.addView(terminalText("PEOPLE").apply {
+            textSize = 15f
+            setPadding(0, dp(18), 0, dp(10))
+            setTextColor(BERRY_TEXT)
+        })
+        root.addView(peopleContainer)
+        refreshPeopleRows()
+
+        dialog.setContentView(root)
+        dialog.window?.apply {
+            setBackgroundDrawableResource(android.R.color.transparent)
+            setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+            attributes = attributes.apply {
+                width = WindowManager.LayoutParams.MATCH_PARENT
+                height = WindowManager.LayoutParams.MATCH_PARENT
+                gravity = Gravity.RIGHT
+            }
+        }
+        dialog.show()
+        dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+
+        mainHandler.postDelayed({
+            if (dialog.isShowing) {
+                refreshPeopleRows()
+            } else {
+                counterView.text = (meshService?.peerCount() ?: count).toString()
+            }
+        }, 1_200)
+        mainHandler.postDelayed({
+            if (dialog.isShowing) refreshPeopleRows()
+        }, 3_000)
+    }
+
+    private fun networkPeerRow(name: String, signal: String): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            addView(terminalText("[]").apply {
+                textSize = 16f
+                setPadding(0, 0, dp(12), 0)
+            })
+            addView(terminalText(name).apply {
+                textSize = 15f
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(terminalText(signal).apply {
+                textSize = 12f
+                setTextColor(BERRY_TEXT_DIM)
+            })
+        }
+    }
+
+    private fun networkActionRow(
+        title: String,
+        subtitle: String,
+        selected: Boolean,
+        onClick: () -> Unit
+    ): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = roundedDrawable(
+                if (selected) ACCENT_PINK else INPUT_SURFACE,
+                dp(18),
+                if (selected) STRAWBERRY_RED else SOFT_PINK_STROKE
+            )
+            elevation = dp(1).toFloat()
+            addView(terminalText(if (selected) ">" else " ").apply {
+                textSize = 16f
+                setTextColor(STRAWBERRY_RED)
+                setPadding(0, 0, dp(10), 0)
+            })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(terminalText(title).apply {
+                    textSize = 15f
+                    setTextColor(BERRY_TEXT)
+                })
+                addView(terminalText(subtitle).apply {
+                    textSize = 12f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setPadding(0, dp(4), 0, 0)
+                })
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun showImagePreview(imagePath: String) {
+        val dialog = Dialog(this).apply {
+            requestWindowFeature(Window.FEATURE_NO_TITLE)
+        }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(18), dp(12), dp(18))
+            setBackgroundColor(CREAM_BACKGROUND)
+        }
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(View(this@MainActivity), LinearLayout.LayoutParams(0, 1, 1f))
+            addView(terminalAction("X").apply {
+                textSize = 18f
+                setOnClickListener { dialog.dismiss() }
+            })
+        })
+        root.addView(ImageView(this).apply {
+            setImageBitmap(BitmapFactory.decodeFile(imagePath))
+            adjustViewBounds = true
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(Color.TRANSPARENT)
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            0,
+            1f
+        ))
+
+        dialog.setContentView(root)
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        dialog.show()
+        dialog.window?.setLayout(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT
+        )
+    }
+
+    private fun addMessage(author: String, body: String, mine: Boolean) {
+        val message = ChatMessage(author, body, mine)
+        meshMessages += message
+        if (!savedMessagesSelected) {
+            messages += message
+        }
+        chatAdapter.notifyDataSetChanged()
+        chatList.post { chatList.setSelection(chatAdapter.count - 1) }
+    }
+
+    private fun addImageMessage(author: String, imagePath: String, mine: Boolean) {
+        val message = ChatMessage(author, "", mine, imagePath)
+        meshMessages += message
+        if (!savedMessagesSelected) {
+            messages += message
+        }
+        chatAdapter.notifyDataSetChanged()
+        chatList.post { chatList.setSelection(chatAdapter.count - 1) }
+    }
+
+    private fun addReceivedImage(line: String) {
+        val payload = line.substringAfter(": ", "")
+        val imagePath = payload.substringBefore("|")
+        if (imagePath.isBlank()) return
+        addImageMessage("@peer", imagePath, mine = false)
+        showImageProgress("image received")
+        mainHandler.postDelayed({ hideImageProgress() }, 1_200)
+    }
+
+    private fun updateImageProgress(value: String) {
+        val sent = value.substringBefore("/").toIntOrNull()
+        val total = value.substringAfter("/", "").toIntOrNull()
+        if (sent == null || total == null || total <= 0) {
+            showImageProgress("sending image...")
+            return
+        }
+        val percent = ((sent * 100f) / total).toInt().coerceIn(0, 100)
+        showImageProgress("sending image $percent% ($sent/$total)")
+    }
+
+    private fun saveLocalMessage(message: ChatMessage) {
+        savedMessages += message
+        if (messages.size == 1 && messages.firstOrNull()?.body == "saved messages are empty") {
+            messages.clear()
+        }
+        messages += message
+        persistSavedMessages()
+        chatAdapter.notifyDataSetChanged()
+        chatList.post { chatList.setSelection(chatAdapter.count - 1) }
+    }
+
+    private fun showSavedMessages() {
+        messages.clear()
+        if (savedMessages.isEmpty()) {
+            messages += ChatMessage("system", "saved messages are empty", false)
+        } else {
+            messages += savedMessages
+        }
+        chatAdapter.notifyDataSetChanged()
+    }
+
+    private fun showMeshMessages() {
+        messages.clear()
+        messages += meshMessages
+        chatAdapter.notifyDataSetChanged()
+        chatList.post { chatList.setSelection(chatAdapter.count - 1) }
+    }
+
+    private fun loadSavedMessages() {
+        val stored = getSharedPreferences(SAVED_MESSAGES_PREFS, Context.MODE_PRIVATE)
+            .getString(SAVED_MESSAGES_KEY, "")
+            .orEmpty()
+        if (stored.isBlank()) return
+        stored.lineSequence()
+            .mapNotNull { line ->
+                val parts = line.split("\t", limit = 3)
+                val author = parts.firstOrNull().orEmpty().ifBlank { "@me" }
+                val body = parts.getOrNull(1)?.decodeStoredText() ?: return@mapNotNull null
+                val imagePath = parts.getOrNull(2)?.decodeStoredText()?.ifBlank { null }
+                ChatMessage(author, body, true, imagePath)
+            }
+            .forEach { savedMessages += it }
+    }
+
+    private fun persistSavedMessages() {
+        val stored = savedMessages.joinToString("\n") {
+            "${it.displayAuthor().encodeStoredText()}\t${it.body.encodeStoredText()}\t${it.imagePath.orEmpty().encodeStoredText()}"
+        }
+        getSharedPreferences(SAVED_MESSAGES_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(SAVED_MESSAGES_KEY, stored)
+            .apply()
+    }
+
+    private fun renameLocalMessages(previous: String, next: String) {
+        (meshMessages + savedMessages + messages)
+            .filter { it.mine }
+            .forEach { it.author = next }
+        persistSavedMessages()
+        chatAdapter.notifyDataSetChanged()
+    }
+
+    private fun ChatMessage.displayAuthor(): String =
+        if (mine) currentNickname else author
+
+    private fun updateRecipientHint() {
+        messageInput.hint = when {
+            savedMessagesSelected -> "save a message..."
+            selectedRecipientId == null -> "type a message..."
+            else -> "message $selectedRecipientLabel..."
+        }
+    }
+
+    private fun updateChatTitle() {
+        if (::chatTitleView.isInitialized) {
+            chatTitleView.text = selectedRecipientLabel.toDisplayTitle()
+        }
+    }
+
+    private fun String.toDisplayTitle(): String = when (this) {
+        "everyone" -> "Everyone"
+        "saved" -> "Saved messages"
+        else -> this
+    }
+
+    private fun keepNicknamePrefix() {
+        if (normalizingNickname) return
+        val current = usernameField.text?.toString().orEmpty()
+        if (current.startsWith("@") && current.length in 2..MAX_NICKNAME_LENGTH) return
+
+        normalizingNickname = true
+        val normalized = "@${current.removePrefix("@")}".take(MAX_NICKNAME_LENGTH)
+        usernameField.setText(normalized)
+        usernameField.setSelection(normalized.length.coerceAtLeast(1))
+        normalizingNickname = false
+    }
+
+    private fun requestMissingPermissions() {
+        val permissions = requiredPermissions().filter {
+            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+        }.toTypedArray()
+
+        if (permissions.isNotEmpty()) {
+            requestPermissions(permissions, 42)
+        } else {
+            startAppAfterPermissions()
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != 42) return
+
+        if (hasRequiredPermissions()) {
+            startAppAfterPermissions()
+        } else {
+            addMessage("system", "permissions denied: mesh radio offline", false)
+        }
+    }
+
+    private fun startAppAfterPermissions() {
+        if (!ensureBluetoothEnabled()) return
+        startAndBindMeshService()
+    }
+
+    private fun ensureBluetoothEnabled(): Boolean {
+        val adapter = getSystemService(BluetoothManager::class.java).adapter
+        val enabled = try {
+            adapter?.isEnabled == true
+        } catch (e: SecurityException) {
+            false
+        }
+        if (!enabled) {
+            addMessage("system", "bluetooth disabled", false)
+            startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+            return false
+        }
+        return true
+    }
+
+    private fun hasRequiredPermissions(): Boolean =
+        requiredPermissions().all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
+
+    private fun requiredPermissions(): List<String> = buildList {
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2) {
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            add(Manifest.permission.BLUETOOTH_SCAN)
+            add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    private fun startAndBindMeshService() {
+        if (serviceBound) return
+        val intent = Intent(this, MeshNetworkService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        serviceBound = bindService(intent, connection, Context.BIND_AUTO_CREATE)
+    }
+
+    private fun refreshHeader() {
+        counterView.text = (meshService?.peerCount() ?: 0).toString()
+    }
+
+    private fun showKeyboard(view: View) {
+        (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+            .showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
+    }
+
+    private fun hideKeyboard() {
+        (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+            .hideSoftInputFromWindow(usernameField.windowToken, 0)
+    }
+
+    private fun terminalText(value: String): TextView =
+        TextView(this).apply {
+            text = value
+            typeface = Typeface.MONOSPACE
+            setTextColor(BERRY_TEXT)
+            includeFontPadding = false
+        }
+
+    private fun terminalAction(value: String): TextView =
+        TextView(this).apply {
+            text = value
+            typeface = Typeface.MONOSPACE
+            setTextColor(BERRY_TEXT)
+            setBackgroundColor(Color.TRANSPARENT)
+            setPadding(dp(6), dp(4), dp(6), dp(4))
+            gravity = Gravity.CENTER
+        }
+
+    private fun circleDrawable(color: Int): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(color)
+        }
+
+    private fun roundedDrawable(color: Int, cornerRadius: Int, strokeColor: Int? = null): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(color)
+            this.cornerRadius = cornerRadius.toFloat()
+            strokeColor?.let { setStroke(dp(1), it) }
+        }
+
+    private fun cursorDrawable(): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(STRAWBERRY_RED)
+            setSize(dp(2), dp(18))
+        }
+
+    private fun applySafeArea(root: View, inputBar: View) {
+        root.setOnApplyWindowInsetsListener { _, insets ->
+            val topInset = insets.systemWindowInsetTop
+            val bottomInset = insets.systemWindowInsetBottom
+            root.setPadding(dp(12), maxOf(dp(44), topInset + dp(8)), dp(12), dp(8))
+            inputBar.setPadding(
+                inputBar.paddingLeft,
+                dp(8),
+                inputBar.paddingRight,
+                maxOf(dp(8), bottomInset + dp(8))
+            )
+            insets
+        }
+        root.requestApplyInsets()
+    }
+
+    private fun SendResult.toUiText(): String = when (this) {
+        is SendResult.Sent -> "sent: $messageId"
+        is SendResult.Queued -> "queued: $reason"
+        is SendResult.Failed -> "failed: $error"
+    }
+
+    private fun String.prefixAt(): String =
+        if (startsWith("@")) this else "@$this"
+
+    private fun String.isScanNoise(): Boolean =
+        startsWith("search people:")
+            || startsWith("peer counter:")
+            || startsWith("discovered:")
+            || startsWith("secure session:")
+            || startsWith("verified:")
+            || startsWith("disconnected:")
+            || startsWith("broadcast:")
+            || startsWith("send to")
+            || startsWith("image send:")
+
+    private fun String.encodeStoredText(): String =
+        replace("%", "%25").replace("\t", "%09").replace("\n", "%0A")
+
+    private fun String.decodeStoredText(): String =
+        replace("%0A", "\n").replace("%09", "\t").replace("%25", "%")
+
+    private fun takePersistableUriPermissionIfPossible(uri: Uri, flags: Int) {
+        runCatching {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            )
+        }
+    }
+
+    private fun queryDisplayName(uri: Uri): String {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0) return cursor.getString(index)
+            }
+        }
+        return "image.jpg"
+    }
+
+    private fun copyImageToLocalFile(fileName: String, bytes: ByteArray): File {
+        val directory = File(filesDir, "sent_images").apply { mkdirs() }
+        val safeName = fileName.replace(Regex("[^A-Za-z0-9._-]"), "_").ifBlank { "image.jpg" }
+        return File(directory, "${System.currentTimeMillis()}_$safeName").also { it.writeBytes(bytes) }
+    }
+
+    private fun prepareImageForTransfer(uri: Uri, originalName: String): PreparedImage? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        val boundsStream = contentResolver.openInputStream(uri) ?: return null
+        boundsStream.use {
+            BitmapFactory.decodeStream(it, null, bounds)
+        }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            return decodeImageWithImageDecoder(uri)?.let { bitmap ->
+                val scaled = scaleBitmapIfNeeded(bitmap, MAX_IMAGE_DIMENSION)
+                val compressed = compressBitmap(scaled)
+                if (scaled !== bitmap && !scaled.isRecycled) scaled.recycle()
+                if (!bitmap.isRecycled) bitmap.recycle()
+                PreparedImage("${originalName.substringBeforeLast('.', "image")}.jpg", "image/jpeg", compressed)
+            }
+        }
+
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = calculateInSampleSize(bounds, MAX_IMAGE_DIMENSION)
+        }
+        val bitmap = contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, options)
+        } ?: decodeImageWithImageDecoder(uri) ?: return null
+
+        val scaled = scaleBitmapIfNeeded(bitmap, MAX_IMAGE_DIMENSION)
+        val compressed = compressBitmap(scaled)
+        if (scaled !== bitmap && !scaled.isRecycled) scaled.recycle()
+        if (!bitmap.isRecycled) bitmap.recycle()
+        val safeName = originalName
+            .substringBeforeLast('.', originalName)
+            .ifBlank { "image" }
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .take(80)
+        return PreparedImage("$safeName.jpg", "image/jpeg", compressed)
+    }
+
+    private fun decodeImageWithImageDecoder(uri: Uri): Bitmap? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
+        return runCatching {
+            ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { decoder, _, _ ->
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            }
+        }.getOrNull()
+    }
+
+    private fun scaleBitmapIfNeeded(bitmap: Bitmap, maxDimension: Int): Bitmap {
+        val width = bitmap.width
+        val height = bitmap.height
+        val longest = maxOf(width, height)
+        if (longest <= maxDimension) return bitmap
+        val scale = maxDimension.toFloat() / longest.toFloat()
+        return Bitmap.createScaledBitmap(
+            bitmap,
+            (width * scale).toInt().coerceAtLeast(1),
+            (height * scale).toInt().coerceAtLeast(1),
+            true
+        )
+    }
+
+    private fun calculateInSampleSize(options: BitmapFactory.Options, maxDimension: Int): Int {
+        var sampleSize = 1
+        var width = options.outWidth
+        var height = options.outHeight
+        while (width / 2 >= maxDimension || height / 2 >= maxDimension) {
+            width /= 2
+            height /= 2
+            sampleSize *= 2
+        }
+        return sampleSize
+    }
+
+    private fun compressBitmap(bitmap: Bitmap): ByteArray {
+        var quality = 82
+        var bytes: ByteArray
+        do {
+            val output = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)
+            bytes = output.toByteArray()
+            quality -= 8
+        } while (bytes.size > TARGET_IMAGE_BYTES && quality >= 50)
+        return bytes
+    }
+
+    private fun showImageProgress(text: String) {
+        transferStatusView.text = text
+        transferStatusView.visibility = View.VISIBLE
+    }
+
+    private fun hideImageProgress() {
+        transferStatusView.visibility = View.GONE
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private inner class ChatAdapter(private val items: List<ChatMessage>) : BaseAdapter() {
+        override fun getCount(): Int = items.size
+        override fun getItem(position: Int): ChatMessage = items[position]
+        override fun getItemId(position: Int): Long = position.toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+            val item = getItem(position)
+            val isServiceLog = item.author == "system" || item.author == "mesh"
+            return LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = when {
+                    isServiceLog -> Gravity.CENTER_HORIZONTAL
+                    item.mine -> Gravity.RIGHT
+                    else -> Gravity.LEFT
+                }
+                setPadding(dp(8), dp(6), dp(8), dp(6))
+                if (item.imagePath != null) {
+                    val bitmap = BitmapFactory.decodeFile(item.imagePath)
+                    val imageSize = calculateChatImageSize(bitmap)
+                    val image = BorderedImageView(this@MainActivity).apply {
+                        setImageBitmap(bitmap)
+                        adjustViewBounds = false
+                        scaleType = ImageView.ScaleType.FIT_CENTER
+                        setBackgroundColor(Color.TRANSPARENT)
+                        setOnClickListener { showImagePreview(item.imagePath) }
+                    }
+                    addView(image, LinearLayout.LayoutParams(
+                        imageSize.first,
+                        imageSize.second
+                    ))
+                    return@apply
+                }
+
+                val bubble = TextView(this@MainActivity).apply {
+                    text = if (isServiceLog) "i ${item.body}" else item.body.wrapForChatBubble()
+                    typeface = if (isServiceLog) Typeface.MONOSPACE else Typeface.DEFAULT
+                    textSize = if (isServiceLog) 14f else 15f
+                    setLineSpacing(dp(2).toFloat(), 1f)
+                    gravity = Gravity.CENTER
+                    minWidth = 0
+                    minHeight = if (isServiceLog) 0 else dp(46)
+                    setTextColor(
+                        when {
+                            isServiceLog -> MUTED_CORAL
+                            item.mine -> Color.WHITE
+                            else -> INCOMING_TEXT
+                        }
+                    )
+                    background = when {
+                        isServiceLog -> roundedDrawable(SERVICE_BUBBLE, dp(14), SERVICE_BUBBLE_STROKE)
+                        item.mine -> roundedDrawable(OUTGOING_BUBBLE, dp(20))
+                        else -> roundedDrawable(INCOMING_BUBBLE, dp(20))
+                    }
+                    setPadding(dp(18), dp(12), dp(18), dp(12))
+                    maxWidth = (resources.displayMetrics.widthPixels * 0.78f).toInt()
+                }
+                addView(bubble, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+            }
+        }
+    }
+
+    private inner class BorderedImageView(context: Context) : ImageView(context) {
+        private val clipPath = Path()
+        private val clipRect = RectF()
+        private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dp(1).toFloat()
+            color = IMAGE_BORDER
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val radius = dp(8).toFloat()
+            clipRect.set(0f, 0f, width.toFloat(), height.toFloat())
+            clipPath.reset()
+            clipPath.addRoundRect(clipRect, radius, radius, Path.Direction.CW)
+            val saveCount = canvas.save()
+            canvas.clipPath(clipPath)
+            super.onDraw(canvas)
+            canvas.restoreToCount(saveCount)
+
+            val halfStroke = borderPaint.strokeWidth / 2f
+            val rect = RectF(
+                halfStroke,
+                halfStroke,
+                width - halfStroke,
+                height - halfStroke
+            )
+            canvas.drawRoundRect(rect, radius, radius, borderPaint)
+        }
+    }
+
+    private fun calculateChatImageSize(bitmap: Bitmap?): Pair<Int, Int> {
+        if (bitmap == null || bitmap.width <= 0 || bitmap.height <= 0) {
+            return (resources.displayMetrics.widthPixels * 0.58f).toInt() to dp(180)
+        }
+
+        val aspect = bitmap.width.toFloat() / bitmap.height.toFloat()
+        val maxWideWidth = (resources.displayMetrics.widthPixels * 0.58f).toInt()
+        val maxPortraitHeight = dp(380)
+        val maxLandscapeHeight = dp(220)
+
+        return if (aspect < 0.72f) {
+            val height = maxPortraitHeight
+            val width = (height * aspect).toInt().coerceIn(dp(150), maxWideWidth)
+            width to height
+        } else {
+            val width = maxWideWidth
+            val height = (width / aspect).toInt().coerceIn(dp(120), maxLandscapeHeight)
+            width to height
+        }
+    }
+
+    private data class ChatMessage(
+        var author: String,
+        val body: String,
+        val mine: Boolean,
+        val imagePath: String? = null
+    )
+
+    private data class PreparedImage(
+        val fileName: String,
+        val mimeType: String,
+        val bytes: ByteArray
+    )
+
+    companion object {
+        private const val CREAM_BACKGROUND = 0xFFFFF5F5.toInt()
+        private const val BERRY_TEXT = 0xFF8E444D.toInt()
+        private const val BERRY_TEXT_DIM = 0xFFB2777D.toInt()
+        private const val ACCENT_PINK = 0xFFFFB7C5.toInt()
+        private const val STRAWBERRY_RED = 0xFFFF4D6D.toInt()
+        private const val INPUT_SURFACE = 0xFFFFFDFD.toInt()
+        private const val PINK_SHADOW_STROKE = 0xFFF7D2DA.toInt()
+        private const val MUTED_CORAL = 0xFFE88E8E.toInt()
+        private const val SERVICE_BUBBLE = 0xFFFFEAEE.toInt()
+        private const val SERVICE_BUBBLE_STROKE = 0xFFF5C7CF.toInt()
+        private const val INCOMING_BUBBLE = 0xFFF4F7FA.toInt()
+        private const val INCOMING_TEXT = 0xFF536174.toInt()
+        private const val OUTGOING_BUBBLE = 0xFFEF4F9A.toInt()
+        private const val IMAGE_BORDER = 0xFFFF8FA8.toInt()
+        private const val SOFT_PINK_PANEL = 0xFFFFEEF2.toInt()
+        private const val SOFT_PINK_STROKE = 0xFFF6D4DC.toInt()
+        private const val MAX_NICKNAME_LENGTH = 12
+        private const val SAVED_MESSAGES_PREFS = "saved_messages"
+        private const val SAVED_MESSAGES_KEY = "items"
+        private const val IMAGE_PICK_REQUEST = 93
+        private const val MAX_IMAGE_BYTES = 2 * 1024 * 1024
+        private const val TARGET_IMAGE_BYTES = 512 * 1024
+        private const val MAX_IMAGE_DIMENSION = 1280
+        private const val BUBBLE_WRAP_CHARS = 24
+    }
+
+    private fun String.wrapForChatBubble(): String {
+        if (length <= BUBBLE_WRAP_CHARS) return this
+        val lines = mutableListOf<String>()
+        var current = StringBuilder()
+        split(Regex("\\s+")).filter { it.isNotBlank() }.forEach { word ->
+            if (word.length > BUBBLE_WRAP_CHARS) {
+                if (current.isNotEmpty()) {
+                    lines += current.toString()
+                    current = StringBuilder()
+                }
+                word.chunked(BUBBLE_WRAP_CHARS).forEach { lines += it }
+            } else if (current.isEmpty()) {
+                current.append(word)
+            } else if (current.length + 1 + word.length <= BUBBLE_WRAP_CHARS) {
+                current.append(' ').append(word)
+            } else {
+                lines += current.toString()
+                current = StringBuilder(word)
+            }
+        }
+        if (current.isNotEmpty()) lines += current.toString()
+        return lines.joinToString("\n")
+    }
+}
