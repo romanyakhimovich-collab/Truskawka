@@ -61,6 +61,7 @@ class MainActivity : Activity() {
     private var selectedRecipientLabel: String = "everyone"
     private var savedMessagesSelected = false
     private var normalizingNickname = false
+    private var nicknameDialogShowing = false
     private var currentNickname = "@jachimowicz"
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -102,6 +103,9 @@ class MainActivity : Activity() {
             usernameField.setText(currentNickname)
             refreshHeader()
             addMessage("system", "service connected", false)
+            if (meshService?.hasStoredNickname() == false) {
+                showInitialNicknameDialog()
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -363,6 +367,135 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(4), dp(12), dp(2))
             background = roundedDrawable(SERVICE_BUBBLE, dp(14), SERVICE_BUBBLE_STROKE)
         }
+
+    private fun showInitialNicknameDialog() {
+        val service = meshService ?: return
+        if (nicknameDialogShowing) return
+        nicknameDialogShowing = true
+
+        val dialog = Dialog(this).apply {
+            requestWindowFeature(Window.FEATURE_NO_TITLE)
+            setCancelable(false)
+            setCanceledOnTouchOutside(false)
+        }
+
+        val input = EditText(this).apply {
+            setText("@")
+            setSingleLine(true)
+            typeface = Typeface.MONOSPACE
+            textSize = 18f
+            setTextColor(BERRY_TEXT)
+            setHintTextColor(BERRY_TEXT_DIM)
+            hint = "@nickname"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            filters = arrayOf(InputFilter.LengthFilter(MAX_NICKNAME_LENGTH))
+            background = roundedDrawable(INPUT_SURFACE, dp(22), PINK_SHADOW_STROKE)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+        }
+
+        var normalizing = false
+        input.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+            override fun afterTextChanged(s: Editable?) {
+                if (normalizing) return
+                val current = s?.toString().orEmpty()
+                if (current.startsWith("@") && current.length <= MAX_NICKNAME_LENGTH) return
+                normalizing = true
+                val normalized = "@${current.removePrefix("@")}".take(MAX_NICKNAME_LENGTH)
+                input.setText(normalized)
+                input.setSelection(normalized.length.coerceAtLeast(1))
+                normalizing = false
+            }
+        })
+
+        val saveButton = terminalAction("Start chatting").apply {
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = roundedDrawable(STRAWBERRY_RED, dp(22))
+            setPadding(dp(18), dp(12), dp(18), dp(12))
+            setOnClickListener {
+                val requested = input.text.toString().trim().prefixAt().take(MAX_NICKNAME_LENGTH)
+                if (requested.length < 2) {
+                    Toast.makeText(this@MainActivity, "Choose a nickname", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+
+                val previous = currentNickname
+                val display = service.setNickname(requested).take(MAX_NICKNAME_LENGTH)
+                currentNickname = display
+                usernameField.setText(display)
+                usernameField.setSelection(usernameField.text.length)
+                if (previous != display) {
+                    renameLocalMessages(previous, display)
+                }
+                nicknameDialogShowing = false
+                dialog.dismiss()
+            }
+        }
+
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(22), dp(24), dp(22), dp(22))
+            background = roundedDrawable(SOFT_PINK_PANEL, dp(28), SOFT_PINK_STROKE)
+
+            addView(ImageView(this@MainActivity).apply {
+                setImageResource(R.drawable.truskawka_logo)
+                background = roundedDrawable(Color.WHITE, dp(18), PINK_SHADOW_STROKE)
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+            }, LinearLayout.LayoutParams(dp(72), dp(72)))
+
+            addView(terminalText("Welcome to Truskawka").apply {
+                textSize = 22f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setTextColor(BERRY_TEXT)
+                setPadding(0, dp(16), 0, dp(6))
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+            addView(terminalText("Choose your mesh nickname").apply {
+                textSize = 14f
+                gravity = Gravity.CENTER
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(dp(6), 0, dp(6), dp(18))
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+            addView(input, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+            addView(terminalText("The @ stays fixed. Max 12 characters.").apply {
+                textSize = 12f
+                gravity = Gravity.CENTER
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(0, dp(8), 0, dp(18))
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+            addView(saveButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+
+        val root = FrameLayout(this).apply {
+            setPadding(dp(22), dp(44), dp(22), dp(28))
+            setBackgroundColor(0x66FFB7C5)
+            addView(panel, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+            ))
+        }
+
+        dialog.setContentView(root)
+        dialog.setOnDismissListener { nicknameDialogShowing = false }
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        dialog.show()
+        dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+        input.post {
+            input.requestFocus()
+            input.setSelection(input.text.length)
+            (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+                .showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+        }
+    }
 
     private fun triggerMeshScan() {
         val count = meshService?.searchPeople() ?: 0

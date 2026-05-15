@@ -143,6 +143,10 @@ class MeshNetworkService : Service() {
             ?.take(MAX_NICKNAME_LENGTH)
             ?: "@${localNodeId.shortId()}".take(MAX_NICKNAME_LENGTH)
 
+    fun hasStoredNickname(): Boolean =
+        getSharedPreferences("bitchat_profile", Context.MODE_PRIVATE)
+            .contains("nickname")
+
     fun setNickname(nickname: String): String {
         val prefs = getSharedPreferences("bitchat_profile", Context.MODE_PRIVATE)
         val current = getNickname()
@@ -152,6 +156,12 @@ class MeshNetworkService : Service() {
             .take(MAX_NICKNAME_LENGTH - 1)
         val display = "@$normalized"
         if (display == current) {
+            if (!prefs.contains("nickname")) {
+                prefs.edit()
+                    .putString("nickname", display)
+                    .putLong(KEY_NICKNAME_CHANGED_AT, System.currentTimeMillis())
+                    .apply()
+            }
             return current
         }
 
