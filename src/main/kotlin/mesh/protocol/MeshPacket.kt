@@ -140,6 +140,7 @@ enum class PacketType(val value: Byte) {
     HANDSHAKE_ACK(0x03),   // Key exchange response
     MESSAGE(0x10),         // Encrypted text message
     ACK(0x11),             // Delivery acknowledgment
+    READ_RECEIPT(0x12),    // Message read receipt
     FILE_META(0x20),       // File transfer metadata
     FILE_CHUNK(0x21),      // File data chunk
     ROUTE_REQ(0x30),       // Route request (AODV)

@@ -82,6 +82,7 @@ class MeshManager(
     private var messageListener: ((senderId: UUID, message: String, timestamp: Long) -> Unit)? = null
     private var fileListener: ((senderId: UUID, fileName: String, mimeType: String, bytes: ByteArray, timestamp: Long) -> Unit)? = null
     private var peerListener: ((nodeId: UUID, event: PeerEvent) -> Unit)? = null
+    private var messageStatusListener: ((messageId: UUID, status: MessageDeliveryStatus) -> Unit)? = null
 
     // Background executor
     private val executor = Executors.newScheduledThreadPool(2)
@@ -268,19 +269,8 @@ class MeshManager(
             .put(encrypted.ciphertext)
             .array()
 
-        val packet = MeshPacket(
-            type = PacketType.MESSAGE,
-            flags = PacketFlags(requiresAck = true, isEncrypted = true),
-            messageId = UUID.randomUUID(),
-            senderId = localNodeId,
-            recipientId = recipientId,
-            timestamp = System.currentTimeMillis(),
-            payload = payload,
-            signature = signature
-        )
-
-        router.sendMessage(recipientId, payload, signature, requiresAck = true)
-        return SendResult.Sent(packet.messageId)
+        val messageId = router.sendMessage(recipientId, payload, signature, requiresAck = true)
+        return SendResult.Sent(messageId)
     }
 
     private fun queuePendingMessage(recipientId: UUID, message: ByteArray) {
@@ -459,6 +449,27 @@ class MeshManager(
         // Deliver to application
         val message = String(plaintext, Charsets.UTF_8)
         messageListener?.invoke(packet.senderId, message, packet.timestamp)
+        if (!packet.isBroadcast()) {
+            sendReadReceipt(packet.senderId, packet.messageId)
+        }
+    }
+
+    private fun sendReadReceipt(recipientId: UUID, readMessageId: UUID) {
+        val payload = ByteBuffer.allocate(16)
+            .putLong(readMessageId.mostSignificantBits)
+            .putLong(readMessageId.leastSignificantBits)
+            .array()
+        val packet = MeshPacket(
+            type = PacketType.READ_RECEIPT,
+            flags = PacketFlags(isEncrypted = false),
+            messageId = UUID.randomUUID(),
+            senderId = localNodeId,
+            recipientId = recipientId,
+            timestamp = System.currentTimeMillis(),
+            payload = payload,
+            signature = ByteArray(0)
+        )
+        combinedTransmitter.sendTo(recipientId, packet)
     }
 
     override fun onNeighborDiscovered(nodeId: UUID, payload: ByteArray) {
@@ -532,8 +543,11 @@ class MeshManager(
     }
 
     override fun onAckReceived(messageId: UUID) {
-        // Message was delivered
-        // Could notify application here
+        messageStatusListener?.invoke(messageId, MessageDeliveryStatus.DELIVERED)
+    }
+
+    override fun onReadReceiptReceived(senderId: UUID, messageId: UUID) {
+        messageStatusListener?.invoke(messageId, MessageDeliveryStatus.READ)
     }
 
     // ==================== BleServiceCallback Interface ====================
@@ -573,6 +587,10 @@ class MeshManager(
 
     fun setPeerListener(listener: (nodeId: UUID, event: PeerEvent) -> Unit) {
         this.peerListener = listener
+    }
+
+    fun setMessageStatusListener(listener: (messageId: UUID, status: MessageDeliveryStatus) -> Unit) {
+        this.messageStatusListener = listener
     }
 
     fun getKnownPeers(): List<PeerInfo> = knownPeers.values.toList()
@@ -618,6 +636,11 @@ enum class PeerEvent {
     SESSION_ESTABLISHED,
     DISCONNECTED,
     VERIFIED
+}
+
+enum class MessageDeliveryStatus {
+    DELIVERED,
+    READ
 }
 
 sealed class SendResult {

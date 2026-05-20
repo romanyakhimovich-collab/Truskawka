@@ -51,6 +51,10 @@ import android.widget.Toast
 import mesh.SendResult
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.Calendar
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 import kotlin.concurrent.thread
 
@@ -81,6 +85,8 @@ class MainActivity : Activity() {
     private lateinit var transferStatusView: TextView
     private lateinit var messageInput: EditText
     private lateinit var actionButton: TextView
+    private val messageTimeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+    private val messageDateFormat = SimpleDateFormat("d MMMM yyyy", Locale.getDefault())
 
     private val logListener: (String) -> Unit = { line ->
         runOnUiThread {
@@ -88,6 +94,12 @@ class MainActivity : Activity() {
                 addReceivedImage(line)
             } else if (line.startsWith("image progress:")) {
                 updateImageProgress(line.substringAfter("image progress:").trim())
+            } else if (line.startsWith("message from ")) {
+                addReceivedText(line)
+            } else if (line.startsWith("message delivered:")) {
+                updateMessageStatus(line.substringAfter(":").trim(), MessageStatus.DELIVERED)
+            } else if (line.startsWith("message read:")) {
+                updateMessageStatus(line.substringAfter(":").trim(), MessageStatus.READ)
             } else if (!line.isScanNoise()) {
                 addMessage("mesh", line, false)
             }
@@ -543,20 +555,26 @@ class MainActivity : Activity() {
         val author = usernameField.text.toString().prefixAt()
         val targetId = selectedRecipientId
         if (savedMessagesSelected) {
-            saveLocalMessage(ChatMessage(author, text, true))
+            saveLocalMessage(ChatMessage(author, text, true, status = MessageStatus.READ))
             messageInput.text.clear()
             return
         }
 
-        addMessage(author, text, true)
+        val localMessage = addMessage(author, text, true)
         messageInput.text.clear()
         val result = if (targetId == null) {
             meshService?.broadcastMessage(text)
         } else {
             meshService?.sendMessage(targetId.toString(), text)
         } ?: SendResult.Failed("service offline")
-        if (result is SendResult.Failed) {
-            addMessage("mesh", result.toUiText(), false)
+        when (result) {
+            is SendResult.Sent -> {
+                if (targetId != null) {
+                    localMessage.messageId = result.messageId
+                }
+            }
+            is SendResult.Failed -> addMessage("mesh", result.toUiText(), false)
+            is SendResult.Queued -> Unit
         }
     }
 
@@ -609,7 +627,7 @@ class MainActivity : Activity() {
 
             runOnUiThread {
                 if (savedMessagesSelected) {
-                    saveLocalMessage(ChatMessage(author, "", true, localPath))
+                    saveLocalMessage(ChatMessage(author, "", true, localPath, status = MessageStatus.READ))
                     hideImageProgress()
                 } else {
                     addImageMessage(author, localPath, mine = true)
@@ -857,8 +875,29 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun addMessage(author: String, body: String, mine: Boolean) {
-        val message = ChatMessage(author, body, mine)
+    private fun addMessage(
+        author: String,
+        body: String,
+        mine: Boolean,
+        timestamp: Long = System.currentTimeMillis()
+    ): ChatMessage {
+        val message = ChatMessage(author, body, mine, timestamp = timestamp)
+        meshMessages += message
+        if (!savedMessagesSelected) {
+            messages += message
+        }
+        chatAdapter.notifyDataSetChanged()
+        chatList.post { chatList.setSelection(chatAdapter.count - 1) }
+        return message
+    }
+
+    private fun addImageMessage(
+        author: String,
+        imagePath: String,
+        mine: Boolean,
+        timestamp: Long = System.currentTimeMillis()
+    ) {
+        val message = ChatMessage(author, "", mine, imagePath, timestamp)
         meshMessages += message
         if (!savedMessagesSelected) {
             messages += message
@@ -867,21 +906,28 @@ class MainActivity : Activity() {
         chatList.post { chatList.setSelection(chatAdapter.count - 1) }
     }
 
-    private fun addImageMessage(author: String, imagePath: String, mine: Boolean) {
-        val message = ChatMessage(author, "", mine, imagePath)
-        meshMessages += message
-        if (!savedMessagesSelected) {
-            messages += message
-        }
-        chatAdapter.notifyDataSetChanged()
-        chatList.post { chatList.setSelection(chatAdapter.count - 1) }
+    private fun addReceivedText(line: String) {
+        val meta = line.substringAfter("message from ", "")
+        val author = meta.substringBefore(" at ", "@peer").ifBlank { "@peer" }
+        val timestampAndBody = meta.substringAfter(" at ", "")
+        val timestamp = timestampAndBody.substringBefore(": ", "")
+            .toLongOrNull()
+            ?: System.currentTimeMillis()
+        val body = timestampAndBody.substringAfter(": ", line)
+        addMessage(author, body, mine = false, timestamp = timestamp)
     }
 
     private fun addReceivedImage(line: String) {
-        val payload = line.substringAfter(": ", "")
+        val meta = line.substringAfter("image from ", "")
+        val author = meta.substringBefore(" at ", "@peer").ifBlank { "@peer" }
+        val timestampAndPayload = meta.substringAfter(" at ", "")
+        val timestamp = timestampAndPayload.substringBefore(": ", "")
+            .toLongOrNull()
+            ?: System.currentTimeMillis()
+        val payload = timestampAndPayload.substringAfter(": ", line.substringAfter(": ", ""))
         val imagePath = payload.substringBefore("|")
         if (imagePath.isBlank()) return
-        addImageMessage("@peer", imagePath, mine = false)
+        addImageMessage(author, imagePath, mine = false, timestamp = timestamp)
         showImageProgress("image received")
         mainHandler.postDelayed({ hideImageProgress() }, 1_200)
     }
@@ -895,6 +941,22 @@ class MainActivity : Activity() {
         }
         val percent = ((sent * 100f) / total).toInt().coerceIn(0, 100)
         showImageProgress("sending image $percent% ($sent/$total)")
+    }
+
+    private fun updateMessageStatus(messageIdText: String, status: MessageStatus) {
+        val messageId = runCatching { UUID.fromString(messageIdText) }.getOrNull() ?: return
+        var changed = false
+        meshMessages
+            .filter { it.mine && it.messageId == messageId }
+            .forEach { message ->
+                if (message.status != MessageStatus.READ) {
+                    message.status = status
+                    changed = true
+                }
+            }
+        if (changed) {
+            chatAdapter.notifyDataSetChanged()
+        }
     }
 
     private fun saveLocalMessage(message: ChatMessage) {
@@ -932,18 +994,24 @@ class MainActivity : Activity() {
         if (stored.isBlank()) return
         stored.lineSequence()
             .mapNotNull { line ->
-                val parts = line.split("\t", limit = 3)
+                val parts = line.split("\t", limit = 5)
                 val author = parts.firstOrNull().orEmpty().ifBlank { "@me" }
                 val body = parts.getOrNull(1)?.decodeStoredText() ?: return@mapNotNull null
                 val imagePath = parts.getOrNull(2)?.decodeStoredText()?.ifBlank { null }
-                ChatMessage(author, body, true, imagePath)
+                val timestamp = parts.getOrNull(3)?.toLongOrNull() ?: System.currentTimeMillis()
+                val status = parts.getOrNull(4)
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { runCatching { MessageStatus.valueOf(it) }.getOrNull() }
+                    ?: MessageStatus.READ
+                ChatMessage(author, body, true, imagePath, timestamp, status = status)
             }
             .forEach { savedMessages += it }
+        persistSavedMessages()
     }
 
     private fun persistSavedMessages() {
         val stored = savedMessages.joinToString("\n") {
-            "${it.displayAuthor().encodeStoredText()}\t${it.body.encodeStoredText()}\t${it.imagePath.orEmpty().encodeStoredText()}"
+            "${it.displayAuthor().encodeStoredText()}\t${it.body.encodeStoredText()}\t${it.imagePath.orEmpty().encodeStoredText()}\t${it.timestamp}\t${it.status?.name.orEmpty()}"
         }
         getSharedPreferences(SAVED_MESSAGES_PREFS, Context.MODE_PRIVATE)
             .edit()
@@ -961,6 +1029,24 @@ class MainActivity : Activity() {
 
     private fun ChatMessage.displayAuthor(): String =
         if (mine) currentNickname else author
+
+    private fun ChatMessage.displayTime(): String =
+        messageTimeFormat.format(Date(timestamp))
+
+    private fun ChatMessage.displayDate(): String {
+        val messageDay = Calendar.getInstance().apply { timeInMillis = timestamp }
+        val today = Calendar.getInstance()
+        val yesterday = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
+        return when {
+            messageDay.isSameDay(today) -> "Today"
+            messageDay.isSameDay(yesterday) -> "Yesterday"
+            else -> messageDateFormat.format(Date(timestamp))
+        }
+    }
+
+    private fun Calendar.isSameDay(other: Calendar): Boolean =
+        get(Calendar.YEAR) == other.get(Calendar.YEAR) &&
+            get(Calendar.DAY_OF_YEAR) == other.get(Calendar.DAY_OF_YEAR)
 
     private fun updateRecipientHint() {
         messageInput.hint = when {
@@ -1158,6 +1244,8 @@ class MainActivity : Activity() {
             || startsWith("broadcast:")
             || startsWith("send to")
             || startsWith("image send:")
+            || startsWith("message delivered:")
+            || startsWith("message read:")
 
     private fun String.encodeStoredText(): String =
         replace("%", "%25").replace("\t", "%09").replace("\n", "%0A")
@@ -1299,6 +1387,15 @@ class MainActivity : Activity() {
                     else -> Gravity.LEFT
                 }
                 setPadding(dp(8), dp(6), dp(8), dp(6))
+                if (shouldShowDateHeader(position)) {
+                    addView(dateHeader(item), LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        gravity = Gravity.CENTER_HORIZONTAL
+                        bottomMargin = dp(8)
+                    })
+                }
                 if (item.imagePath != null) {
                     val bitmap = BitmapFactory.decodeFile(item.imagePath)
                     val imageSize = calculateChatImageSize(bitmap)
@@ -1313,31 +1410,19 @@ class MainActivity : Activity() {
                         imageSize.first,
                         imageSize.second
                     ))
+                    addView(messageTimeView(item, overOutgoing = item.mine).apply {
+                        setPadding(0, dp(4), dp(4), 0)
+                    }, LinearLayout.LayoutParams(
+                        imageSize.first,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ))
                     return@apply
                 }
 
-                val bubble = TextView(this@MainActivity).apply {
-                    text = if (isServiceLog) "i ${item.body}" else item.body.wrapForChatBubble()
-                    typeface = if (isServiceLog) Typeface.MONOSPACE else Typeface.DEFAULT
-                    textSize = if (isServiceLog) 14f else 15f
-                    setLineSpacing(dp(2).toFloat(), 1f)
-                    gravity = Gravity.CENTER
-                    minWidth = 0
-                    minHeight = if (isServiceLog) 0 else dp(46)
-                    setTextColor(
-                        when {
-                            isServiceLog -> MUTED_CORAL
-                            item.mine -> Color.WHITE
-                            else -> INCOMING_TEXT
-                        }
-                    )
-                    background = when {
-                        isServiceLog -> roundedDrawable(SERVICE_BUBBLE, dp(14), SERVICE_BUBBLE_STROKE)
-                        item.mine -> roundedDrawable(OUTGOING_BUBBLE, dp(20))
-                        else -> roundedDrawable(INCOMING_BUBBLE, dp(20))
-                    }
-                    setPadding(dp(18), dp(12), dp(18), dp(12))
-                    maxWidth = (resources.displayMetrics.widthPixels * 0.78f).toInt()
+                val bubble = if (isServiceLog) {
+                    serviceBubble(item)
+                } else {
+                    messageBubble(item)
                 }
                 addView(bubble, LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1345,6 +1430,139 @@ class MainActivity : Activity() {
                 ))
             }
         }
+
+        private fun shouldShowDateHeader(position: Int): Boolean {
+            if (position == 0) return true
+            val current = Calendar.getInstance().apply { timeInMillis = getItem(position).timestamp }
+            val previous = Calendar.getInstance().apply { timeInMillis = getItem(position - 1).timestamp }
+            return !current.isSameDay(previous)
+        }
+
+        private fun dateHeader(item: ChatMessage): TextView =
+            TextView(this@MainActivity).apply {
+                text = item.displayDate()
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT_DIM)
+                gravity = Gravity.CENTER
+                background = roundedDrawable(SERVICE_BUBBLE, dp(26), SERVICE_BUBBLE_STROKE)
+                setPadding(dp(14), dp(6), dp(14), dp(6))
+            }
+
+        private fun serviceBubble(item: ChatMessage): TextView =
+            TextView(this@MainActivity).apply {
+                text = "i ${item.body}"
+                typeface = Typeface.MONOSPACE
+                textSize = 14f
+                setLineSpacing(dp(2).toFloat(), 1f)
+                gravity = Gravity.CENTER
+                minWidth = 0
+                minHeight = 0
+                setTextColor(MUTED_CORAL)
+                background = roundedDrawable(SERVICE_BUBBLE, dp(26), SERVICE_BUBBLE_STROKE)
+                setPadding(dp(22), dp(12), dp(22), dp(12))
+                maxWidth = (resources.displayMetrics.widthPixels * 0.78f).toInt()
+            }
+
+        private fun messageBubble(item: ChatMessage): LinearLayout =
+            LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                minimumWidth = dp(74)
+                minimumHeight = dp(46)
+                background = if (item.mine) {
+                    roundedDrawable(OUTGOING_BUBBLE, dp(26), OUTGOING_BUBBLE_STROKE)
+                } else {
+                    roundedDrawable(INCOMING_BUBBLE, dp(26), INCOMING_BUBBLE_STROKE)
+                }
+                setPadding(dp(18), dp(10), dp(14), dp(8))
+
+                addView(TextView(this@MainActivity).apply {
+                    text = item.body.wrapForChatBubble()
+                    typeface = Typeface.DEFAULT
+                    textSize = 15f
+                    setLineSpacing(dp(2).toFloat(), 1f)
+                    setTextColor(if (item.mine) Color.WHITE else INCOMING_TEXT)
+                    maxWidth = (resources.displayMetrics.widthPixels * 0.70f).toInt()
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+
+                addView(messageTimeView(item, overOutgoing = item.mine), LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    gravity = Gravity.RIGHT
+                    topMargin = dp(2)
+                })
+            }
+
+        private fun messageTimeView(item: ChatMessage, overOutgoing: Boolean): View {
+            val tint = if (overOutgoing) 0xE6FFFFFF.toInt() else BERRY_TEXT_DIM
+            if (!item.mine || item.status == null) {
+                return TextView(this@MainActivity).apply {
+                    text = item.displayTime()
+                    textSize = 11f
+                    typeface = Typeface.DEFAULT
+                    gravity = Gravity.RIGHT
+                    setTextColor(tint)
+                }
+            }
+
+            return LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(TextView(this@MainActivity).apply {
+                    text = item.displayTime()
+                    textSize = 11f
+                    typeface = Typeface.DEFAULT
+                    gravity = Gravity.RIGHT
+                    setTextColor(tint)
+                })
+                addView(CheckMarksView(this@MainActivity, item.status ?: MessageStatus.DELIVERED, tint), LinearLayout.LayoutParams(
+                    dp(18),
+                    dp(12)
+                ).apply {
+                    marginStart = dp(4)
+                })
+            }
+        }
+    }
+
+    private inner class CheckMarksView(
+        context: Context,
+        private val status: MessageStatus,
+        color: Int
+    ) : View(context) {
+        private val markPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.STROKE
+            strokeWidth = px(1.8f)
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            if (status == MessageStatus.READ) {
+                drawMark(canvas, px(1f))
+                drawMark(canvas, px(7f))
+            } else {
+                drawMark(canvas, px(6f))
+            }
+        }
+
+        private fun drawMark(canvas: Canvas, startX: Float) {
+            val path = Path().apply {
+                moveTo(startX, px(6.5f))
+                lineTo(startX + px(3.5f), px(10f))
+                lineTo(startX + px(10f), px(2f))
+            }
+            canvas.drawPath(path, markPaint)
+        }
+
+        private fun px(value: Float): Float =
+            value * resources.displayMetrics.density
     }
 
     private inner class BorderedImageView(context: Context) : ImageView(context) {
@@ -1402,8 +1620,16 @@ class MainActivity : Activity() {
         var author: String,
         val body: String,
         val mine: Boolean,
-        val imagePath: String? = null
+        val imagePath: String? = null,
+        val timestamp: Long = System.currentTimeMillis(),
+        var messageId: UUID? = null,
+        var status: MessageStatus? = null
     )
+
+    private enum class MessageStatus(val marks: String) {
+        DELIVERED("✓"),
+        READ("✓✓")
+    }
 
     private data class PreparedImage(
         val fileName: String,
@@ -1422,9 +1648,11 @@ class MainActivity : Activity() {
         private const val MUTED_CORAL = 0xFFE88E8E.toInt()
         private const val SERVICE_BUBBLE = 0xFFFFEAEE.toInt()
         private const val SERVICE_BUBBLE_STROKE = 0xFFF5C7CF.toInt()
-        private const val INCOMING_BUBBLE = 0xFFF4F7FA.toInt()
+        private const val INCOMING_BUBBLE = 0xD9FFFFFF.toInt()
+        private const val INCOMING_BUBBLE_STROKE = 0xCCF2CDD5.toInt()
         private const val INCOMING_TEXT = 0xFF536174.toInt()
-        private const val OUTGOING_BUBBLE = 0xFFEF4F9A.toInt()
+        private const val OUTGOING_BUBBLE = 0xD9FF9FB4.toInt()
+        private const val OUTGOING_BUBBLE_STROKE = 0xCCF39AAD.toInt()
         private const val IMAGE_BORDER = 0xFFFF8FA8.toInt()
         private const val SOFT_PINK_PANEL = 0xFFFFEEF2.toInt()
         private const val SOFT_PINK_STROKE = 0xFFF6D4DC.toInt()

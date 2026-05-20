@@ -11,6 +11,7 @@ import android.net.wifi.p2p.WifiP2pDevice
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import mesh.MessageDeliveryStatus
 import mesh.MeshManager
 import mesh.PeerEvent
 import mesh.SendResult
@@ -85,6 +86,13 @@ class MeshNetworkService : Service() {
                 PeerEvent.VERIFIED -> "verified"
             }
             publish("$label: ${meshManager.getAlias(nodeId)}")
+        }
+        meshManager.setMessageStatusListener { messageId, status ->
+            val label = when (status) {
+                MessageDeliveryStatus.DELIVERED -> "delivered"
+                MessageDeliveryStatus.READ -> "read"
+            }
+            publish("message $label: $messageId")
         }
         try {
             meshManager.initialize()

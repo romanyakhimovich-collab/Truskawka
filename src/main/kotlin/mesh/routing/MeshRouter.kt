@@ -95,6 +95,7 @@ class MeshRouter(
             PacketType.HANDSHAKE_ACK -> handleHandshakeAck(packet)
             PacketType.MESSAGE -> handleMessage(packet)
             PacketType.ACK -> handleAck(packet)
+            PacketType.READ_RECEIPT -> handleReadReceipt(packet)
             PacketType.ROUTE_REQ -> handleRouteRequest(packet)
             PacketType.ROUTE_REP -> handleRouteReply(packet)
             PacketType.HEARTBEAT -> { /* Just neighbor update above */ }
@@ -157,7 +158,7 @@ class MeshRouter(
         payload: ByteArray,
         signature: ByteArray,
         requiresAck: Boolean = true
-    ) {
+    ): UUID {
         val packet = MeshPacket(
             type = PacketType.MESSAGE,
             flags = mesh.protocol.PacketFlags(
@@ -185,6 +186,7 @@ class MeshRouter(
         if (requiresAck) {
             storePendingMessage(packet)
         }
+        return packet.messageId
     }
 
     /**
@@ -251,6 +253,22 @@ class MeshRouter(
         )
         pendingMessages.removeIf { it.packet.messageId == ackedMessageId }
         messageHandler.onAckReceived(ackedMessageId)
+    }
+
+    private fun handleReadReceipt(packet: MeshPacket) {
+        val isForUs = packet.recipientId == localNodeId
+        if (isForUs) {
+            val readMessageId = UUID(
+                java.nio.ByteBuffer.wrap(packet.payload).long,
+                java.nio.ByteBuffer.wrap(packet.payload, 8, 8).long
+            )
+            messageHandler.onReadReceiptReceived(packet.senderId, readMessageId)
+            return
+        }
+
+        if (shouldRelay(packet)) {
+            relayPacket(packet)
+        }
     }
 
     private fun handleRouteRequest(packet: MeshPacket) {
@@ -435,4 +453,5 @@ interface MessageHandler {
     fun onHandshakeReceived(nodeId: UUID, publicKey: ByteArray)
     fun onHandshakeAckReceived(nodeId: UUID, encryptedPayload: ByteArray)
     fun onAckReceived(messageId: UUID)
+    fun onReadReceiptReceived(senderId: UUID, messageId: UUID)
 }
