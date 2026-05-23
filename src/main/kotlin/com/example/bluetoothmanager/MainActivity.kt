@@ -1031,7 +1031,7 @@ class MainActivity : Activity() {
                 setOnClickListener { dialog.dismiss() }
             })
         })
-        root.addView(ZoomableImageView(this).apply {
+        root.addView(ZoomableImageView(this) { dialog.dismiss() }.apply {
             setImageBitmap(BitmapFactory.decodeFile(imagePath))
             setBackgroundColor(Color.TRANSPARENT)
         }, LinearLayout.LayoutParams(
@@ -2256,12 +2256,19 @@ class MainActivity : Activity() {
         }
     }
 
-    private inner class ZoomableImageView(context: Context) : ImageView(context) {
+    private inner class ZoomableImageView(
+        context: Context,
+        private val onDragAtOriginalSize: () -> Unit
+    ) : ImageView(context) {
         private val contentMatrix = Matrix()
         private var minScale = 1f
         private var currentScale = 1f
         private var lastX = 0f
         private var lastY = 0f
+        private var downX = 0f
+        private var downY = 0f
+        private var closeTriggered = false
+        private var originalDragPrimed = false
         private var dragging = false
 
         private val scaleDetector = ScaleGestureDetector(
@@ -2271,6 +2278,9 @@ class MainActivity : Activity() {
                     val target = (currentScale * detector.scaleFactor).coerceIn(minScale, minScale * 5f)
                     val factor = target / currentScale
                     currentScale = target
+                    if (currentScale > minScale * 1.05f) {
+                        originalDragPrimed = false
+                    }
                     contentMatrix.postScale(factor, factor, detector.focusX, detector.focusY)
                     constrainImage()
                     imageMatrix = contentMatrix
@@ -2286,6 +2296,7 @@ class MainActivity : Activity() {
                     val target = if (currentScale > minScale * 1.4f) minScale else minScale * 2.4f
                     val factor = target / currentScale
                     currentScale = target
+                    originalDragPrimed = false
                     contentMatrix.postScale(factor, factor, e.x, e.y)
                     constrainImage()
                     imageMatrix = contentMatrix
@@ -2317,10 +2328,27 @@ class MainActivity : Activity() {
                 MotionEvent.ACTION_DOWN -> {
                     lastX = event.x
                     lastY = event.y
+                    downX = event.x
+                    downY = event.y
+                    closeTriggered = false
                     dragging = true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    if (dragging && !scaleDetector.isInProgress && currentScale > minScale) {
+                    if (dragging && !scaleDetector.isInProgress && currentScale <= minScale * 1.05f) {
+                        val moved = kotlin.math.hypot(
+                            (event.x - downX).toDouble(),
+                            (event.y - downY).toDouble()
+                        )
+                        if (!closeTriggered && moved > dp(34)) {
+                            closeTriggered = true
+                            if (originalDragPrimed) {
+                                onDragAtOriginalSize()
+                            } else {
+                                originalDragPrimed = true
+                                resetImageMatrix()
+                            }
+                        }
+                    } else if (dragging && !scaleDetector.isInProgress && currentScale > minScale) {
                         contentMatrix.postTranslate(event.x - lastX, event.y - lastY)
                         constrainImage()
                         imageMatrix = contentMatrix
