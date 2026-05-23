@@ -79,8 +79,8 @@ class MeshManager(
     private val pendingOutbox = ConcurrentHashMap<UUID, MutableList<PendingOutboxMessage>>()
 
     // Message listeners
-    private var messageListener: ((senderId: UUID, message: String, timestamp: Long) -> Unit)? = null
-    private var fileListener: ((senderId: UUID, fileName: String, mimeType: String, bytes: ByteArray, timestamp: Long) -> Unit)? = null
+    private var messageListener: ((senderId: UUID, message: String, timestamp: Long, isBroadcast: Boolean) -> Unit)? = null
+    private var fileListener: ((senderId: UUID, fileName: String, mimeType: String, bytes: ByteArray, timestamp: Long, isBroadcast: Boolean) -> Unit)? = null
     private var peerListener: ((nodeId: UUID, event: PeerEvent) -> Unit)? = null
     private var messageStatusListener: ((messageId: UUID, status: MessageDeliveryStatus) -> Unit)? = null
 
@@ -376,7 +376,8 @@ class MeshManager(
                 mimeType = mimeType,
                 totalBytes = totalBytes,
                 chunks = arrayOfNulls(chunkCount),
-                timestamp = packet.timestamp
+                timestamp = packet.timestamp,
+                isBroadcast = packet.isBroadcast()
             )
         }
     }
@@ -410,7 +411,8 @@ class MeshManager(
                         transfer.fileName,
                         transfer.mimeType,
                         bytes,
-                        transfer.timestamp
+                        transfer.timestamp,
+                        transfer.isBroadcast
                     )
                 }
             }
@@ -448,7 +450,7 @@ class MeshManager(
 
         // Deliver to application
         val message = String(plaintext, Charsets.UTF_8)
-        messageListener?.invoke(packet.senderId, message, packet.timestamp)
+        messageListener?.invoke(packet.senderId, message, packet.timestamp, packet.isBroadcast())
         if (!packet.isBroadcast()) {
             sendReadReceipt(packet.senderId, packet.messageId)
         }
@@ -577,11 +579,11 @@ class MeshManager(
 
     // ==================== Public API ====================
 
-    fun setMessageListener(listener: (senderId: UUID, message: String, timestamp: Long) -> Unit) {
+    fun setMessageListener(listener: (senderId: UUID, message: String, timestamp: Long, isBroadcast: Boolean) -> Unit) {
         this.messageListener = listener
     }
 
-    fun setFileListener(listener: (senderId: UUID, fileName: String, mimeType: String, bytes: ByteArray, timestamp: Long) -> Unit) {
+    fun setFileListener(listener: (senderId: UUID, fileName: String, mimeType: String, bytes: ByteArray, timestamp: Long, isBroadcast: Boolean) -> Unit) {
         this.fileListener = listener
     }
 
@@ -628,7 +630,8 @@ data class IncomingFileTransfer(
     val mimeType: String,
     val totalBytes: Int,
     val chunks: Array<ByteArray?>,
-    val timestamp: Long
+    val timestamp: Long,
+    val isBroadcast: Boolean
 )
 
 enum class PeerEvent {

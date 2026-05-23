@@ -75,6 +75,7 @@ class MainActivity : Activity() {
     )
     private val meshMessages = messages.toMutableList()
     private val savedMessages = mutableListOf<ChatMessage>()
+    private val peerMessages = mutableMapOf<String, MutableList<ChatMessage>>()
     private lateinit var chatAdapter: ChatAdapter
 
     private lateinit var usernameField: EditText
@@ -116,6 +117,7 @@ class MainActivity : Activity() {
             meshService?.addLogListener(logListener)
             currentNickname = meshService?.getNickname()?.take(MAX_NICKNAME_LENGTH) ?: "@jachimowicz"
             usernameField.setText(currentNickname)
+            syncKnownPeers()
             refreshHeader()
             addMessage("system", "service connected", false)
             if (meshService?.hasStoredNickname() == false) {
@@ -221,9 +223,7 @@ class MainActivity : Activity() {
                     textSize = 18f
                     setTextColor(STRAWBERRY_RED)
                     setPadding(0, dp(6), dp(4), dp(6))
-                    setOnClickListener {
-                        addMessage("system", "chat list placeholder", false)
-                    }
+                    setOnClickListener { showChatList() }
                 })
 
                 usernameField = EditText(this@MainActivity).apply {
@@ -682,12 +682,139 @@ class MainActivity : Activity() {
         actionButton.text = if (messageInput.text.toString().isBlank()) "^" else ">"
     }
 
+    private fun showChatList() {
+        syncKnownPeers()
+        chatStore.ensureBaseChats()
+
+        val dialog = Dialog(this).apply {
+            requestWindowFeature(Window.FEATURE_NO_TITLE)
+        }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(18), dp(18), dp(18))
+            setBackgroundColor(SOFT_PINK_PANEL)
+        }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(terminalText("Chats").apply {
+                textSize = 22f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(terminalAction("+").apply {
+                textSize = 20f
+                background = circleDrawable(ACCENT_PINK)
+                setOnClickListener {
+                    dialog.dismiss()
+                    showMeshPanel(scanFirst = true)
+                }
+            }, LinearLayout.LayoutParams(dp(36), dp(36)))
+            addView(terminalAction("X").apply {
+                textSize = 18f
+                setOnClickListener { dialog.dismiss() }
+            })
+        }
+        root.addView(header)
+
+        val summaries = chatStore.listChats()
+            .filter { it.kind != ChatKind.PEER.name || it.peerId != null }
+        if (summaries.isEmpty()) {
+            root.addView(terminalText("No chats yet").apply {
+                textSize = 14f
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(0, dp(24), 0, 0)
+            })
+        } else {
+            summaries.forEach { summary ->
+                root.addView(chatSummaryRow(summary) {
+                    val peerId = summary.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+                    selectChat(summary.chatKey, summary.title, peerId)
+                    dialog.dismiss()
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    topMargin = dp(10)
+                })
+            }
+        }
+
+        dialog.setContentView(root)
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        dialog.show()
+        dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+    }
+
+    private fun chatSummaryRow(summary: ChatSummary, onClick: () -> Unit): LinearLayout {
+        val preview = when {
+            summary.lastImagePath != null -> "photo"
+            summary.lastBody.isNotBlank() -> summary.lastBody
+            summary.kind == ChatKind.SAVED.name -> "private notes for yourself"
+            summary.kind == ChatKind.EVERYONE.name -> "nearby public mesh"
+            summary.verified -> "verified contact"
+            else -> "tap to open chat"
+        }
+        val selected = summary.chatKey == currentChatKey()
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = roundedDrawable(
+                if (selected) ACCENT_PINK else INPUT_SURFACE,
+                dp(20),
+                if (selected) STRAWBERRY_RED else SOFT_PINK_STROKE
+            )
+            addView(TextView(this@MainActivity).apply {
+                text = when (summary.kind) {
+                    ChatKind.SAVED.name -> "*"
+                    ChatKind.EVERYONE.name -> "#"
+                    else -> if (summary.verified) "ok" else "@"
+                }
+                typeface = Typeface.DEFAULT_BOLD
+                textSize = 13f
+                gravity = Gravity.CENTER
+                setTextColor(STRAWBERRY_RED)
+                background = circleDrawable(0x33FFB7C5)
+            }, LinearLayout.LayoutParams(dp(38), dp(38)).apply {
+                marginEnd = dp(12)
+            })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(terminalText(summary.title.toDisplayTitle()).apply {
+                    textSize = 16f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(BERRY_TEXT)
+                    maxLines = 1
+                })
+                addView(terminalText(preview).apply {
+                    textSize = 12f
+                    setTextColor(BERRY_TEXT_DIM)
+                    maxLines = 1
+                    setPadding(0, dp(4), 0, 0)
+                })
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            if (summary.messageCount > 0) {
+                addView(terminalText(summary.messageCount.toString()).apply {
+                    textSize = 12f
+                    gravity = Gravity.CENTER
+                    setTextColor(BERRY_TEXT)
+                    background = roundedDrawable(0x22FF4D6D, dp(12))
+                    setPadding(dp(8), dp(3), dp(8), dp(3))
+                })
+            }
+            setOnClickListener { onClick() }
+        }
+    }
+
     private fun showMeshPanel(scanFirst: Boolean) {
         val count = if (scanFirst) {
             meshService?.searchPeople() ?: 0
         } else {
             meshService?.peerCount() ?: 0
         }
+        syncKnownPeers()
         counterView.text = count.toString()
 
         val dialog = Dialog(this).apply {
@@ -728,6 +855,10 @@ class MainActivity : Activity() {
                 val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
                 query.isBlank() || label.lowercase(Locale.getDefault()).contains(query)
             }
+            peers.forEach { peer ->
+                val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
+                rememberPeer(peer.nodeId, label)
+            }
             if (peers.isEmpty()) {
                 peopleContainer.addView(terminalText(if (query.isBlank()) "Searching nearby..." else "No matches").apply {
                     textSize = 14f
@@ -736,14 +867,11 @@ class MainActivity : Activity() {
             } else {
                 peers.forEach { peer ->
                     val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
-                    peopleContainer.addView(networkActionRow(label, "tap to chat", !savedMessagesSelected && selectedRecipientId == peer.nodeId) {
-                        savedMessagesSelected = false
-                        selectedRecipientId = peer.nodeId
-                        selectedRecipientLabel = label
+                    val verified = chatStore.getPeer(peer.nodeId.toString())?.verified == true
+                    peopleContainer.addView(networkActionRow(label, if (verified) "verified contact" else "tap to chat", !savedMessagesSelected && selectedRecipientId == peer.nodeId) {
+                        rememberPeer(peer.nodeId, label)
                         meshService?.prepareChatWith(peer.nodeId.toString())
-                        showMeshMessages()
-                        updateRecipientHint()
-                        updateChatTitle()
+                        selectChat(peerChatKey(peer.nodeId), label, peer.nodeId)
                         dialog.dismiss()
                     })
                 }
@@ -756,7 +884,7 @@ class MainActivity : Activity() {
             addView(nearbyTitle, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(terminalAction("qr").apply {
                 textSize = 13f
-                setOnClickListener { addMessage("system", "qr placeholder", false) }
+                setOnClickListener { showCurrentChatProfile() }
             })
             addView(terminalAction("X").apply {
                 textSize = 18f
@@ -766,22 +894,12 @@ class MainActivity : Activity() {
         root.addView(header)
 
         root.addView(networkActionRow("Everyone", "broadcast mode", !savedMessagesSelected && selectedRecipientId == null) {
-            savedMessagesSelected = false
-            selectedRecipientId = null
-            selectedRecipientLabel = "everyone"
-            showMeshMessages()
-            updateRecipientHint()
-            updateChatTitle()
+            selectChat(CHAT_EVERYONE, "everyone", null)
             dialog.dismiss()
         })
 
         root.addView(networkActionRow("Saved messages", "private local chat", savedMessagesSelected) {
-            savedMessagesSelected = true
-            selectedRecipientId = null
-            selectedRecipientLabel = "saved"
-            showSavedMessages()
-            updateRecipientHint()
-            updateChatTitle()
+            selectChat(CHAT_SAVED, "saved", null)
             dialog.dismiss()
         })
 
@@ -928,16 +1046,26 @@ class MainActivity : Activity() {
         body: String,
         mine: Boolean,
         timestamp: Long = System.currentTimeMillis(),
-        status: MessageStatus? = null
+        status: MessageStatus? = null,
+        chatKey: String = currentChatKey()
     ): ChatMessage {
         val message = ChatMessage(author, body, mine, timestamp = timestamp, status = status)
-        meshMessages += message
-        persistChatMessage(CHAT_MESH, message)
-        if (!savedMessagesSelected) {
+        val isServiceMessage = author == "system" || author == "mesh"
+        val actualChatKey = if (isServiceMessage && savedMessagesSelected) CHAT_EVERYONE else chatKey
+        val buffer = messagesForChat(actualChatKey)
+        if (buffer.isNotEmpty() && buffer.size == 1 && buffer.first().author == "system") {
+            buffer.clear()
+        }
+        buffer += message
+        persistChatMessage(actualChatKey, message)
+        if (currentChatKey() == actualChatKey && !savedMessagesSelected) {
+            if (messages.size == 1 && messages.firstOrNull()?.author == "system") {
+                messages.clear()
+            }
             messages += message
+            chatList.post { chatList.setSelection(chatAdapter.count - 1) }
         }
         chatAdapter.notifyDataSetChanged()
-        chatList.post { chatList.setSelection(chatAdapter.count - 1) }
         return message
     }
 
@@ -945,32 +1073,44 @@ class MainActivity : Activity() {
         author: String,
         imagePath: String,
         mine: Boolean,
-        timestamp: Long = System.currentTimeMillis()
+        timestamp: Long = System.currentTimeMillis(),
+        chatKey: String = currentChatKey()
     ) {
         val message = ChatMessage(author, "", mine, imagePath, timestamp)
-        meshMessages += message
-        persistChatMessage(CHAT_MESH, message)
-        if (!savedMessagesSelected) {
+        val actualChatKey = if (author == "system" || author == "mesh") CHAT_EVERYONE else chatKey
+        val buffer = messagesForChat(actualChatKey)
+        if (buffer.isNotEmpty() && buffer.size == 1 && buffer.first().author == "system") {
+            buffer.clear()
+        }
+        buffer += message
+        persistChatMessage(actualChatKey, message)
+        if (currentChatKey() == actualChatKey && !savedMessagesSelected) {
+            if (messages.size == 1 && messages.firstOrNull()?.author == "system") {
+                messages.clear()
+            }
             messages += message
+            chatList.post { chatList.setSelection(chatAdapter.count - 1) }
         }
         chatAdapter.notifyDataSetChanged()
-        chatList.post { chatList.setSelection(chatAdapter.count - 1) }
     }
 
     private fun addReceivedText(line: String) {
         val meta = line.substringAfter("message from ", "")
-        val author = meta.substringBefore(" at ", "@peer").ifBlank { "@peer" }
+        val sender = parseIncomingSender(meta.substringBefore(" at ", "@peer"))
+        val author = sender.label
         val timestampAndBody = meta.substringAfter(" at ", "")
         val timestamp = timestampAndBody.substringBefore(": ", "")
             .toLongOrNull()
             ?: System.currentTimeMillis()
         val body = timestampAndBody.substringAfter(": ", line)
-        addMessage(author, body, mine = false, timestamp = timestamp)
+        sender.nodeId?.let { rememberPeer(it, author) }
+        addMessage(author, body, mine = false, timestamp = timestamp, chatKey = incomingChatKey(sender))
     }
 
     private fun addReceivedImage(line: String) {
         val meta = line.substringAfter("image from ", "")
-        val author = meta.substringBefore(" at ", "@peer").ifBlank { "@peer" }
+        val sender = parseIncomingSender(meta.substringBefore(" at ", "@peer"))
+        val author = sender.label
         val timestampAndPayload = meta.substringAfter(" at ", "")
         val timestamp = timestampAndPayload.substringBefore(": ", "")
             .toLongOrNull()
@@ -978,7 +1118,8 @@ class MainActivity : Activity() {
         val payload = timestampAndPayload.substringAfter(": ", line.substringAfter(": ", ""))
         val imagePath = payload.substringBefore("|")
         if (imagePath.isBlank()) return
-        addImageMessage(author, imagePath, mine = false, timestamp = timestamp)
+        sender.nodeId?.let { rememberPeer(it, author) }
+        addImageMessage(author, imagePath, mine = false, timestamp = timestamp, chatKey = incomingChatKey(sender))
         showImageProgress("image received")
         mainHandler.postDelayed({ hideImageProgress() }, 1_200)
     }
@@ -997,14 +1138,16 @@ class MainActivity : Activity() {
     private fun updateMessageStatus(messageIdText: String, status: MessageStatus) {
         val messageId = runCatching { UUID.fromString(messageIdText) }.getOrNull() ?: return
         var changed = false
-        meshMessages
-            .filter { it.mine && it.messageId == messageId }
-            .forEach { message ->
-                if (message.status != MessageStatus.READ) {
-                    message.status = status
-                    changed = true
+        (listOf(meshMessages, savedMessages, messages) + peerMessages.values)
+            .forEach { buffer ->
+                buffer.filter { it.mine && it.messageId == messageId }
+                    .forEach { message ->
+                        if (message.status != MessageStatus.READ) {
+                            message.status = status
+                            changed = true
+                        }
+                    }
                 }
-            }
         if (changed) {
             chatStore.updateStatusByMeshMessageId(messageId.toString(), status.name)
             chatAdapter.notifyDataSetChanged()
@@ -1033,16 +1176,90 @@ class MainActivity : Activity() {
     }
 
     private fun showMeshMessages() {
+        showChatMessages(CHAT_EVERYONE)
+    }
+
+    private fun selectChat(chatKey: String, title: String, peerId: UUID?) {
+        savedMessagesSelected = chatKey == CHAT_SAVED
+        selectedRecipientId = peerId
+        selectedRecipientLabel = when {
+            chatKey == CHAT_SAVED -> "saved"
+            chatKey == CHAT_EVERYONE -> "everyone"
+            else -> title
+        }
+        if (savedMessagesSelected) {
+            showSavedMessages()
+        } else {
+            showChatMessages(chatKey)
+        }
+        updateRecipientHint()
+        updateChatTitle()
+    }
+
+    private fun showChatMessages(chatKey: String) {
         messages.clear()
-        messages += meshMessages
+        messages += messagesForChat(chatKey)
+        if (messages.isEmpty()) {
+            messages += ChatMessage("system", if (chatKey == CHAT_EVERYONE) "broadcast is empty" else "chat is empty", false)
+        }
         chatAdapter.notifyDataSetChanged()
         chatList.post { chatList.setSelection(chatAdapter.count - 1) }
     }
 
+    private fun currentChatKey(): String = when {
+        savedMessagesSelected -> CHAT_SAVED
+        selectedRecipientId != null -> peerChatKey(selectedRecipientId!!)
+        else -> CHAT_EVERYONE
+    }
+
+    private fun peerChatKey(peerId: UUID): String = "peer:$peerId"
+
+    private fun messagesForChat(chatKey: String): MutableList<ChatMessage> =
+        when (chatKey) {
+            CHAT_SAVED -> savedMessages
+            CHAT_EVERYONE -> meshMessages
+            else -> peerMessages.getOrPut(chatKey) {
+                chatStore.loadMessages(chatKey)
+                    .map { it.toChatMessage(defaultStatus = null) }
+                    .toMutableList()
+            }
+        }
+
+    private fun rememberPeer(peerId: UUID, label: String) {
+        val existing = chatStore.getPeer(peerId.toString())
+        chatStore.upsertPeer(
+            StoredPeer(
+                nodeId = peerId.toString(),
+                alias = label,
+                fingerprint = peerFingerprint(peerId),
+                verified = existing?.verified == true,
+                lastSeen = System.currentTimeMillis()
+            )
+        )
+    }
+
+    private fun syncKnownPeers() {
+        meshService?.knownPeers().orEmpty().forEach { peer ->
+            rememberPeer(peer.nodeId, peer.displayName ?: "@${peer.nodeId.toString().take(8)}")
+        }
+    }
+
+    private fun parseIncomingSender(raw: String): IncomingSender {
+        val parts = raw.split("|")
+        val label = parts.firstOrNull().orEmpty().ifBlank { "@peer" }
+        val nodeId = parts.getOrNull(1)?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+        val isBroadcast = parts.getOrNull(2) == "broadcast"
+        return IncomingSender(label, nodeId, isBroadcast)
+    }
+
+    private fun incomingChatKey(sender: IncomingSender): String =
+        if (sender.isBroadcast || sender.nodeId == null) CHAT_EVERYONE else peerChatKey(sender.nodeId)
+
     private fun loadStoredMessages() {
+        chatStore.ensureBaseChats()
         migrateSavedMessagesIfNeeded()
 
-        val storedMesh = chatStore.loadMessages(CHAT_MESH).map { it.toChatMessage(defaultStatus = null) }
+        val storedMesh = chatStore.loadMessages(CHAT_EVERYONE).map { it.toChatMessage(defaultStatus = null) }
         if (storedMesh.isNotEmpty()) {
             meshMessages.clear()
             meshMessages += storedMesh
@@ -1090,8 +1307,10 @@ class MainActivity : Activity() {
         (meshMessages + savedMessages + messages)
             .filter { it.mine }
             .forEach { it.author = next }
-        rebuildStoredChat(CHAT_MESH, meshMessages)
-        rebuildStoredChat(CHAT_SAVED, savedMessages)
+        peerMessages.values.flatten()
+            .filter { it.mine }
+            .forEach { it.author = next }
+        chatStore.updateMineAuthor(next)
         chatAdapter.notifyDataSetChanged()
     }
 
@@ -1203,15 +1422,20 @@ class MainActivity : Activity() {
 
     private fun showCurrentChatProfile() {
         val title = selectedRecipientLabel.toDisplayTitle()
+        val peerId = selectedRecipientId
+        val storedPeer = peerId?.let { chatStore.getPeer(it.toString()) }
+        val fingerprint = peerId?.let { storedPeer?.fingerprint ?: peerFingerprint(it) }
+        val verified = storedPeer?.verified == true
         val subtitle = when {
             savedMessagesSelected -> "Private local chat stored on this device."
             selectedRecipientId == null -> "Broadcast chat for everyone nearby."
-            else -> "Peer ID: ${selectedRecipientId.toString().take(8)}...${selectedRecipientId.toString().takeLast(6)}"
+            else -> "Peer ID: ${peerId.toString().take(8)}...${peerId.toString().takeLast(6)}"
         }
         val action = when {
             savedMessagesSelected -> "Saved messages are automatically marked as read."
             selectedRecipientId == null -> "Messages here are public to nearby mesh users."
-            else -> "Tap Nearby to reconnect or switch people."
+            verified -> "This contact is marked as verified on this device."
+            else -> "Compare the code with your friend, then mark it verified."
         }
 
         val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
@@ -1237,6 +1461,32 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER
                 setPadding(0, 0, 0, dp(18))
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            if (peerId != null && fingerprint != null) {
+                addView(terminalText(fingerprint.chunked(4).joinToString(" ")).apply {
+                    textSize = 18f
+                    typeface = Typeface.MONOSPACE
+                    gravity = Gravity.CENTER
+                    setTextColor(BERRY_TEXT)
+                    background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                    setPadding(dp(12), dp(12), dp(12), dp(12))
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    bottomMargin = dp(10)
+                })
+                addView(terminalAction(if (verified) "Verified" else "Mark as verified").apply {
+                    textSize = 16f
+                    gravity = Gravity.CENTER
+                    background = roundedDrawable(if (verified) 0x33FF4D6D else ACCENT_PINK, dp(18), SOFT_PINK_STROKE)
+                    setOnClickListener {
+                        rememberPeer(peerId, selectedRecipientLabel)
+                        chatStore.setPeerVerified(peerId.toString(), true)
+                        Toast.makeText(this@MainActivity, "Contact verified", Toast.LENGTH_SHORT).show()
+                        dialog.dismiss()
+                        updateChatTitle()
+                    }
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    bottomMargin = dp(10)
+                })
+            }
             addView(terminalAction("Close").apply {
                 textSize = 16f
                 gravity = Gravity.CENTER
@@ -1263,6 +1513,12 @@ class MainActivity : Activity() {
         "saved" -> "Saved messages"
         else -> this
     }
+
+    private fun peerFingerprint(peerId: UUID): String =
+        peerId.toString()
+            .replace("-", "")
+            .take(20)
+            .uppercase(Locale.getDefault())
 
     private fun keepNicknamePrefix() {
         if (normalizingNickname) return
@@ -1893,6 +2149,12 @@ class MainActivity : Activity() {
         val bytes: ByteArray
     )
 
+    private data class IncomingSender(
+        val label: String,
+        val nodeId: UUID?,
+        val isBroadcast: Boolean
+    )
+
     companion object {
         private const val CREAM_BACKGROUND = 0xFFFFF5F5.toInt()
         private const val BERRY_TEXT = 0xFF8E444D.toInt()
@@ -1913,7 +2175,7 @@ class MainActivity : Activity() {
         private const val SOFT_PINK_PANEL = 0xFFFFEEF2.toInt()
         private const val SOFT_PINK_STROKE = 0xFFF6D4DC.toInt()
         private const val MAX_NICKNAME_LENGTH = 12
-        private const val CHAT_MESH = "mesh"
+        private const val CHAT_EVERYONE = "everyone"
         private const val CHAT_SAVED = "saved"
         private const val SAVED_MESSAGES_PREFS = "saved_messages"
         private const val SAVED_MESSAGES_KEY = "items"

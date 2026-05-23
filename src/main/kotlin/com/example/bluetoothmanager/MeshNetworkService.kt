@@ -71,12 +71,14 @@ class MeshNetworkService : Service() {
             wifiDirectTransport = wifiDirectSocketManager,
             localNodeId = localNodeId
         )
-        meshManager.setMessageListener { senderId, message, timestamp ->
-            publish("message from ${meshManager.getAlias(senderId)} at $timestamp: $message")
+        meshManager.setMessageListener { senderId, message, timestamp, isBroadcast ->
+            val scope = if (isBroadcast) "broadcast" else "private"
+            publish("message from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: $message")
         }
-        meshManager.setFileListener { senderId, fileName, mimeType, bytes, timestamp ->
+        meshManager.setFileListener { senderId, fileName, mimeType, bytes, timestamp, isBroadcast ->
             val file = writeIncomingImage(fileName, bytes)
-            publish("image from ${meshManager.getAlias(senderId)} at $timestamp: ${file.absolutePath}|$mimeType")
+            val scope = if (isBroadcast) "broadcast" else "private"
+            publish("image from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: ${file.absolutePath}|$mimeType")
         }
         meshManager.setPeerListener { nodeId, event ->
             val label = when (event) {
@@ -126,6 +128,8 @@ class MeshNetworkService : Service() {
     }
 
     fun knownPeers() = meshManager.getKnownPeers()
+
+    fun getLocalFingerprint(): String = meshManager.getLocalFingerprint()
 
     fun peerCount(): Int = meshManager.getKnownPeers().size + wifiDirectSocketManager.peerCount()
 
