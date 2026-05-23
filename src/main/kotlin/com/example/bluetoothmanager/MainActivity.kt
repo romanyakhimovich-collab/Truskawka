@@ -14,6 +14,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ImageDecoder
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PorterDuff
@@ -34,7 +35,10 @@ import android.text.InputFilter
 import android.text.InputType
 import android.text.TextWatcher
 import android.view.Gravity
+import android.view.GestureDetector
 import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
@@ -795,12 +799,13 @@ class MainActivity : Activity() {
                     setPadding(0, dp(4), 0, 0)
                 })
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            if (summary.messageCount > 0) {
-                addView(terminalText(summary.messageCount.toString()).apply {
+            if (summary.unreadCount > 0) {
+                addView(terminalText(summary.unreadCount.toString()).apply {
                     textSize = 12f
                     gravity = Gravity.CENTER
-                    setTextColor(BERRY_TEXT)
-                    background = roundedDrawable(0x22FF4D6D, dp(12))
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.WHITE)
+                    background = roundedDrawable(STRAWBERRY_RED, dp(12))
                     setPadding(dp(8), dp(3), dp(8), dp(3))
                 })
             }
@@ -867,8 +872,13 @@ class MainActivity : Activity() {
             } else {
                 peers.forEach { peer ->
                     val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
-                    val verified = chatStore.getPeer(peer.nodeId.toString())?.verified == true
-                    peopleContainer.addView(networkActionRow(label, if (verified) "verified contact" else "tap to chat", !savedMessagesSelected && selectedRecipientId == peer.nodeId) {
+                    val stored = chatStore.getPeer(peer.nodeId.toString())
+                    val verified = stored?.verified == true
+                    val subtitle = listOfNotNull(
+                        if (verified) "verified" else null,
+                        stored?.let { formatPeerPresence(it.lastSeen) } ?: "online now"
+                    ).joinToString(" / ")
+                    peopleContainer.addView(networkActionRow(label, subtitle, !savedMessagesSelected && selectedRecipientId == peer.nodeId) {
                         rememberPeer(peer.nodeId, label)
                         meshService?.prepareChatWith(peer.nodeId.toString())
                         selectChat(peerChatKey(peer.nodeId), label, peer.nodeId)
@@ -1021,10 +1031,8 @@ class MainActivity : Activity() {
                 setOnClickListener { dialog.dismiss() }
             })
         })
-        root.addView(ImageView(this).apply {
+        root.addView(ZoomableImageView(this).apply {
             setImageBitmap(BitmapFactory.decodeFile(imagePath))
-            adjustViewBounds = true
-            scaleType = ImageView.ScaleType.FIT_CENTER
             setBackgroundColor(Color.TRANSPARENT)
         }, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1104,7 +1112,9 @@ class MainActivity : Activity() {
             ?: System.currentTimeMillis()
         val body = timestampAndBody.substringAfter(": ", line)
         sender.nodeId?.let { rememberPeer(it, author) }
-        addMessage(author, body, mine = false, timestamp = timestamp, chatKey = incomingChatKey(sender))
+        val chatKey = incomingChatKey(sender)
+        if (chatKey != currentChatKey()) chatStore.incrementUnread(chatKey)
+        addMessage(author, body, mine = false, timestamp = timestamp, chatKey = chatKey)
     }
 
     private fun addReceivedImage(line: String) {
@@ -1119,7 +1129,9 @@ class MainActivity : Activity() {
         val imagePath = payload.substringBefore("|")
         if (imagePath.isBlank()) return
         sender.nodeId?.let { rememberPeer(it, author) }
-        addImageMessage(author, imagePath, mine = false, timestamp = timestamp, chatKey = incomingChatKey(sender))
+        val chatKey = incomingChatKey(sender)
+        if (chatKey != currentChatKey()) chatStore.incrementUnread(chatKey)
+        addImageMessage(author, imagePath, mine = false, timestamp = timestamp, chatKey = chatKey)
         showImageProgress("image received")
         mainHandler.postDelayed({ hideImageProgress() }, 1_200)
     }
@@ -1192,6 +1204,7 @@ class MainActivity : Activity() {
         } else {
             showChatMessages(chatKey)
         }
+        chatStore.clearUnread(chatKey)
         updateRecipientHint()
         updateChatTitle()
     }
@@ -1429,7 +1442,7 @@ class MainActivity : Activity() {
         val subtitle = when {
             savedMessagesSelected -> "Private local chat stored on this device."
             selectedRecipientId == null -> "Broadcast chat for everyone nearby."
-            else -> "Peer ID: ${peerId.toString().take(8)}...${peerId.toString().takeLast(6)}"
+            else -> "${formatPeerPresence(storedPeer?.lastSeen ?: 0L)} / Peer ID: ${peerId.toString().take(8)}...${peerId.toString().takeLast(6)}"
         }
         val action = when {
             savedMessagesSelected -> "Saved messages are automatically marked as read."
@@ -1461,6 +1474,17 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER
                 setPadding(0, 0, 0, dp(18))
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(terminalAction("Search messages").apply {
+                textSize = 16f
+                gravity = Gravity.CENTER
+                background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                setOnClickListener {
+                    dialog.dismiss()
+                    showMessageSearchDialog(currentChatKey())
+                }
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(10)
+            })
             if (peerId != null && fingerprint != null) {
                 addView(terminalText(fingerprint.chunked(4).joinToString(" ")).apply {
                     textSize = 18f
@@ -1508,10 +1532,137 @@ class MainActivity : Activity() {
         dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
     }
 
+    private fun showMessageSearchDialog(chatKey: String) {
+        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(18), dp(18), dp(18))
+            setBackgroundColor(SOFT_PINK_PANEL)
+        }
+        val resultsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        val input = EditText(this).apply {
+            hint = "search messages..."
+            setSingleLine(true)
+            typeface = Typeface.MONOSPACE
+            textSize = 15f
+            setTextColor(BERRY_TEXT)
+            setHintTextColor(BERRY_TEXT_DIM)
+            background = roundedDrawable(INPUT_SURFACE, dp(20), SOFT_PINK_STROKE)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+        }
+
+        fun renderResults() {
+            val query = input.text?.toString().orEmpty().trim().lowercase(Locale.getDefault())
+            resultsContainer.removeAllViews()
+            if (query.isBlank()) {
+                resultsContainer.addView(terminalText("Type to search this chat").apply {
+                    textSize = 14f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setPadding(0, dp(18), 0, 0)
+                })
+                return
+            }
+
+            val results = messagesForChat(chatKey)
+                .filterNot { it.author == "system" || it.author == "mesh" }
+                .filter { message ->
+                    message.body.lowercase(Locale.getDefault()).contains(query) ||
+                        message.author.lowercase(Locale.getDefault()).contains(query) ||
+                        (message.imagePath != null && "photo".contains(query))
+                }
+                .take(25)
+
+            if (results.isEmpty()) {
+                resultsContainer.addView(terminalText("No matches").apply {
+                    textSize = 14f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setPadding(0, dp(18), 0, 0)
+                })
+            } else {
+                results.forEach { result ->
+                    resultsContainer.addView(searchResultRow(result) {
+                        val index = messages.indexOf(result)
+                        if (index >= 0) chatList.setSelection(index)
+                        dialog.dismiss()
+                    }, LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        topMargin = dp(10)
+                    })
+                }
+            }
+        }
+
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(terminalText("Search").apply {
+                textSize = 22f
+                typeface = Typeface.DEFAULT_BOLD
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(terminalAction("X").apply {
+                textSize = 18f
+                setOnClickListener { dialog.dismiss() }
+            })
+        })
+        root.addView(input, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            topMargin = dp(16)
+        })
+        root.addView(resultsContainer)
+        input.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = renderResults()
+            override fun afterTextChanged(s: Editable?) = Unit
+        })
+        renderResults()
+
+        dialog.setContentView(root)
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        dialog.show()
+        dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+        input.requestFocus()
+        showKeyboard(input)
+    }
+
+    private fun searchResultRow(message: ChatMessage, onClick: () -> Unit): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+            addView(terminalText("${message.displayAuthor()}  ${message.displayDate()} ${message.displayTime()}").apply {
+                textSize = 12f
+                setTextColor(BERRY_TEXT_DIM)
+            })
+            addView(terminalText(message.body.ifBlank { "photo" }).apply {
+                textSize = 14f
+                setTextColor(BERRY_TEXT)
+                maxLines = 2
+                setPadding(0, dp(6), 0, 0)
+            })
+            setOnClickListener { onClick() }
+        }
+
     private fun String.toDisplayTitle(): String = when (this) {
         "everyone" -> "Everyone"
         "saved" -> "Saved messages"
         else -> this
+    }
+
+    private fun formatPeerPresence(lastSeen: Long): String {
+        if (lastSeen <= 0L) return "seen recently"
+        val elapsed = System.currentTimeMillis() - lastSeen
+        return when {
+            elapsed < 2L * 60L * 1000L -> "online now"
+            elapsed < 60L * 60L * 1000L -> "seen ${elapsed / 60_000L} min ago"
+            elapsed < 24L * 60L * 60L * 1000L -> "seen ${elapsed / 3_600_000L} h ago"
+            else -> "seen ${elapsed / 86_400_000L} d ago"
+        }
     }
 
     private fun peerFingerprint(peerId: UUID): String =
@@ -2102,6 +2253,128 @@ class MainActivity : Activity() {
                 height - halfStroke
             )
             canvas.drawRoundRect(rect, radius, radius, borderPaint)
+        }
+    }
+
+    private inner class ZoomableImageView(context: Context) : ImageView(context) {
+        private val contentMatrix = Matrix()
+        private var minScale = 1f
+        private var currentScale = 1f
+        private var lastX = 0f
+        private var lastY = 0f
+        private var dragging = false
+
+        private val scaleDetector = ScaleGestureDetector(
+            context,
+            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScale(detector: ScaleGestureDetector): Boolean {
+                    val target = (currentScale * detector.scaleFactor).coerceIn(minScale, minScale * 5f)
+                    val factor = target / currentScale
+                    currentScale = target
+                    contentMatrix.postScale(factor, factor, detector.focusX, detector.focusY)
+                    constrainImage()
+                    imageMatrix = contentMatrix
+                    return true
+                }
+            }
+        )
+
+        private val gestureDetector = GestureDetector(
+            context,
+            object : GestureDetector.SimpleOnGestureListener() {
+                override fun onDoubleTap(e: MotionEvent): Boolean {
+                    val target = if (currentScale > minScale * 1.4f) minScale else minScale * 2.4f
+                    val factor = target / currentScale
+                    currentScale = target
+                    contentMatrix.postScale(factor, factor, e.x, e.y)
+                    constrainImage()
+                    imageMatrix = contentMatrix
+                    return true
+                }
+            }
+        )
+
+        init {
+            scaleType = ScaleType.MATRIX
+            isClickable = true
+        }
+
+        override fun setImageBitmap(bm: Bitmap?) {
+            super.setImageBitmap(bm)
+            post { resetImageMatrix() }
+        }
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            resetImageMatrix()
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            gestureDetector.onTouchEvent(event)
+            scaleDetector.onTouchEvent(event)
+
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    lastX = event.x
+                    lastY = event.y
+                    dragging = true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (dragging && !scaleDetector.isInProgress && currentScale > minScale) {
+                        contentMatrix.postTranslate(event.x - lastX, event.y - lastY)
+                        constrainImage()
+                        imageMatrix = contentMatrix
+                    }
+                    lastX = event.x
+                    lastY = event.y
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> dragging = false
+            }
+            return true
+        }
+
+        private fun resetImageMatrix() {
+            val drawable = drawable ?: return
+            if (width == 0 || height == 0 || drawable.intrinsicWidth <= 0 || drawable.intrinsicHeight <= 0) return
+
+            val scale = minOf(
+                width.toFloat() / drawable.intrinsicWidth.toFloat(),
+                height.toFloat() / drawable.intrinsicHeight.toFloat()
+            )
+            val dx = (width - drawable.intrinsicWidth * scale) / 2f
+            val dy = (height - drawable.intrinsicHeight * scale) / 2f
+
+            minScale = scale
+            currentScale = scale
+            contentMatrix.reset()
+            contentMatrix.setScale(scale, scale)
+            contentMatrix.postTranslate(dx, dy)
+            imageMatrix = contentMatrix
+        }
+
+        private fun constrainImage() {
+            val drawable = drawable ?: return
+            val rect = RectF(
+                0f,
+                0f,
+                drawable.intrinsicWidth.toFloat(),
+                drawable.intrinsicHeight.toFloat()
+            )
+            contentMatrix.mapRect(rect)
+
+            val dx = when {
+                rect.width() <= width -> width / 2f - rect.centerX()
+                rect.left > 0f -> -rect.left
+                rect.right < width -> width - rect.right
+                else -> 0f
+            }
+            val dy = when {
+                rect.height() <= height -> height / 2f - rect.centerY()
+                rect.top > 0f -> -rect.top
+                rect.bottom < height -> height - rect.bottom
+                else -> 0f
+            }
+            contentMatrix.postTranslate(dx, dy)
         }
     }
 

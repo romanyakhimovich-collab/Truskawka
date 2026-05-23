@@ -22,6 +22,9 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             seedBaseChats(db)
             db.execSQL("UPDATE messages SET chat_key = ? WHERE chat_key = ?", arrayOf(CHAT_EVERYONE, LEGACY_CHAT_MESH))
         }
+        if (oldVersion < 3) {
+            addColumnIfMissing(db, "chats", "unread_count", "INTEGER NOT NULL DEFAULT 0")
+        }
     }
 
     fun ensureChat(chat: StoredChat) {
@@ -105,6 +108,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 c.kind,
                 c.peer_id,
                 c.verified,
+                c.unread_count,
                 COALESCE(m.body, '') AS last_body,
                 m.image_path AS last_image_path,
                 COALESCE(m.timestamp, c.updated_at) AS last_timestamp,
@@ -138,6 +142,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                     kind = cursor.getString(cursor.getColumnIndexOrThrow("kind")),
                     peerId = cursor.getString(cursor.getColumnIndexOrThrow("peer_id")),
                     verified = cursor.getInt(cursor.getColumnIndexOrThrow("verified")) == 1,
+                    unreadCount = cursor.getInt(cursor.getColumnIndexOrThrow("unread_count")),
                     lastBody = cursor.getString(cursor.getColumnIndexOrThrow("last_body")),
                     lastImagePath = cursor.getString(cursor.getColumnIndexOrThrow("last_image_path")),
                     lastTimestamp = cursor.getLong(cursor.getColumnIndexOrThrow("last_timestamp")),
@@ -210,6 +215,22 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         )
     }
 
+    fun incrementUnread(chatKey: String) {
+        writableDatabase.execSQL(
+            "UPDATE chats SET unread_count = unread_count + 1, updated_at = ? WHERE chat_key = ?",
+            arrayOf<Any>(System.currentTimeMillis(), chatKey)
+        )
+    }
+
+    fun clearUnread(chatKey: String) {
+        writableDatabase.update(
+            "chats",
+            ContentValues().apply { put("unread_count", 0) },
+            "chat_key = ?",
+            arrayOf(chatKey)
+        )
+    }
+
     fun countMessages(chatKey: String): Int {
         readableDatabase.rawQuery(
             "SELECT COUNT(*) FROM messages WHERE chat_key = ?",
@@ -253,6 +274,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 kind TEXT NOT NULL,
                 peer_id TEXT,
                 verified INTEGER NOT NULL DEFAULT 0,
+                unread_count INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
@@ -320,6 +342,16 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         )
     }
 
+    private fun addColumnIfMissing(db: SQLiteDatabase, table: String, column: String, definition: String) {
+        db.rawQuery("PRAGMA table_info($table)", null).use { cursor ->
+            val nameIndex = cursor.getColumnIndexOrThrow("name")
+            while (cursor.moveToNext()) {
+                if (cursor.getString(nameIndex) == column) return
+            }
+        }
+        db.execSQL("ALTER TABLE $table ADD COLUMN $column $definition")
+    }
+
     private fun StoredMessage.toValues(chatKey: String): ContentValues =
         ContentValues().apply {
             put("chat_key", chatKey)
@@ -339,6 +371,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             put("kind", kind)
             put("peer_id", peerId)
             put("verified", if (verified) 1 else 0)
+            put("unread_count", unreadCount)
             put("created_at", createdAt)
             put("updated_at", updatedAt)
         }
@@ -363,7 +396,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
 
     companion object {
         private const val DB_NAME = "truskawka_chats.db"
-        private const val DB_VERSION = 2
+        private const val DB_VERSION = 3
         const val CHAT_EVERYONE = "everyone"
         const val CHAT_SAVED = "saved"
         private const val LEGACY_CHAT_MESH = "mesh"
@@ -382,6 +415,7 @@ data class StoredChat(
     val kind: String,
     val peerId: String? = null,
     val verified: Boolean = false,
+    val unreadCount: Int = 0,
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = createdAt
 )
@@ -415,6 +449,7 @@ data class ChatSummary(
     val kind: String,
     val peerId: String?,
     val verified: Boolean,
+    val unreadCount: Int,
     val lastBody: String,
     val lastImagePath: String?,
     val lastTimestamp: Long,
