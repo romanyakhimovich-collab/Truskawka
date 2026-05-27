@@ -108,6 +108,7 @@ class MeshNetworkService : Service() {
             }
             publish("message $label: $messageId")
         }
+        meshManager.setTransportLogListener(::publish)
         try {
             meshManager.initialize()
             meshManager.start()

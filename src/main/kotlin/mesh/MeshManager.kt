@@ -83,6 +83,7 @@ class MeshManager(
     private var fileListener: ((senderId: UUID, fileName: String, mimeType: String, bytes: ByteArray, timestamp: Long, isBroadcast: Boolean) -> Unit)? = null
     private var peerListener: ((nodeId: UUID, event: PeerEvent) -> Unit)? = null
     private var messageStatusListener: ((messageId: UUID, status: MessageDeliveryStatus) -> Unit)? = null
+    private var transportLogListener: ((message: String) -> Unit)? = null
 
     // Background executor
     private val executor = Executors.newScheduledThreadPool(2)
@@ -258,9 +259,6 @@ class MeshManager(
         val encrypted = crypto.encryptMessage(recipientId, plaintext)
             ?: return SendResult.Failed("Encryption failed")
 
-        // Sign the ciphertext
-        val signature = crypto.sign(encrypted.ciphertext)
-
         // Build packet
         // Payload format: [nonce_len(1) | nonce | ciphertext]
         val payload = ByteBuffer.allocate(1 + encrypted.nonce.size + encrypted.ciphertext.size)
@@ -268,6 +266,7 @@ class MeshManager(
             .put(encrypted.nonce)
             .put(encrypted.ciphertext)
             .array()
+        val signature = crypto.sign(payload)
 
         val messageId = router.sendMessage(recipientId, payload, signature, requiresAck = true)
         return SendResult.Sent(messageId)
@@ -502,6 +501,7 @@ class MeshManager(
     }
 
     override fun onHandshakeReceived(nodeId: UUID, publicKey: ByteArray) {
+        onNeighborDiscovered(nodeId, ByteArray(0))
         // Process handshake and send ACK
         when (val result = crypto.handleHandshakeAndCreateAck(nodeId, publicKey)) {
             is HandshakeResult.Success -> {
@@ -528,6 +528,7 @@ class MeshManager(
     }
 
     override fun onHandshakeAckReceived(nodeId: UUID, encryptedPayload: ByteArray) {
+        onNeighborDiscovered(nodeId, ByteArray(0))
         when (val result = crypto.handleHandshakeAck(nodeId, encryptedPayload)) {
             is HandshakeResult.Success -> {
                 peerListener?.invoke(nodeId, PeerEvent.SESSION_ESTABLISHED)
@@ -555,26 +556,27 @@ class MeshManager(
     // ==================== BleServiceCallback Interface ====================
 
     override fun onDeviceDiscovered(address: String, name: String?, rssi: Int) {
-        // Device discovered, connection will be attempted automatically
+        transportLogListener?.invoke("ble device found: ${name ?: address} rssi=$rssi")
     }
 
     override fun onPeerConnected(address: String) {
+        transportLogListener?.invoke("ble connected: $address")
         activeMeshScan(localAlias)
         executor.schedule({ activeMeshScan(localAlias) }, 1200, TimeUnit.MILLISECONDS)
     }
 
     override fun onPeerDisconnected(address: String) {
-        // BLE connection lost
+        transportLogListener?.invoke("ble disconnected: $address")
     }
 
     override fun onPeerIdentified(address: String, nodeId: UUID) {
-        // Peer's node ID received
+        transportLogListener?.invoke("ble peer identified: ${nodeId.toString().take(8)}")
         onNeighborDiscovered(nodeId, ByteArray(0))
         initiateHandshakeWith(nodeId)
     }
 
     override fun onError(message: String) {
-        // Log error
+        transportLogListener?.invoke("ble error: $message")
     }
 
     // ==================== Public API ====================
@@ -593,6 +595,10 @@ class MeshManager(
 
     fun setMessageStatusListener(listener: (messageId: UUID, status: MessageDeliveryStatus) -> Unit) {
         this.messageStatusListener = listener
+    }
+
+    fun setTransportLogListener(listener: (message: String) -> Unit) {
+        this.transportLogListener = listener
     }
 
     fun getKnownPeers(): List<PeerInfo> = knownPeers.values.toList()

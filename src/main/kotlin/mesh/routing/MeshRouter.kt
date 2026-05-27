@@ -233,16 +233,26 @@ class MeshRouter(
     }
 
     private fun handleDiscovery(packet: MeshPacket) {
-        // Respond with our own discovery packet
         messageHandler.onNeighborDiscovered(packet.senderId, packet.payload)
+        if (shouldRelay(packet)) {
+            relayPacket(packet)
+        }
     }
 
     private fun handleHandshake(packet: MeshPacket) {
-        messageHandler.onHandshakeReceived(packet.senderId, packet.payload)
+        if (packet.recipientId == localNodeId) {
+            messageHandler.onHandshakeReceived(packet.senderId, packet.payload)
+        } else if (shouldRelay(packet)) {
+            relayPacket(packet)
+        }
     }
 
     private fun handleHandshakeAck(packet: MeshPacket) {
-        messageHandler.onHandshakeAckReceived(packet.senderId, packet.payload)
+        if (packet.recipientId == localNodeId) {
+            messageHandler.onHandshakeAckReceived(packet.senderId, packet.payload)
+        } else if (shouldRelay(packet)) {
+            relayPacket(packet)
+        }
     }
 
     private fun handleAck(packet: MeshPacket) {

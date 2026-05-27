@@ -181,6 +181,7 @@ abstract class BleTransportService(
                 val task = transmitQueue.poll() ?: break
 
                 if (task.isBroadcast) {
+                    writeToDevice(task.address, task.data)
                     notifyAllDevices(task.data)
                 } else if (!writeToDevice(task.address, task.data)) {
                     notifyAllDevices(task.data)
