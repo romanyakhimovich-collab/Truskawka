@@ -121,6 +121,7 @@ class MainActivity : Activity() {
             meshService?.addLogListener(logListener)
             currentNickname = meshService?.getNickname()?.take(MAX_NICKNAME_LENGTH) ?: "@jachimowicz"
             usernameField.setText(currentNickname)
+            meshService?.startNearbyDiscovery(silent = true)
             syncKnownPeers()
             refreshHeader()
             addMessage("system", "service connected", false)
@@ -945,16 +946,18 @@ class MainActivity : Activity() {
         dialog.show()
         dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
 
-        mainHandler.postDelayed({
-            if (dialog.isShowing) {
-                refreshPeopleRows()
-            } else {
-                counterView.text = (meshService?.peerCount() ?: count).toString()
+        val panelRefresh = object : Runnable {
+            override fun run() {
+                if (dialog.isShowing) {
+                    syncKnownPeers()
+                    refreshPeopleRows()
+                    mainHandler.postDelayed(this, 1_500)
+                } else {
+                    counterView.text = (meshService?.peerCount() ?: count).toString()
+                }
             }
-        }, 1_200)
-        mainHandler.postDelayed({
-            if (dialog.isShowing) refreshPeopleRows()
-        }, 3_000)
+        }
+        mainHandler.postDelayed(panelRefresh, 1_200)
     }
 
     private fun networkPeerRow(name: String, signal: String): LinearLayout {
@@ -1886,6 +1889,7 @@ class MainActivity : Activity() {
 
     private fun String.isScanNoise(): Boolean =
         startsWith("search people:")
+            || startsWith("nearby search started")
             || startsWith("peer counter:")
             || startsWith("discovered:")
             || startsWith("secure session:")

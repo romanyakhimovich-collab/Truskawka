@@ -10,7 +10,9 @@ import android.content.pm.ServiceInfo
 import android.net.wifi.p2p.WifiP2pDevice
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import mesh.MessageDeliveryStatus
 import mesh.MeshManager
 import mesh.PeerEvent
@@ -24,12 +26,21 @@ import java.util.concurrent.CopyOnWriteArrayList
 class MeshNetworkService : Service() {
     private val binder = LocalBinder()
     private val listeners = CopyOnWriteArrayList<(String) -> Unit>()
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private lateinit var meshManager: MeshManager
     private lateinit var bleTransport: AndroidBleService
     private lateinit var wifiDirectSocketManager: WifiDirectSocketManager
     private lateinit var localNodeId: UUID
     private var wifiDirectPeers: List<WifiP2pDevice> = emptyList()
+    private var automaticDiscoveryStarted = false
+
+    private val discoveryPulse = object : Runnable {
+        override fun run() {
+            startNearbyDiscovery(silent = true)
+            mainHandler.postDelayed(this, DISCOVERY_PULSE_MS)
+        }
+    }
 
     val nodeId: UUID
         get() = localNodeId
@@ -88,6 +99,7 @@ class MeshNetworkService : Service() {
                 PeerEvent.VERIFIED -> "verified"
             }
             publish("$label: ${meshManager.getAlias(nodeId)}")
+            publish("peer counter: ${peerCount()}")
         }
         meshManager.setMessageStatusListener { messageId, status ->
             val label = when (status) {
@@ -100,6 +112,7 @@ class MeshNetworkService : Service() {
             meshManager.initialize()
             meshManager.start()
             publish("mesh started as ${localNodeId.shortId()}")
+            startAutomaticDiscovery()
         } catch (e: Exception) {
             publish("mesh startup failed: ${e.message}")
         }
@@ -116,6 +129,7 @@ class MeshNetworkService : Service() {
         if (::wifiDirectSocketManager.isInitialized) {
             wifiDirectSocketManager.stop()
         }
+        mainHandler.removeCallbacks(discoveryPulse)
         super.onDestroy()
     }
 
@@ -135,6 +149,13 @@ class MeshNetworkService : Service() {
 
     fun searchPeople(): Int {
         publish("search people: BLE + Wi-Fi Direct")
+        return startNearbyDiscovery(silent = false)
+    }
+
+    fun startNearbyDiscovery(silent: Boolean = false): Int {
+        if (!silent) {
+            publish("nearby search started")
+        }
         runCatching {
             bleTransport.startAdvertising()
             bleTransport.startScanning()
@@ -143,7 +164,15 @@ class MeshNetworkService : Service() {
             publish("ble search failed: ${it.message}")
         }
         wifiDirectSocketManager.startDiscovery()
+        publish("peer counter: ${peerCount()}")
         return peerCount()
+    }
+
+    private fun startAutomaticDiscovery() {
+        if (automaticDiscoveryStarted) return
+        automaticDiscoveryStarted = true
+        startNearbyDiscovery(silent = true)
+        mainHandler.postDelayed(discoveryPulse, DISCOVERY_PULSE_MS)
     }
 
     fun sendPayloadViaWifiDirect(payload: ByteArray): Result<Unit> =
@@ -296,5 +325,6 @@ class MeshNetworkService : Service() {
         private const val MAX_NICKNAME_LENGTH = 12
         private const val KEY_NICKNAME_CHANGED_AT = "nickname_changed_at"
         private const val NICKNAME_CHANGE_INTERVAL_MS = 7L * 24L * 60L * 60L * 1000L
+        private const val DISCOVERY_PULSE_MS = 15_000L
     }
 }
