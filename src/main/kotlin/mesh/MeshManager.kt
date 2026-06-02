@@ -559,6 +559,12 @@ class MeshManager(
         transportLogListener?.invoke("ble device found: ${name ?: address} rssi=$rssi")
     }
 
+    override fun onAdvertisementPeerDiscovered(address: String, nodeId: UUID, alias: String?, rssi: Int) {
+        transportLogListener?.invoke("ble radio hello: ${alias ?: nodeId.toString().take(8)} rssi=$rssi")
+        onNeighborDiscovered(nodeId, alias?.toByteArray(Charsets.UTF_8) ?: ByteArray(0))
+        initiateHandshakeWith(nodeId)
+    }
+
     override fun onPeerConnected(address: String) {
         transportLogListener?.invoke("ble connected: $address")
         activeMeshScan(localAlias)

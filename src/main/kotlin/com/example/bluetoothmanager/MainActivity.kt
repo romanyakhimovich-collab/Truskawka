@@ -837,6 +837,11 @@ class MainActivity : Activity() {
             textSize = 20f
             setTextColor(BERRY_TEXT)
         }
+        val transportStatus = terminalText(meshService?.meshTransportStatus() ?: "Mesh starting...").apply {
+            textSize = 12f
+            setTextColor(BERRY_TEXT_DIM)
+            setPadding(0, 0, 0, dp(10))
+        }
         val peopleContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
@@ -853,6 +858,7 @@ class MainActivity : Activity() {
         fun refreshPeopleRows() {
             val peerCount = meshService?.peerCount() ?: 0
             nearbyTitle.text = "Nearby $peerCount"
+            transportStatus.text = meshService?.meshTransportStatus() ?: "Mesh starting..."
             counterView.text = peerCount.toString()
             peopleContainer.removeAllViews()
 
@@ -903,6 +909,7 @@ class MainActivity : Activity() {
             })
         }
         root.addView(header)
+        root.addView(transportStatus)
 
         root.addView(networkActionRow("Everyone", "broadcast mode", !savedMessagesSelected && selectedRecipientId == null) {
             selectChat(CHAT_EVERYONE, "everyone", null)
@@ -1901,6 +1908,7 @@ class MainActivity : Activity() {
             || startsWith("message delivered:")
             || startsWith("message read:")
             || startsWith("wifi-direct")
+            || startsWith("emulator relay")
             || startsWith("ble ")
             || startsWith("BLE ")
 

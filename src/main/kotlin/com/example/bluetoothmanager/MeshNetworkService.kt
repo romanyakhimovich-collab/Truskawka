@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.ServiceInfo
 import android.net.wifi.p2p.WifiP2pDevice
 import android.os.Binder
@@ -31,6 +32,7 @@ class MeshNetworkService : Service() {
     private lateinit var meshManager: MeshManager
     private lateinit var bleTransport: AndroidBleService
     private lateinit var wifiDirectSocketManager: WifiDirectSocketManager
+    private var emulatorRelayTransport: EmulatorRelayTransport? = null
     private lateinit var localNodeId: UUID
     private var wifiDirectPeers: List<WifiP2pDevice> = emptyList()
     private var automaticDiscoveryStarted = false
@@ -64,22 +66,26 @@ class MeshNetworkService : Service() {
                 wifiDirectPeers = it
                 publish("peer counter: ${peerCount()}")
             },
-            onPayloadReceived = { payload ->
-                runCatching {
-                    MeshPacket.fromBytes(payload)
-                }.onSuccess { packet ->
-                    if (::meshManager.isInitialized) {
-                        meshManager.onWifiDirectPacketReceived(packet)
-                    }
-                }.onFailure {
-                    publish("wifi-direct packet rejected: ${it.message}")
-                }
-            }
+            onPayloadReceived = ::handleTransportPayload
         )
+        val opportunisticTransports = buildList {
+            add(wifiDirectSocketManager)
+            if (shouldUseDevRelay()) {
+                emulatorRelayTransport = EmulatorRelayTransport(
+                    localNodeId = localNodeId,
+                    aliasProvider = ::getNickname,
+                    onLog = ::publish,
+                    onPayloadReceived = ::handleTransportPayload,
+                    onPeerSeen = ::handleEmulatorRelayPeerSeen,
+                    onConnected = ::handleEmulatorRelayConnected
+                )
+                add(emulatorRelayTransport!!)
+            }
+        }
         meshManager = MeshManager(
             secureStorage = AndroidSecureKeyStorage(applicationContext),
             bleTransport = bleTransport,
-            wifiDirectTransport = wifiDirectSocketManager,
+            wifiDirectTransport = CompositeOpportunisticTransport(opportunisticTransports),
             localNodeId = localNodeId
         )
         meshManager.setMessageListener { senderId, message, timestamp, isBroadcast ->
@@ -130,6 +136,7 @@ class MeshNetworkService : Service() {
         if (::wifiDirectSocketManager.isInitialized) {
             wifiDirectSocketManager.stop()
         }
+        emulatorRelayTransport?.stop()
         mainHandler.removeCallbacks(discoveryPulse)
         super.onDestroy()
     }
@@ -148,8 +155,17 @@ class MeshNetworkService : Service() {
 
     fun peerCount(): Int = meshManager.getKnownPeers().size + wifiDirectSocketManager.peerCount()
 
+    fun meshTransportStatus(): String {
+        val relay = emulatorRelayTransport
+        return when {
+            relay != null -> relay.statusText()
+            else -> "Phone mesh: Bluetooth + nearby Wi-Fi"
+        }
+    }
+
     fun searchPeople(): Int {
-        publish("search people: BLE + Wi-Fi Direct")
+        val relayLabel = if (shouldUseDevRelay()) " + dev relay" else ""
+        publish("search people: BLE + Wi-Fi Direct$relayLabel")
         return startNearbyDiscovery(silent = false)
     }
 
@@ -158,6 +174,11 @@ class MeshNetworkService : Service() {
             publish("nearby search started")
         }
         runCatching {
+            if (shouldUseDevRelay()) {
+                emulatorRelayTransport?.start()
+                emulatorRelayTransport?.announce()
+            }
+            bleTransport.setLocalAlias(getNickname())
             bleTransport.startAdvertising()
             bleTransport.startScanning()
             meshManager.activeMeshScan(getNickname())
@@ -219,6 +240,7 @@ class MeshNetworkService : Service() {
             .apply()
         publish("nick changed: $display")
         if (::meshManager.isInitialized) {
+            bleTransport.setLocalAlias(display)
             meshManager.activeMeshScan(display)
         }
         return display
@@ -227,7 +249,8 @@ class MeshNetworkService : Service() {
     fun sendMessage(recipientText: String, body: String): SendResult {
         val recipient = runCatching { UUID.fromString(recipientText.trim()) }.getOrNull()
             ?: return SendResult.Failed("Recipient must be a full UUID")
-        val result = meshManager.sendMessage(recipient, body)
+        val result = runCatching { meshManager.sendMessage(recipient, body) }
+            .getOrElse { SendResult.Failed(it.message ?: "send failed") }
         publish("send to ${meshManager.getAlias(recipient)}: ${result.label()}")
         return result
     }
@@ -235,11 +258,15 @@ class MeshNetworkService : Service() {
     fun prepareChatWith(recipientText: String) {
         val recipient = runCatching { UUID.fromString(recipientText.trim()) }.getOrNull() ?: return
         meshManager.activeMeshScan(getNickname())
-        meshManager.initiateHandshakeWith(recipient)
+        emulatorRelayTransport?.announce()
+        runCatching { meshManager.initiateHandshakeWith(recipient) }
+            .onFailure { publish("handshake failed: ${it.message}") }
     }
 
     fun broadcastMessage(body: String): SendResult {
-        val result = meshManager.broadcastMessage(body)
+        emulatorRelayTransport?.announce()
+        val result = runCatching { meshManager.broadcastMessage(body) }
+            .getOrElse { SendResult.Failed(it.message ?: "broadcast failed") }
         publish("broadcast: ${result.label()}")
         return result
     }
@@ -248,17 +275,65 @@ class MeshNetworkService : Service() {
         val recipient = recipientText
             ?.takeIf { it.isNotBlank() }
             ?.let { runCatching { UUID.fromString(it.trim()) }.getOrNull() }
-        val result = meshManager.sendImage(recipient, fileName, mimeType, bytes) { sent, total ->
-            if (sent == 0 || sent == total || sent % maxOf(1, total / 10) == 0) {
-                publish("image progress: $sent/$total")
+        emulatorRelayTransport?.announce()
+        val result = runCatching {
+            meshManager.sendImage(recipient, fileName, mimeType, bytes) { sent, total ->
+                if (sent == 0 || sent == total || sent % maxOf(1, total / 10) == 0) {
+                    publish("image progress: $sent/$total")
+                }
             }
-        }
+        }.getOrElse { SendResult.Failed(it.message ?: "image send failed") }
         publish("image send: ${result.label()}")
         return result
     }
 
     private fun publish(message: String) {
         listeners.forEach { it(message) }
+    }
+
+    private fun handleTransportPayload(payload: ByteArray) {
+        runCatching {
+            MeshPacket.fromBytes(payload)
+        }.onSuccess { packet ->
+            if (::meshManager.isInitialized) {
+                meshManager.onWifiDirectPacketReceived(packet)
+            }
+        }.onFailure {
+            publish("mesh packet rejected: ${it.message}")
+        }
+    }
+
+    private fun handleEmulatorRelayConnected() {
+        mainHandler.post {
+            if (!::meshManager.isInitialized) return@post
+            publish("emulator relay ready")
+            emulatorRelayTransport?.announce()
+            meshManager.activeMeshScan(getNickname())
+            publish("peer counter: ${peerCount()}")
+            mainHandler.postDelayed({
+                if (::meshManager.isInitialized) {
+                    emulatorRelayTransport?.announce()
+                    meshManager.activeMeshScan(getNickname())
+                    publish("peer counter: ${peerCount()}")
+                }
+            }, 1_000L)
+            mainHandler.postDelayed({
+                if (::meshManager.isInitialized) {
+                    emulatorRelayTransport?.announce()
+                    meshManager.activeMeshScan(getNickname())
+                    publish("peer counter: ${peerCount()}")
+                }
+            }, 3_000L)
+        }
+    }
+
+    private fun handleEmulatorRelayPeerSeen(nodeId: UUID, alias: String) {
+        mainHandler.post {
+            if (!::meshManager.isInitialized) return@post
+            meshManager.onNeighborDiscovered(nodeId, alias.toByteArray(Charsets.UTF_8))
+            publish("emulator relay peer: $alias")
+            publish("peer counter: ${peerCount()}")
+        }
     }
 
     private fun writeIncomingImage(fileName: String, bytes: ByteArray): File {
@@ -313,6 +388,29 @@ class MeshNetworkService : Service() {
     }
 
     private fun UUID.shortId(): String = toString().take(8)
+
+    private fun isProbablyEmulator(): Boolean {
+        val fingerprint = Build.FINGERPRINT.lowercase()
+        val model = Build.MODEL.lowercase()
+        val product = Build.PRODUCT.lowercase()
+        val manufacturer = Build.MANUFACTURER.lowercase()
+        val brand = Build.BRAND.lowercase()
+        val device = Build.DEVICE.lowercase()
+        return fingerprint.startsWith("generic")
+            || fingerprint.contains("emulator")
+            || model.contains("emulator")
+            || model.contains("android sdk built for")
+            || product.contains("sdk")
+            || product.contains("emulator")
+            || manufacturer.contains("genymotion")
+            || brand == "generic"
+            || device.contains("generic")
+    }
+
+    private fun shouldUseDevRelay(): Boolean {
+        val isDebuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        return isDebuggable || isProbablyEmulator()
+    }
 
     private fun SendResult.label(): String = when (this) {
         is SendResult.Sent -> "sent ${messageId.shortId()}"

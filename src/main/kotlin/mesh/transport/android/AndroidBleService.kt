@@ -27,6 +27,8 @@ import android.content.pm.PackageManager
 import android.os.ParcelUuid
 import mesh.transport.BleTransportService
 import mesh.transport.MeshBleUuids
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -39,8 +41,21 @@ class AndroidBleService(
     private var advertiser: BluetoothLeAdvertiser? = null
     private var scanner: BluetoothLeScanner? = null
     private var gattServer: BluetoothGattServer? = null
+    @Volatile
+    private var localAlias: String = "@${localNodeId.toString().take(8)}"
 
     private val gattClients = ConcurrentHashMap<String, BluetoothGatt>()
+    private val advertisedPeers = ConcurrentHashMap<UUID, Long>()
+
+    fun setLocalAlias(alias: String) {
+        val normalized = alias.trim().take(12).ifBlank { "@${localNodeId.toString().take(8)}" }
+        if (normalized == localAlias) return
+        localAlias = normalized
+        if (isAdvertising) {
+            stopAdvertising()
+            startAdvertising()
+        }
+    }
 
     override fun initialize(): Boolean {
         val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -79,7 +94,7 @@ class AndroidBleService(
             .build()
 
         val data = AdvertiseData.Builder()
-            .addServiceUuid(ParcelUuid(MeshBleUuids.SERVICE_UUID))
+            .addManufacturerData(MANUFACTURER_ID, buildRadioHelloPayload())
             .setIncludeTxPowerLevel(false)
             .setIncludeDeviceName(false)
             .build()
@@ -100,13 +115,9 @@ class AndroidBleService(
         val bleScanner = scanner ?: return false
         if (!hasScanPermission()) return false
 
-        val filters = listOf(
-            ScanFilter.Builder()
-                .setServiceUuid(ParcelUuid(MeshBleUuids.SERVICE_UUID))
-                .build()
-        )
+        val filters = emptyList<ScanFilter>()
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .build()
 
@@ -227,7 +238,25 @@ class AndroidBleService(
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val address = result.device.address ?: return
-            if (!connectedPeers.containsKey(address)) {
+            val radioHello = parseRadioHello(result)
+            if (radioHello != null) {
+                val now = System.currentTimeMillis()
+                val lastSeen = advertisedPeers[radioHello.nodeId] ?: 0L
+                peerNodeIds[address] = radioHello.nodeId
+                nodeAddresses[radioHello.nodeId] = address
+                if (now - lastSeen > ADVERTISED_PEER_NOTIFY_INTERVAL_MS) {
+                    advertisedPeers[radioHello.nodeId] = now
+                    serviceCallback?.onAdvertisementPeerDiscovered(
+                        address,
+                        radioHello.nodeId,
+                        radioHello.alias,
+                        result.rssi
+                    )
+                }
+                if (!connectedPeers.containsKey(address)) {
+                    onDeviceDiscovered(address, radioHello.alias, result.rssi)
+                }
+            } else if (hasMeshServiceUuid(result) && !connectedPeers.containsKey(address)) {
                 onDeviceDiscovered(address, result.device.name, result.rssi)
             }
         }
@@ -384,6 +413,42 @@ class AndroidBleService(
         serviceCallback?.onPeerIdentified(gatt.device.address, remoteNodeId)
     }
 
+    private fun buildRadioHelloPayload(): ByteArray {
+        val aliasBytes = localAlias.toByteArray(Charsets.UTF_8).take(MAX_ADVERTISED_ALIAS_BYTES).toByteArray()
+        return ByteBuffer.allocate(1 + 16 + 1 + aliasBytes.size)
+            .order(ByteOrder.BIG_ENDIAN)
+            .put(RADIO_HELLO_VERSION)
+            .putLong(localNodeId.mostSignificantBits)
+            .putLong(localNodeId.leastSignificantBits)
+            .put(aliasBytes.size.toByte())
+            .put(aliasBytes)
+            .array()
+    }
+
+    private fun parseRadioHello(result: ScanResult): RadioHello? {
+        val payload = result.scanRecord?.getManufacturerSpecificData(MANUFACTURER_ID) ?: return null
+        if (payload.size < 18 || payload[0] != RADIO_HELLO_VERSION) return null
+        return runCatching {
+            val buffer = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+            buffer.get()
+            val nodeId = UUID(buffer.long, buffer.long)
+            if (nodeId == localNodeId) return null
+            val aliasLength = buffer.get().toInt() and 0xFF
+            val safeLength = aliasLength.coerceAtMost(buffer.remaining())
+            val aliasBytes = ByteArray(safeLength)
+            buffer.get(aliasBytes)
+            val alias = aliasBytes.toString(Charsets.UTF_8)
+                .trim()
+                .takeIf { it.startsWith("@") && it.length > 1 }
+            RadioHello(nodeId, alias)
+        }.getOrNull()
+    }
+
+    private fun hasMeshServiceUuid(result: ScanResult): Boolean =
+        result.scanRecord
+            ?.serviceUuids
+            ?.contains(ParcelUuid(MeshBleUuids.SERVICE_UUID)) == true
+
     private fun hasScanPermission(): Boolean =
         android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S ||
             context.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
@@ -395,4 +460,16 @@ class AndroidBleService(
     private fun hasConnectPermission(): Boolean =
         android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S ||
             context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+
+    private data class RadioHello(
+        val nodeId: UUID,
+        val alias: String?
+    )
+
+    companion object {
+        private const val MANUFACTURER_ID = 0x0B17
+        private const val RADIO_HELLO_VERSION: Byte = 1
+        private const val MAX_ADVERTISED_ALIAS_BYTES = 12
+        private const val ADVERTISED_PEER_NOTIFY_INTERVAL_MS = 3_000L
+    }
 }

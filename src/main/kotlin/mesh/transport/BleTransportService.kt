@@ -347,6 +347,7 @@ data class TransmitTask(
 
 interface BleServiceCallback {
     fun onDeviceDiscovered(address: String, name: String?, rssi: Int)
+    fun onAdvertisementPeerDiscovered(address: String, nodeId: UUID, alias: String?, rssi: Int)
     fun onPeerConnected(address: String)
     fun onPeerDisconnected(address: String)
     fun onPeerIdentified(address: String, nodeId: UUID)
