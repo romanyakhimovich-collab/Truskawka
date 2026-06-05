@@ -2,6 +2,7 @@ package com.example.bluetoothmanager
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.Dialog
 import android.bluetooth.BluetoothManager
 import android.content.ComponentName
@@ -46,11 +47,13 @@ import android.view.Window
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.BaseAdapter
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import mesh.SendResult
@@ -61,6 +64,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.security.MessageDigest
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
@@ -72,6 +76,7 @@ class MainActivity : Activity() {
     private var normalizingNickname = false
     private var nicknameDialogShowing = false
     private var currentNickname = "@your name"
+    private var chatListShownAtStartup = false
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val messages = mutableListOf(
@@ -121,7 +126,7 @@ class MainActivity : Activity() {
             meshService = (service as MeshNetworkService.LocalBinder).service()
             meshService?.addLogListener(logListener)
             currentNickname = meshService?.getNickname()?.take(MAX_NICKNAME_LENGTH) ?: "@your name"
-            usernameField.setText(currentNickname)
+            usernameField.setText(contactDisplayName())
             meshService?.startNearbyDiscovery(silent = true)
             syncKnownPeers()
             refreshHeader()
@@ -144,6 +149,10 @@ class MainActivity : Activity() {
         chatStore = ChatStore(this)
         loadStoredMessages()
         buildUi()
+        if (!chatListShownAtStartup) {
+            chatListShownAtStartup = true
+            mainHandler.post { showChatList() }
+        }
 
         if (hasRequiredPermissions()) {
             startAppAfterPermissions()
@@ -208,72 +217,25 @@ class MainActivity : Activity() {
     private fun buildHeader(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, dp(10))
+            setPadding(0, 0, 0, dp(12))
 
             val topRow = FrameLayout(this@MainActivity)
             val leftGroup = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
 
-                addView(ImageView(this@MainActivity).apply {
-                    setImageResource(R.drawable.truskawka_logo)
-                    scaleType = ImageView.ScaleType.CENTER_CROP
-                    background = roundedDrawable(Color.WHITE, dp(8), PINK_SHADOW_STROKE)
-                    clipToOutline = false
-                    setPadding(dp(2), dp(2), dp(2), dp(2))
-                }, LinearLayout.LayoutParams(dp(30), dp(30)).apply {
+                addView(terminalAction("< Back to chats").apply {
+                    textSize = 12f
+                    setTextColor(BERRY_TEXT)
+                    background = roundedDrawable(INPUT_SURFACE, dp(14), SOFT_PINK_STROKE)
+                    setPadding(dp(10), dp(6), dp(10), dp(6))
+                    setOnClickListener { showChatList() }
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
                     marginEnd = dp(8)
                 })
-
-                addView(terminalText("Truskawka/").apply {
-                    textSize = 18f
-                    setTextColor(STRAWBERRY_RED)
-                    setPadding(0, dp(6), dp(4), dp(6))
-                    setOnClickListener { showChatList() }
-                })
-
-                usernameField = EditText(this@MainActivity).apply {
-                    setText("@jachimowicz")
-                    setSingleLine(true)
-                    typeface = Typeface.MONOSPACE
-                    textSize = 16f
-                    setTextColor(BERRY_TEXT)
-                    setHintTextColor(BERRY_TEXT_DIM)
-                    setBackgroundColor(Color.TRANSPARENT)
-                    inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
-                    filters = arrayOf(InputFilter.LengthFilter(MAX_NICKNAME_LENGTH))
-                    minWidth = dp(118)
-                    setPadding(0, 0, dp(4), 0)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        textCursorDrawable = cursorDrawable()
-                    }
-                    setOnFocusChangeListener { _, hasFocus ->
-                        if (!hasFocus) saveUsername()
-                    }
-                    setOnEditorActionListener { _, _, event ->
-                        if (event == null || event.keyCode == KeyEvent.KEYCODE_ENTER) {
-                            saveUsername()
-                            clearFocus()
-                            hideKeyboard()
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    setOnClickListener {
-                        requestFocus()
-                        setSelection(text.length.coerceAtLeast(1))
-                        showKeyboard(this)
-                    }
-                    addTextChangedListener(object : TextWatcher {
-                        override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
-                        override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
-                        override fun afterTextChanged(s: Editable?) {
-                            keepNicknamePrefix()
-                        }
-                    })
-                }
-                addView(usernameField)
             }
             topRow.addView(leftGroup, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -281,40 +243,46 @@ class MainActivity : Activity() {
                 Gravity.LEFT or Gravity.CENTER_VERTICAL
             ))
 
-            statusGroup = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(8), dp(4), dp(8), dp(4))
-                background = roundedDrawable(ACCENT_PINK, dp(14))
-                addView(terminalText("Nearby").apply {
-                    textSize = 12f
-                    setTextColor(BERRY_TEXT)
-                    setPadding(dp(2), 0, dp(6), 0)
-                })
-                counterView = terminalText("0").apply {
-                    textSize = 13f
-                    setTextColor(BERRY_TEXT)
-                }
-                addView(counterView)
-                setOnClickListener { showMeshPanel(scanFirst = true) }
-            }
-            topRow.addView(statusGroup, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.RIGHT or Gravity.CENTER_VERTICAL
-            ))
+            statusGroup = LinearLayout(this@MainActivity).apply { visibility = View.GONE }
+            counterView = terminalText("0")
+            statusGroup.addView(counterView)
             addView(topRow, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(34)
+                dp(42)
+            ))
+
+            usernameField = EditText(this@MainActivity).apply {
+                setText(contactDisplayName())
+                setSingleLine(true)
+                typeface = Typeface.DEFAULT
+                textSize = 14f
+                setTextColor(BERRY_TEXT_DIM)
+                setHintTextColor(BERRY_TEXT_DIM)
+                setBackgroundColor(Color.TRANSPARENT)
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                filters = arrayOf(InputFilter.LengthFilter(MAX_NICKNAME_LENGTH))
+                minWidth = dp(130)
+                setPadding(dp(2), dp(4), dp(4), dp(4))
+                isFocusable = false
+                isFocusableInTouchMode = false
+                isClickable = false
+                isLongClickable = false
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    textCursorDrawable = cursorDrawable()
+                }
+            }
+            addView(usernameField, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
             ))
 
             chatTitleView = terminalText(selectedRecipientLabel.toDisplayTitle()).apply {
-                textSize = 16f
+                textSize = 22f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
-                gravity = Gravity.CENTER
+                gravity = Gravity.START
                 maxLines = 1
-                setPadding(dp(24), dp(8), dp(24), 0)
+                setPadding(dp(2), dp(10), dp(2), 0)
                 setOnClickListener { showCurrentChatProfile() }
             }
             addView(chatTitleView, LinearLayout.LayoutParams(
@@ -323,11 +291,11 @@ class MainActivity : Activity() {
             ))
 
             networkStatusView = terminalText("Offline").apply {
-                textSize = 12f
+                textSize = 13f
                 setTextColor(BERRY_TEXT_DIM)
-                gravity = Gravity.CENTER
+                gravity = Gravity.START
                 maxLines = 1
-                setPadding(dp(24), dp(2), dp(24), 0)
+                setPadding(dp(2), dp(4), dp(2), 0)
             }
             addView(networkStatusView, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -340,16 +308,16 @@ class MainActivity : Activity() {
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
+            setPadding(0, dp(8), 0, dp(6))
 
             addView(ImageView(this@MainActivity).apply {
-                minimumWidth = dp(40)
-                minimumHeight = dp(40)
-                background = circleDrawable(ACCENT_PINK)
+                minimumWidth = dp(44)
+                minimumHeight = dp(44)
+                background = roundedDrawable(0x26FF4359, dp(22), 0x55FF4359)
                 setImageResource(android.R.drawable.ic_menu_gallery)
-                setColorFilter(BERRY_TEXT, PorterDuff.Mode.SRC_IN)
+                setColorFilter(STRAWBERRY_RED, PorterDuff.Mode.SRC_IN)
                 scaleType = ImageView.ScaleType.CENTER
-                setPadding(dp(9), dp(9), dp(9), dp(9))
+                setPadding(dp(10), dp(10), dp(10), dp(10))
                 setOnClickListener { openImagePicker() }
             })
 
@@ -358,17 +326,17 @@ class MainActivity : Activity() {
                 setSingleLine(false)
                 maxLines = 4
                 setHorizontallyScrolling(false)
-                typeface = Typeface.MONOSPACE
+                typeface = Typeface.DEFAULT
                 textSize = 15f
                 setTextColor(BERRY_TEXT)
                 setHintTextColor(BERRY_TEXT_DIM)
-                background = roundedDrawable(INPUT_SURFACE, dp(22), PINK_SHADOW_STROKE)
+                background = roundedDrawable(INPUT_SURFACE, dp(24), PINK_SHADOW_STROKE)
                 elevation = dp(2).toFloat()
                 inputType = InputType.TYPE_CLASS_TEXT or
                     InputType.TYPE_TEXT_FLAG_CAP_SENTENCES or
                     InputType.TYPE_TEXT_FLAG_MULTI_LINE
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(14), dp(10), dp(14), dp(10))
+                setPadding(dp(16), dp(12), dp(16), dp(12))
                 addTextChangedListener(object : TextWatcher {
                     override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
                     override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
@@ -385,9 +353,10 @@ class MainActivity : Activity() {
             actionButton = terminalAction(">").apply {
                 background = circleDrawable(STRAWBERRY_RED)
                 setTextColor(CREAM_BACKGROUND)
+                textSize = 22f
                 gravity = Gravity.CENTER
-                minWidth = dp(42)
-                minHeight = dp(42)
+                minWidth = dp(46)
+                minHeight = dp(46)
                 setOnClickListener { handleInputAction() }
             }
             addView(actionButton)
@@ -697,8 +666,8 @@ class MainActivity : Activity() {
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(18), dp(18), dp(18))
-            setBackgroundColor(SOFT_PINK_PANEL)
+            setPadding(dp(16), dp(44), dp(16), dp(16))
+            setBackgroundColor(CREAM_BACKGROUND)
         }
 
         val header = LinearLayout(this).apply {
@@ -709,32 +678,55 @@ class MainActivity : Activity() {
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(terminalAction("+").apply {
-                textSize = 20f
-                background = circleDrawable(ACCENT_PINK)
-                setOnClickListener {
-                    dialog.dismiss()
-                    showMeshPanel(scanFirst = true)
-                }
-            }, LinearLayout.LayoutParams(dp(36), dp(36)))
-            addView(terminalAction("X").apply {
-                textSize = 18f
-                setOnClickListener { dialog.dismiss() }
-            })
         }
         root.addView(header)
+
+        val listScroll = ScrollView(this).apply {
+            isFillViewport = true
+            setPadding(0, dp(12), 0, 0)
+        }
+        val listContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        listScroll.addView(listContent, ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(listScroll, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            0,
+            1f
+        ))
+
+        root.addView(buildPageBottomNav(
+            selected = PageTab.CONTACTS,
+            onNewContacts = {
+                dialog.dismiss()
+                showMeshPanel(scanFirst = true)
+            },
+            onContacts = { },
+            onProfile = {
+                dialog.dismiss()
+                showOwnProfilePage()
+            }
+        ), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            topMargin = dp(10)
+        })
 
         val summaries = chatStore.listChats()
             .filter { it.kind != ChatKind.PEER.name || it.peerId != null }
         if (summaries.isEmpty()) {
-            root.addView(terminalText("No chats yet").apply {
+            listContent.addView(terminalText("No chats yet").apply {
                 textSize = 14f
                 setTextColor(BERRY_TEXT_DIM)
                 setPadding(0, dp(24), 0, 0)
             })
         } else {
             summaries.forEach { summary ->
-                root.addView(chatSummaryRow(summary) {
+                listContent.addView(chatSummaryRow(summary) {
                     val peerId = summary.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
                     selectChat(summary.chatKey, summary.title, peerId)
                     dialog.dismiss()
@@ -753,7 +745,45 @@ class MainActivity : Activity() {
         dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
     }
 
+    private fun chatListBottomItem(title: String, selected: Boolean, onClick: () -> Unit): TextView =
+        terminalText(title).apply {
+            gravity = Gravity.CENTER
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(if (selected) CREAM_BACKGROUND else BERRY_TEXT_DIM)
+            background = roundedDrawable(if (selected) STRAWBERRY_RED else Color.TRANSPARENT, dp(20))
+            setOnClickListener { onClick() }
+        }
+
+    private enum class PageTab { NEW_CONTACTS, CONTACTS, PROFILE }
+
+    private fun buildPageBottomNav(
+        selected: PageTab,
+        onNewContacts: () -> Unit,
+        onContacts: () -> Unit,
+        onProfile: () -> Unit
+    ): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dp(6), dp(8), dp(6), dp(8))
+            background = roundedDrawable(Color.WHITE, dp(24), SOFT_PINK_STROKE)
+
+            addView(chatListBottomItem("New contacts", selected == PageTab.NEW_CONTACTS, onNewContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+                marginEnd = dp(4)
+            })
+            addView(chatListBottomItem("Contacts", selected == PageTab.CONTACTS, onContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+                marginStart = dp(4)
+                marginEnd = dp(4)
+            })
+            addView(chatListBottomItem("Profile", selected == PageTab.PROFILE, onProfile), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+                marginStart = dp(4)
+            })
+        }
+
     private fun chatSummaryRow(summary: ChatSummary, onClick: () -> Unit): LinearLayout {
+        val presence = summaryPresence(summary)
+        val displayTitle = summaryDisplayTitle(summary)
         val preview = when {
             summary.lastImagePath != null -> "photo"
             summary.lastBody.isNotBlank() -> summary.lastBody
@@ -788,12 +818,20 @@ class MainActivity : Activity() {
             })
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
-                addView(terminalText(summary.title.toDisplayTitle()).apply {
+                addView(terminalText(displayTitle).apply {
                     textSize = 16f
                     typeface = Typeface.DEFAULT_BOLD
                     setTextColor(BERRY_TEXT)
                     maxLines = 1
                 })
+                if (summary.pinned) {
+                    addView(terminalText("pinned").apply {
+                        textSize = 11f
+                        typeface = Typeface.DEFAULT_BOLD
+                        setTextColor(STRAWBERRY_RED)
+                        setPadding(0, dp(2), 0, 0)
+                    })
+                }
                 addView(terminalText(preview).apply {
                     textSize = 12f
                     setTextColor(BERRY_TEXT_DIM)
@@ -801,17 +839,28 @@ class MainActivity : Activity() {
                     setPadding(0, dp(4), 0, 0)
                 })
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(terminalText(presence.first).apply {
+                textSize = 11f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(if (presence.second) LEAF_GREEN else BERRY_TEXT_DIM)
+                background = roundedDrawable(0x14FF4359, dp(12), SOFT_PINK_STROKE)
+                setPadding(dp(8), dp(3), dp(8), dp(3))
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginEnd = if (summary.unreadCount > 0) dp(8) else 0
+            })
             if (summary.unreadCount > 0) {
-                addView(terminalText(summary.unreadCount.toString()).apply {
-                    textSize = 12f
-                    gravity = Gravity.CENTER
-                    typeface = Typeface.DEFAULT_BOLD
-                    setTextColor(Color.WHITE)
-                    background = roundedDrawable(STRAWBERRY_RED, dp(12))
-                    setPadding(dp(8), dp(3), dp(8), dp(3))
-                })
+                addView(View(this@MainActivity).apply {
+                    background = circleDrawable(STRAWBERRY_RED)
+                }, LinearLayout.LayoutParams(dp(10), dp(10)))
             }
             setOnClickListener { onClick() }
+            setOnLongClickListener {
+                showChatRowActions(summary)
+                true
+            }
         }
     }
 
@@ -834,7 +883,7 @@ class MainActivity : Activity() {
             setBackgroundColor(SOFT_PINK_PANEL)
         }
 
-        val nearbyTitle = terminalText("Nearby ${meshService?.peerCount() ?: 0}").apply {
+        val nearbyTitle = terminalText("Patch ${meshService?.peerCount() ?: 0}").apply {
             textSize = 20f
             setTextColor(BERRY_TEXT)
         }
@@ -843,13 +892,21 @@ class MainActivity : Activity() {
             setTextColor(BERRY_TEXT_DIM)
             setPadding(0, 0, 0, dp(10))
         }
+        val radarView = PatchRadarView(this).apply {
+            minimumHeight = dp(180)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(180)
+            ).apply { bottomMargin = dp(12) }
+            background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+        }
         val peopleContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
         val searchInput = EditText(this).apply {
-            hint = "search people..."
+            hint = "search in patch..."
             setSingleLine(true)
-            typeface = Typeface.MONOSPACE
+            typeface = Typeface.DEFAULT
             textSize = 14f
             setTextColor(BERRY_TEXT)
             setHintTextColor(BERRY_TEXT_DIM)
@@ -858,35 +915,76 @@ class MainActivity : Activity() {
         }
         fun refreshPeopleRows() {
             val peerCount = meshService?.peerCount() ?: 0
-            nearbyTitle.text = "Nearby $peerCount"
+            nearbyTitle.text = "Patch $peerCount"
             transportStatus.text = meshService?.meshTransportStatus() ?: "Mesh starting..."
             counterView.text = peerCount.toString()
             peopleContainer.removeAllViews()
 
             val query = searchInput.text?.toString().orEmpty().trim().lowercase(Locale.getDefault())
+            val existingPeerIds = chatStore.listChats()
+                .filter { it.kind == ChatKind.PEER.name && it.messageCount > 0 }
+                .mapNotNull { it.peerId?.let { id -> runCatching { UUID.fromString(id) }.getOrNull() } }
+                .toSet()
             val peers = meshService?.knownPeers().orEmpty().filter { peer ->
                 val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
-                query.isBlank() || label.lowercase(Locale.getDefault()).contains(query)
+                (query.isBlank() || label.lowercase(Locale.getDefault()).contains(query)) &&
+                    !existingPeerIds.contains(peer.nodeId)
             }
-            peers.forEach { peer ->
-                val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
-                rememberPeer(peer.nodeId, label)
-            }
-            if (peers.isEmpty()) {
-                peopleContainer.addView(terminalText(if (query.isBlank()) "Searching nearby..." else "No matches").apply {
+            val directPeers = peers.filter { it.isDirect || it.hopCount <= 1 }
+            val meshPeers = peers.filterNot { it.isDirect || it.hopCount <= 1 }
+            radarView.setPeerCounts(directPeers.size, meshPeers.size)
+
+            peopleContainer.addView(terminalText("Direct in range (${directPeers.size})").apply {
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+                setPadding(0, 0, 0, dp(8))
+            })
+            if (directPeers.isEmpty()) {
+                peopleContainer.addView(terminalText(if (query.isBlank()) "No direct peers in Bluetooth range" else "No direct matches").apply {
                     textSize = 14f
                     setTextColor(BERRY_TEXT_DIM)
+                    setPadding(0, 0, 0, dp(8))
                 })
             } else {
-                peers.forEach { peer ->
+                directPeers.forEach { peer ->
                     val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
                     val stored = chatStore.getPeer(peer.nodeId.toString())
                     val verified = stored?.verified == true
                     val subtitle = listOfNotNull(
+                        "direct BLE",
                         if (verified) "verified" else null,
                         stored?.let { formatPeerPresence(it.lastSeen) } ?: "online now"
                     ).joinToString(" / ")
-                    peopleContainer.addView(networkActionRow(label, subtitle, !savedMessagesSelected && selectedRecipientId == peer.nodeId) {
+                    peopleContainer.addView(patchPeerRow(label, subtitle, !savedMessagesSelected && selectedRecipientId == peer.nodeId) {
+                        rememberPeer(peer.nodeId, label)
+                        meshService?.prepareChatWith(peer.nodeId.toString())
+                        selectChat(peerChatKey(peer.nodeId), label, peer.nodeId)
+                        dialog.dismiss()
+                    }, LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { bottomMargin = dp(8) })
+                }
+            }
+
+            peopleContainer.addView(terminalText("Reachable via hops (${meshPeers.size})").apply {
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+                setPadding(0, dp(6), 0, dp(8))
+            })
+            if (meshPeers.isEmpty()) {
+                peopleContainer.addView(terminalText(if (query.isBlank()) "No multi-hop routes discovered yet" else "No hop matches").apply {
+                    textSize = 14f
+                    setTextColor(BERRY_TEXT_DIM)
+                })
+            } else {
+                meshPeers.forEach { peer ->
+                    val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
+                    val hops = peer.hopCount.coerceAtLeast(2)
+                    val subtitle = "via $hops hops / ${formatPeerPresence(peer.lastSeen)}"
+                    peopleContainer.addView(patchPeerRow(label, subtitle, !savedMessagesSelected && selectedRecipientId == peer.nodeId) {
                         rememberPeer(peer.nodeId, label)
                         meshService?.prepareChatWith(peer.nodeId.toString())
                         selectChat(peerChatKey(peer.nodeId), label, peer.nodeId)
@@ -900,45 +998,61 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             addView(nearbyTitle, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(terminalAction("qr").apply {
-                textSize = 13f
-                setOnClickListener { showCurrentChatProfile() }
-            })
-            addView(terminalAction("X").apply {
-                textSize = 18f
-                setOnClickListener { dialog.dismiss() }
-            })
         }
         root.addView(header)
         root.addView(transportStatus)
+        root.addView(radarView)
 
-        root.addView(networkActionRow("Everyone", "broadcast mode", !savedMessagesSelected && selectedRecipientId == null) {
-            selectChat(CHAT_EVERYONE, "everyone", null)
-            dialog.dismiss()
-        })
-
-        root.addView(networkActionRow("Saved messages", "private local chat", savedMessagesSelected) {
-            selectChat(CHAT_SAVED, "saved", null)
-            dialog.dismiss()
-        })
-
-        root.addView(terminalText("PEOPLE").apply {
-            textSize = 15f
-            setPadding(0, dp(18), 0, dp(10))
-            setTextColor(BERRY_TEXT)
-        })
-        root.addView(searchInput, LinearLayout.LayoutParams(
+        val contentScroll = ScrollView(this).apply {
+            isFillViewport = true
+        }
+        val contentContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(terminalText("PATCH").apply {
+                textSize = 15f
+                setPadding(0, dp(18), 0, dp(10))
+                setTextColor(BERRY_TEXT)
+            })
+            addView(searchInput, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(10)
+            })
+            addView(peopleContainer)
+        }
+        contentScroll.addView(contentContainer, ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply {
-            bottomMargin = dp(10)
-        })
+        ))
+        root.addView(contentScroll, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            0,
+            1f
+        ))
+
         searchInput.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = refreshPeopleRows()
             override fun afterTextChanged(s: Editable?) = Unit
         })
-        root.addView(peopleContainer)
+        root.addView(buildPageBottomNav(
+            selected = PageTab.NEW_CONTACTS,
+            onNewContacts = { },
+            onContacts = {
+                dialog.dismiss()
+                showChatList()
+            },
+            onProfile = {
+                dialog.dismiss()
+                showOwnProfilePage()
+            }
+        ), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            topMargin = dp(10)
+        })
         refreshPeopleRows()
 
         dialog.setContentView(root)
@@ -968,23 +1082,61 @@ class MainActivity : Activity() {
         mainHandler.postDelayed(panelRefresh, 1_200)
     }
 
-    private fun networkPeerRow(name: String, signal: String): LinearLayout {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
-            addView(terminalText("[]").apply {
-                textSize = 16f
-                setPadding(0, 0, dp(12), 0)
+    private fun patchPeerRow(
+        title: String,
+        subtitle: String,
+        selected: Boolean,
+        onClick: () -> Unit
+    ): LinearLayout {
+        return networkActionRow(title, subtitle, selected, onClick).apply {
+            background = roundedDrawable(
+                if (selected) 0x22FF4359 else INPUT_SURFACE,
+                dp(18),
+                if (selected) STRAWBERRY_RED else SOFT_PINK_STROKE
+            )
+        }
+    }
+
+    private fun showGrowScreen() {
+        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(20), dp(20), dp(18))
+            background = roundedDrawable(SOFT_PINK_PANEL, dp(24), SOFT_PINK_STROKE)
+            addView(terminalText("Grow").apply {
+                textSize = 24f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
             })
-            addView(terminalText(name).apply {
-                textSize = 15f
-            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(terminalText(signal).apply {
-                textSize = 12f
+            addView(terminalText("Bring phones close to exchange local keys and join each other's patch.").apply {
+                textSize = 13f
                 setTextColor(BERRY_TEXT_DIM)
+                setPadding(0, dp(8), 0, dp(14))
+            })
+            addView(patchPeerRow("Start discovery", "scan nearby BLE mesh nodes", false) {
+                triggerMeshScan()
+                Toast.makeText(this@MainActivity, "Searching nearby patch", Toast.LENGTH_SHORT).show()
+            })
+            addView(patchPeerRow("Open patch", "show direct and hop peers", false) {
+                dialog.dismiss()
+                showMeshPanel(scanFirst = true)
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) })
+            addView(terminalAction("Close").apply {
+                textSize = 15f
+                setPadding(0, dp(14), 0, 0)
+                setOnClickListener { dialog.dismiss() }
             })
         }
+        dialog.setContentView(root)
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        dialog.show()
+        dialog.window?.setLayout(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT
+        )
     }
 
     private fun networkActionRow(
@@ -1116,12 +1268,17 @@ class MainActivity : Activity() {
     private fun addReceivedText(line: String) {
         val meta = line.substringAfter("message from ", "")
         val sender = parseIncomingSender(meta.substringBefore(" at ", "@peer"))
+        if (isSelfSender(sender.nodeId)) return
         val author = sender.label
         val timestampAndBody = meta.substringAfter(" at ", "")
         val timestamp = timestampAndBody.substringBefore(": ", "")
             .toLongOrNull()
             ?: System.currentTimeMillis()
         val body = timestampAndBody.substringAfter(": ", line)
+        if (body.startsWith(CONTROL_PREFIX)) {
+            handleIncomingControl(sender, body)
+            return
+        }
         sender.nodeId?.let { rememberPeer(it, author) }
         val chatKey = incomingChatKey(sender)
         if (chatKey != currentChatKey()) chatStore.incrementUnread(chatKey)
@@ -1131,6 +1288,7 @@ class MainActivity : Activity() {
     private fun addReceivedImage(line: String) {
         val meta = line.substringAfter("image from ", "")
         val sender = parseIncomingSender(meta.substringBefore(" at ", "@peer"))
+        if (isSelfSender(sender.nodeId)) return
         val author = sender.label
         val timestampAndPayload = meta.substringAfter(" at ", "")
         val timestamp = timestampAndPayload.substringBefore(": ", "")
@@ -1139,6 +1297,10 @@ class MainActivity : Activity() {
         val payload = timestampAndPayload.substringAfter(": ", line.substringAfter(": ", ""))
         val imagePath = payload.substringBefore("|")
         if (imagePath.isBlank()) return
+        if (!File(imagePath).exists()) {
+            addMessage("mesh", "incoming image not available on device", false)
+            return
+        }
         sender.nodeId?.let { rememberPeer(it, author) }
         val chatKey = incomingChatKey(sender)
         if (chatKey != currentChatKey()) chatStore.incrementUnread(chatKey)
@@ -1275,6 +1437,9 @@ class MainActivity : Activity() {
         val isBroadcast = parts.getOrNull(2) == "broadcast"
         return IncomingSender(label, nodeId, isBroadcast)
     }
+
+    private fun isSelfSender(nodeId: UUID?): Boolean =
+        nodeId != null && nodeId == meshService?.nodeId
 
     private fun incomingChatKey(sender: IncomingSender): String =
         if (sender.isBroadcast || sender.nodeId == null) CHAT_EVERYONE else peerChatKey(sender.nodeId)
@@ -1424,9 +1589,34 @@ class MainActivity : Activity() {
         if (::chatTitleView.isInitialized) {
             chatTitleView.text = selectedRecipientLabel.toDisplayTitle()
         }
+        if (::networkStatusView.isInitialized) {
+            networkStatusView.text = when {
+                savedMessagesSelected -> "Saved messages"
+                selectedRecipientId != null -> {
+                    if (isPeerOnline(selectedRecipientId)) {
+                        "online now"
+                    } else {
+                        val peer = chatStore.getPeer(selectedRecipientId.toString())
+                        "Last seen: ${formatPeerPresence(peer?.lastSeen ?: 0L)}"
+                    }
+                }
+                else -> networkStatusView.text
+            }
+        }
     }
 
     private fun updateNetworkStatusFromLog(line: String) {
+        if (selectedRecipientId != null && !savedMessagesSelected) {
+            if (::networkStatusView.isInitialized) {
+                networkStatusView.text = if (isPeerOnline(selectedRecipientId)) {
+                    "online now"
+                } else {
+                    val peer = chatStore.getPeer(selectedRecipientId.toString())
+                    "Last seen: ${formatPeerPresence(peer?.lastSeen ?: 0L)}"
+                }
+            }
+            return
+        }
         val status = when {
             line.startsWith("search people:") -> "Searching nearby..."
             line.startsWith("mesh started") || line.startsWith("service connected") -> "Mesh online"
@@ -1445,7 +1635,11 @@ class MainActivity : Activity() {
     }
 
     private fun showCurrentChatProfile() {
-        val title = selectedRecipientLabel.toDisplayTitle()
+        val title = if (selectedRecipientId != null) {
+            selectedRecipientLabel.toDisplayTitle().removePrefix("@")
+        } else {
+            selectedRecipientLabel.toDisplayTitle()
+        }
         val peerId = selectedRecipientId
         val storedPeer = peerId?.let { chatStore.getPeer(it.toString()) }
         val fingerprint = peerId?.let { storedPeer?.fingerprint ?: peerFingerprint(it) }
@@ -1453,7 +1647,7 @@ class MainActivity : Activity() {
         val subtitle = when {
             savedMessagesSelected -> "Private local chat stored on this device."
             selectedRecipientId == null -> "Broadcast chat for everyone nearby."
-            else -> "${formatPeerPresence(storedPeer?.lastSeen ?: 0L)} / Peer ID: ${peerId.toString().take(8)}...${peerId.toString().takeLast(6)}"
+            else -> "Last seen: ${formatPeerPresence(storedPeer?.lastSeen ?: 0L)} / Peer ID: ${peerId.toString().take(8)}...${peerId.toString().takeLast(6)}"
         }
         val action = when {
             savedMessagesSelected -> "Saved messages are automatically marked as read."
@@ -1541,6 +1735,122 @@ class MainActivity : Activity() {
         dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
         dialog.show()
         dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+    }
+
+    private fun showOwnProfilePage() {
+        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
+        val originalName = meshService?.getNickname()?.take(MAX_NICKNAME_LENGTH) ?: currentNickname
+        val input = EditText(this).apply {
+            setText(getDisplayName())
+            setSingleLine(true)
+            typeface = Typeface.DEFAULT
+            textSize = 16f
+            setTextColor(BERRY_TEXT)
+            setHintTextColor(BERRY_TEXT_DIM)
+            hint = "Display name"
+            filters = arrayOf(InputFilter.LengthFilter(24))
+            background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+        }
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(44), dp(20), dp(20))
+            setBackgroundColor(CREAM_BACKGROUND)
+
+            addView(terminalText("Profile").apply {
+                textSize = 24f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+            })
+
+            addView(terminalText("Original name (fixed)").apply {
+                textSize = 12f
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(0, dp(16), 0, dp(6))
+            })
+            addView(terminalText(originalName).apply {
+                textSize = 17f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+                background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                setPadding(dp(14), dp(10), dp(14), dp(10))
+            })
+
+            addView(terminalText("Display name (editable)").apply {
+                textSize = 12f
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(0, dp(14), 0, dp(6))
+            })
+            addView(input)
+
+            addView(terminalAction("Save").apply {
+                textSize = 16f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                background = roundedDrawable(STRAWBERRY_RED, dp(18))
+                setPadding(dp(14), dp(10), dp(14), dp(10))
+                setOnClickListener {
+                    setDisplayName(input.text?.toString().orEmpty())
+                    usernameField.setText(contactDisplayName())
+                    Toast.makeText(this@MainActivity, "Profile updated", Toast.LENGTH_SHORT).show()
+                    dialog.dismiss()
+                    showChatList()
+                }
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(16)
+            })
+            addView(View(this@MainActivity), LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            ))
+            addView(buildPageBottomNav(
+                selected = PageTab.PROFILE,
+                onNewContacts = {
+                    dialog.dismiss()
+                    showMeshPanel(scanFirst = true)
+                },
+                onContacts = {
+                    dialog.dismiss()
+                    showChatList()
+                },
+                onProfile = { }
+            ), LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(10)
+            })
+        }
+
+        dialog.setContentView(root)
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        dialog.show()
+        dialog.window?.setLayout(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT
+        )
+    }
+
+    private fun getDisplayName(): String =
+        getSharedPreferences("bitchat_profile", Context.MODE_PRIVATE)
+            .getString("display_name", "")
+            .orEmpty()
+
+    private fun setDisplayName(value: String) {
+        getSharedPreferences("bitchat_profile", Context.MODE_PRIVATE)
+            .edit()
+            .putString("display_name", value.trim().take(24))
+            .apply()
+    }
+
+    private fun contactDisplayName(): String {
+        val display = getDisplayName().trim()
+        return display.ifBlank { currentNickname.removePrefix("@") }
     }
 
     private fun showMessageSearchDialog(chatKey: String) {
@@ -1674,6 +1984,274 @@ class MainActivity : Activity() {
             elapsed < 24L * 60L * 60L * 1000L -> "seen ${elapsed / 3_600_000L} h ago"
             else -> "seen ${elapsed / 86_400_000L} d ago"
         }
+    }
+
+    private fun summaryDisplayTitle(summary: ChatSummary): String {
+        val title = summary.title.toDisplayTitle()
+        return if (summary.kind == ChatKind.PEER.name) title.removePrefix("@") else title
+    }
+
+    private fun summaryPresence(summary: ChatSummary): Pair<String, Boolean> {
+        if (summary.kind == ChatKind.SAVED.name) return "local" to true
+        if (summary.kind == ChatKind.EVERYONE.name) {
+            val hasPeers = (meshService?.peerCount() ?: 0) > 0
+            return if (hasPeers) "online" to true else "offline" to false
+        }
+        val peerId = summary.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+            ?: return "offline" to false
+        val active = meshService?.knownPeers().orEmpty().any { it.nodeId == peerId }
+        if (active) return "online" to true
+
+        val lastSeen = chatStore.getPeer(peerId.toString())?.lastSeen ?: 0L
+        val recentlyOnline = lastSeen > 0L && (System.currentTimeMillis() - lastSeen) < 2L * 60L * 1000L
+        return if (recentlyOnline) "online" to true else "offline" to false
+    }
+
+    private fun isPeerOnline(peerId: UUID?): Boolean {
+        if (peerId == null) return false
+        return meshService?.knownPeers().orEmpty().any { it.nodeId == peerId }
+    }
+
+    private fun showChatRowActions(summary: ChatSummary) {
+        val pinLabel = if (summary.pinned) "Unpin" else "Pin"
+        val options = if (summary.kind == ChatKind.PEER.name) {
+            arrayOf(pinLabel, "Delete")
+        } else {
+            arrayOf(pinLabel)
+        }
+        AlertDialog.Builder(this)
+            .setItems(options) { _, which ->
+                when (options[which]) {
+                    "Delete" -> deleteChatSummary(summary, deleteForEveryone = true)
+                    else -> {
+                        chatStore.setChatPinned(summary.chatKey, !summary.pinned)
+                        showChatList()
+                    }
+                }
+            }
+            .show()
+    }
+
+    private fun deleteChatSummary(summary: ChatSummary, deleteForEveryone: Boolean) {
+        if (deleteForEveryone) {
+            sendDeleteChatControl(summary.peerId)
+        }
+        chatStore.deleteChat(summary.chatKey, summary.peerId)
+        val chatKey = summary.chatKey
+        if (currentChatKey() == chatKey && !savedMessagesSelected) {
+            showChatMessages(chatKey)
+            updateRecipientHint()
+            updateChatTitle()
+        }
+        chatAdapter.notifyDataSetChanged()
+        showChatList()
+    }
+
+    private fun showMessageActions(message: ChatMessage) {
+        if (message.author == "system" || message.author == "mesh") return
+        val options = if (message.imagePath == null) arrayOf("Delete", "Edit") else arrayOf("Delete")
+        AlertDialog.Builder(this)
+            .setItems(options) { _, which ->
+                when (options[which]) {
+                    "Delete" -> confirmDeleteMessage(message)
+                    "Edit" -> editMessage(message)
+                }
+            }
+            .show()
+    }
+
+    private fun confirmDeleteMessage(target: ChatMessage) {
+        val checkbox = CheckBox(this).apply {
+            text = "delete for everyone?"
+            setTextColor(BERRY_TEXT)
+            isChecked = false
+        }
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(10), dp(20), dp(4))
+            addView(terminalText("Delete for myself?").apply {
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+                setPadding(0, 0, 0, dp(10))
+            })
+            addView(checkbox)
+        }
+
+        AlertDialog.Builder(this)
+            .setView(panel)
+            .setPositiveButton("Delete") { _, _ ->
+                deleteMessage(target, deleteForEveryone = checkbox.isChecked)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun deleteMessage(target: ChatMessage, deleteForEveryone: Boolean) {
+        if (deleteForEveryone) {
+            sendDeleteMessageControl(target)
+        }
+        val chatKey = currentChatKey()
+        val removed = removeMessageEverywhere(target)
+        if (!removed) {
+            return
+        }
+        if (target.localId > 0L) {
+            chatStore.deleteMessage(target.localId)
+        } else {
+            rebuildStoredChat(chatKey, messagesForChat(chatKey))
+        }
+        if (messagesForChat(chatKey).isEmpty()) {
+            showChatMessages(chatKey)
+        } else {
+            chatAdapter.notifyDataSetChanged()
+        }
+    }
+
+    private fun sendDeleteChatControl(peerIdText: String?) {
+        val peer = peerIdText?.let { runCatching { UUID.fromString(it) }.getOrNull() } ?: return
+        meshService?.sendMessage(peer.toString(), "$CONTROL_PREFIX$CONTROL_DELETE_CHAT")
+    }
+
+    private fun sendDeleteMessageControl(message: ChatMessage) {
+        if (savedMessagesSelected) return
+        val bodyEncoded = java.util.Base64.getUrlEncoder()
+            .withoutPadding()
+            .encodeToString(message.body.toByteArray(Charsets.UTF_8))
+        val imageFlag = if (message.imagePath != null) "1" else "0"
+        val token = messageDeleteToken(message.body, imageFlag == "1")
+        val ownerMineOnSender = if (message.mine) "1" else "0"
+        val payload =
+            "$CONTROL_PREFIX$CONTROL_DELETE_MESSAGE|${message.timestamp}|$imageFlag|$bodyEncoded|$token|$ownerMineOnSender"
+        if (currentChatKey() == CHAT_EVERYONE) {
+            meshService?.broadcastMessage(payload)
+        } else {
+            val peer = selectedRecipientId ?: return
+            meshService?.sendMessage(peer.toString(), payload)
+        }
+    }
+
+    private fun handleIncomingControl(sender: IncomingSender, body: String) {
+        val payload = body.removePrefix(CONTROL_PREFIX)
+        if (payload == CONTROL_DELETE_CHAT) {
+            sender.nodeId?.let { peerId ->
+                val chatKey = peerChatKey(peerId)
+                chatStore.deleteChat(chatKey, peerId.toString())
+                peerMessages.remove(chatKey)
+                if (selectedRecipientId == peerId) {
+                    showChatMessages(peerChatKey(peerId))
+                    updateRecipientHint()
+                    updateChatTitle()
+                } else {
+                    chatAdapter.notifyDataSetChanged()
+                }
+            }
+            return
+        }
+
+        if (!payload.startsWith(CONTROL_DELETE_MESSAGE)) return
+        val parts = payload.split("|")
+        if (parts.size < 4) return
+        val timestamp = parts.getOrNull(1)?.toLongOrNull() ?: return
+        val imageFlag = parts.getOrNull(2) == "1"
+        val bodyValue = runCatching {
+            String(java.util.Base64.getUrlDecoder().decode(parts.getOrNull(3).orEmpty()), Charsets.UTF_8)
+        }.getOrDefault("")
+        val token = parts.getOrNull(4).orEmpty()
+        val ownerMineOnSender = parts.getOrNull(5)?.let { it == "1" }
+        val expectedMine = ownerMineOnSender?.let { !it }
+
+        val chatKey = incomingChatKey(sender)
+        val buffer = messagesForChat(chatKey)
+        val incomingCandidates = buffer.filter { it ->
+            (expectedMine == null || it.mine == expectedMine) &&
+                ((imageFlag && it.imagePath != null) || (!imageFlag && it.imagePath == null))
+        }
+
+        var match = incomingCandidates.lastOrNull {
+            it.timestamp == timestamp &&
+                ((imageFlag && it.imagePath != null) || (!imageFlag && it.imagePath == null && it.body == bodyValue))
+        }
+        if (match == null && token.isNotBlank()) {
+            match = incomingCandidates.lastOrNull {
+                messageDeleteToken(it.body, it.imagePath != null) == token
+            }
+        }
+        if (match == null && bodyValue.isNotBlank()) {
+            match = incomingCandidates.lastOrNull { it.body == bodyValue }
+        }
+        if (match == null) {
+            match = incomingCandidates.lastOrNull { it.timestamp == timestamp }
+        }
+        match ?: return
+
+        val removed = removeMessageEverywhere(match)
+        if (!removed) return
+        if (match.localId > 0L) {
+            chatStore.deleteMessage(match.localId)
+        } else {
+            rebuildStoredChat(chatKey, buffer)
+        }
+        chatAdapter.notifyDataSetChanged()
+    }
+
+    private fun editMessage(target: ChatMessage) {
+        if (target.imagePath != null) return
+        val input = EditText(this).apply {
+            setText(target.body)
+            setSingleLine(false)
+            maxLines = 4
+            setTextColor(BERRY_TEXT)
+            setHintTextColor(BERRY_TEXT_DIM)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = roundedDrawable(INPUT_SURFACE, dp(16), SOFT_PINK_STROKE)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Edit")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ ->
+                val next = input.text?.toString()?.trim().orEmpty()
+                if (next.isBlank()) return@setPositiveButton
+                target.body = next
+                if (target.localId > 0L) {
+                    chatStore.updateMessageBody(target.localId, next)
+                } else {
+                    rebuildStoredChat(currentChatKey(), messagesForChat(currentChatKey()))
+                }
+                chatAdapter.notifyDataSetChanged()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun removeMessageEverywhere(target: ChatMessage): Boolean {
+        var removedAny = false
+        fun MutableList<ChatMessage>.removeTarget() {
+            val removed = removeAll {
+                when {
+                    target.localId > 0L -> it.localId == target.localId
+                    target.messageId != null -> it.messageId == target.messageId
+                    else -> it === target || (
+                        it.timestamp == target.timestamp &&
+                            it.body == target.body &&
+                            it.mine == target.mine &&
+                            ((it.imagePath == null) == (target.imagePath == null))
+                        )
+                }
+            }
+            removedAny = removedAny || removed
+        }
+        meshMessages.removeTarget()
+        savedMessages.removeTarget()
+        messages.removeTarget()
+        peerMessages.values.forEach { it.removeTarget() }
+        return removedAny
+    }
+
+    private fun messageDeleteToken(body: String, isImage: Boolean): String {
+        val source = if (isImage) "img" else "txt:${body.trim()}"
+        val bytes = MessageDigest.getInstance("SHA-256").digest(source.toByteArray(Charsets.UTF_8))
+        return bytes.joinToString("") { b -> "%02x".format(b) }.take(16)
     }
 
     private fun peerFingerprint(peerId: UUID): String =
@@ -2071,6 +2649,73 @@ class MainActivity : Activity() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
+    private inner class PatchRadarView(context: Context) : View(context) {
+        private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dp(1).toFloat()
+            color = SOFT_PINK_STROKE
+        }
+        private val centerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = STRAWBERRY_RED
+        }
+        private val directPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = LEAF_GREEN
+        }
+        private val meshPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = 0x66FF4359
+        }
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = BERRY_TEXT_DIM
+            textSize = dp(11).toFloat()
+            textAlign = Paint.Align.CENTER
+        }
+
+        private var directCount: Int = 0
+        private var meshCount: Int = 0
+
+        fun setPeerCounts(direct: Int, mesh: Int) {
+            directCount = direct
+            meshCount = mesh
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val cx = width / 2f
+            val cy = height / 2f
+            val radius = minOf(width, height) * 0.42f
+
+            canvas.drawCircle(cx, cy, radius, ringPaint)
+            canvas.drawCircle(cx, cy, radius * 0.72f, ringPaint)
+            canvas.drawCircle(cx, cy, radius * 0.45f, ringPaint)
+            canvas.drawCircle(cx, cy, radius * 0.18f, centerPaint)
+            canvas.drawText("You", cx, cy + dp(4), Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                textSize = dp(10).toFloat()
+                textAlign = Paint.Align.CENTER
+            })
+
+            drawPeers(canvas, cx, cy, radius * 0.52f, directCount, directPaint)
+            drawPeers(canvas, cx, cy, radius * 0.84f, meshCount, meshPaint)
+
+            canvas.drawText("Direct: $directCount", cx, height - dp(26).toFloat(), textPaint)
+            canvas.drawText("Mesh hops: $meshCount", cx, height - dp(10).toFloat(), textPaint)
+        }
+
+        private fun drawPeers(canvas: Canvas, cx: Float, cy: Float, radius: Float, count: Int, paint: Paint) {
+            if (count <= 0) return
+            repeat(count.coerceAtMost(14)) { index ->
+                val angle = (index.toFloat() / count.toFloat()) * (Math.PI * 2.0)
+                val x = cx + (kotlin.math.cos(angle).toFloat() * radius)
+                val y = cy + (kotlin.math.sin(angle).toFloat() * radius)
+                canvas.drawCircle(x, y, dp(4).toFloat(), paint)
+            }
+        }
+    }
+
     private inner class ChatAdapter(private val items: List<ChatMessage>) : BaseAdapter() {
         override fun getCount(): Int = items.size
         override fun getItem(position: Int): ChatMessage = items[position]
@@ -2105,6 +2750,10 @@ class MainActivity : Activity() {
                         scaleType = ImageView.ScaleType.FIT_CENTER
                         setBackgroundColor(Color.TRANSPARENT)
                         setOnClickListener { showImagePreview(item.imagePath) }
+                        setOnLongClickListener {
+                            showMessageActions(item)
+                            true
+                        }
                     }
                     addView(image, LinearLayout.LayoutParams(
                         imageSize.first,
@@ -2128,6 +2777,12 @@ class MainActivity : Activity() {
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ))
+                if (!isServiceLog) {
+                    bubble.setOnLongClickListener {
+                        showMessageActions(item)
+                        true
+                    }
+                }
             }
         }
 
@@ -2199,9 +2854,17 @@ class MainActivity : Activity() {
 
         private fun messageTimeView(item: ChatMessage, overOutgoing: Boolean): View {
             val tint = if (overOutgoing) 0xE6FFFFFF.toInt() else BERRY_TEXT_DIM
+            val statusLabel = when (item.status) {
+                MessageStatus.SENDING -> "Sprouting"
+                MessageStatus.DELIVERED -> "Ripe"
+                MessageStatus.READ -> "Ripe"
+                null -> if (selectedRecipientId == null) "Broadcast" else ""
+            }
             if (!item.mine || item.status == null) {
                 return TextView(this@MainActivity).apply {
-                    text = item.displayTime()
+                    text = listOf(statusLabel, item.displayTime())
+                        .filter { it.isNotBlank() }
+                        .joinToString("  ")
                     textSize = 11f
                     typeface = Typeface.DEFAULT
                     gravity = Gravity.RIGHT
@@ -2213,7 +2876,9 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 addView(TextView(this@MainActivity).apply {
-                    text = item.displayTime()
+                    text = listOf(statusLabel, item.displayTime())
+                        .filter { it.isNotBlank() }
+                        .joinToString("  ")
                     textSize = 11f
                     typeface = Typeface.DEFAULT
                     gravity = Gravity.RIGHT
@@ -2476,7 +3141,7 @@ class MainActivity : Activity() {
 
     private data class ChatMessage(
         var author: String,
-        val body: String,
+        var body: String,
         val mine: Boolean,
         val imagePath: String? = null,
         val timestamp: Long = System.currentTimeMillis(),
@@ -2504,24 +3169,25 @@ class MainActivity : Activity() {
     )
 
     companion object {
-        private const val CREAM_BACKGROUND = 0xFFFFF5F5.toInt()
-        private const val BERRY_TEXT = 0xFF8E444D.toInt()
-        private const val BERRY_TEXT_DIM = 0xFFB2777D.toInt()
-        private const val ACCENT_PINK = 0xFFFFB7C5.toInt()
-        private const val STRAWBERRY_RED = 0xFFFF4D6D.toInt()
+        private const val CREAM_BACKGROUND = 0xFFFFFDF9.toInt()
+        private const val BERRY_TEXT = 0xFF3C2328.toInt()
+        private const val BERRY_TEXT_DIM = 0xFF8B6A71.toInt()
+        private const val ACCENT_PINK = 0xFFFFD9DE.toInt()
+        private const val STRAWBERRY_RED = 0xFFFF4359.toInt()
+        private const val LEAF_GREEN = 0xFF2ECC71.toInt()
         private const val INPUT_SURFACE = 0xFFFFFDFD.toInt()
-        private const val PINK_SHADOW_STROKE = 0xFFF7D2DA.toInt()
+        private const val PINK_SHADOW_STROKE = 0xFFFFCBD3.toInt()
         private const val MUTED_CORAL = 0xFFE88E8E.toInt()
-        private const val SERVICE_BUBBLE = 0xFFFFEAEE.toInt()
-        private const val SERVICE_BUBBLE_STROKE = 0xFFF5C7CF.toInt()
+        private const val SERVICE_BUBBLE = 0xFFFFF0F2.toInt()
+        private const val SERVICE_BUBBLE_STROKE = 0xFFFFD0D7.toInt()
         private const val INCOMING_BUBBLE = 0xD9FFFFFF.toInt()
-        private const val INCOMING_BUBBLE_STROKE = 0xCCF2CDD5.toInt()
+        private const val INCOMING_BUBBLE_STROKE = 0xCCF1D7DC.toInt()
         private const val INCOMING_TEXT = 0xFF536174.toInt()
-        private const val OUTGOING_BUBBLE = 0xD9FF9FB4.toInt()
-        private const val OUTGOING_BUBBLE_STROKE = 0xCCF39AAD.toInt()
-        private const val IMAGE_BORDER = 0xFFFF8FA8.toInt()
-        private const val SOFT_PINK_PANEL = 0xFFFFEEF2.toInt()
-        private const val SOFT_PINK_STROKE = 0xFFF6D4DC.toInt()
+        private const val OUTGOING_BUBBLE = 0xD9FF8A99.toInt()
+        private const val OUTGOING_BUBBLE_STROKE = 0xCCFF7184.toInt()
+        private const val IMAGE_BORDER = 0xFFFF7086.toInt()
+        private const val SOFT_PINK_PANEL = 0xFFFFF3F5.toInt()
+        private const val SOFT_PINK_STROKE = 0xFFFFE0E5.toInt()
         private const val MAX_NICKNAME_LENGTH = 12
         private const val CHAT_EVERYONE = "everyone"
         private const val CHAT_SAVED = "saved"
@@ -2532,6 +3198,9 @@ class MainActivity : Activity() {
         private const val TARGET_IMAGE_BYTES = 512 * 1024
         private const val MAX_IMAGE_DIMENSION = 1280
         private const val BUBBLE_WRAP_CHARS = 24
+        private const val CONTROL_PREFIX = "__truskawka_ctl__:"
+        private const val CONTROL_DELETE_MESSAGE = "dm"
+        private const val CONTROL_DELETE_CHAT = "dc"
     }
 
     private fun String.wrapForChatBubble(): String {

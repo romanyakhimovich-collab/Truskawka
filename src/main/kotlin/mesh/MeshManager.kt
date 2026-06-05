@@ -484,13 +484,19 @@ class MeshManager(
                 nodeId = nodeId,
                 discoveredAt = System.currentTimeMillis(),
                 lastSeen = System.currentTimeMillis(),
-                displayName = alias
+                displayName = alias,
+                isDirect = false,
+                hopCount = 2
             )
             peerListener?.invoke(nodeId, PeerEvent.DISCOVERED)
         } else {
             knownPeers[nodeId]?.lastSeen = System.currentTimeMillis()
             if (alias != null) {
                 knownPeers[nodeId]?.displayName = alias
+            }
+            if (knownPeers[nodeId]?.hopCount ?: 2 < 2) {
+                knownPeers[nodeId]?.hopCount = 1
+                knownPeers[nodeId]?.isDirect = true
             }
         }
 
@@ -562,6 +568,7 @@ class MeshManager(
     override fun onAdvertisementPeerDiscovered(address: String, nodeId: UUID, alias: String?, rssi: Int) {
         transportLogListener?.invoke("ble radio hello: ${alias ?: nodeId.toString().take(8)} rssi=$rssi")
         onNeighborDiscovered(nodeId, alias?.toByteArray(Charsets.UTF_8) ?: ByteArray(0))
+        markPeerDirect(nodeId)
         initiateHandshakeWith(nodeId)
     }
 
@@ -578,6 +585,7 @@ class MeshManager(
     override fun onPeerIdentified(address: String, nodeId: UUID) {
         transportLogListener?.invoke("ble peer identified: ${nodeId.toString().take(8)}")
         onNeighborDiscovered(nodeId, ByteArray(0))
+        markPeerDirect(nodeId)
         initiateHandshakeWith(nodeId)
     }
 
@@ -631,6 +639,24 @@ class MeshManager(
         knownPeers.entries.removeIf { now - it.value.lastSeen > KNOWN_PEER_MAX_AGE_MS }
         aliases.entries.removeIf { (nodeId, _) -> !knownPeers.containsKey(nodeId) }
     }
+
+    private fun markPeerDirect(nodeId: UUID) {
+        knownPeers[nodeId]?.let {
+            it.isDirect = true
+            it.hopCount = 1
+            it.lastSeen = System.currentTimeMillis()
+        } ?: run {
+            knownPeers[nodeId] = PeerInfo(
+                nodeId = nodeId,
+                discoveredAt = System.currentTimeMillis(),
+                lastSeen = System.currentTimeMillis(),
+                displayName = aliases[nodeId],
+                isDirect = true,
+                hopCount = 1
+            )
+            peerListener?.invoke(nodeId, PeerEvent.DISCOVERED)
+        }
+    }
 }
 
 // ==================== Data Classes ====================
@@ -639,7 +665,9 @@ data class PeerInfo(
     val nodeId: UUID,
     val discoveredAt: Long,
     var lastSeen: Long,
-    var displayName: String? = null
+    var displayName: String? = null,
+    var isDirect: Boolean = false,
+    var hopCount: Int = 2
 )
 
 data class PendingOutboxMessage(

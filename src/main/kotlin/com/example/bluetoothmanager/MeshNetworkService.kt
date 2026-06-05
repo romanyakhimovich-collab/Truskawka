@@ -89,6 +89,9 @@ class MeshNetworkService : Service() {
             localNodeId = localNodeId
         )
         meshManager.setMessageListener { senderId, message, timestamp, isBroadcast ->
+            if (senderId == localNodeId) {
+                return@setMessageListener
+            }
             val scope = if (isBroadcast) "broadcast" else "private"
             showIncomingNotification(
                 title = if (isBroadcast) "Broadcast from ${meshManager.getAlias(senderId)}" else meshManager.getAlias(senderId),
@@ -98,6 +101,9 @@ class MeshNetworkService : Service() {
             publish("message from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: $message")
         }
         meshManager.setFileListener { senderId, fileName, mimeType, bytes, timestamp, isBroadcast ->
+            if (senderId == localNodeId) {
+                return@setFileListener
+            }
             val file = writeIncomingImage(fileName, bytes)
             val scope = if (isBroadcast) "broadcast" else "private"
             showIncomingNotification(
@@ -429,6 +435,8 @@ class MeshNetworkService : Service() {
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
+            .setCategory(Notification.CATEGORY_MESSAGE)
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
             .build()
         manager.notify(notificationId, notification)
     }

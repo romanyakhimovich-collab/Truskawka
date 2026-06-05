@@ -25,6 +25,9 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         if (oldVersion < 3) {
             addColumnIfMissing(db, "chats", "unread_count", "INTEGER NOT NULL DEFAULT 0")
         }
+        if (oldVersion < 4) {
+            addColumnIfMissing(db, "chats", "pinned", "INTEGER NOT NULL DEFAULT 0")
+        }
     }
 
     fun ensureChat(chat: StoredChat) {
@@ -50,6 +53,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             peer.toValues(),
             SQLiteDatabase.CONFLICT_REPLACE
         )
+        val chatMeta = getChatMeta(peer.chatKey)
         ensureChat(
             StoredChat(
                 chatKey = peer.chatKey,
@@ -57,7 +61,10 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 kind = ChatKind.PEER.name,
                 peerId = peer.nodeId,
                 verified = peer.verified,
-                updatedAt = peer.lastSeen
+                unreadCount = chatMeta?.unreadCount ?: 0,
+                pinned = chatMeta?.pinned ?: false,
+                createdAt = chatMeta?.createdAt ?: System.currentTimeMillis(),
+                updatedAt = chatMeta?.updatedAt ?: peer.lastSeen
             )
         )
     }
@@ -109,6 +116,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 c.peer_id,
                 c.verified,
                 c.unread_count,
+                c.pinned,
                 COALESCE(m.body, '') AS last_body,
                 m.image_path AS last_image_path,
                 COALESCE(m.timestamp, c.updated_at) AS last_timestamp,
@@ -125,13 +133,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 ORDER BY lm.timestamp DESC, lm.id DESC
                 LIMIT 1
             )
-            ORDER BY
-                CASE c.kind
-                    WHEN '${ChatKind.SAVED.name}' THEN 0
-                    WHEN '${ChatKind.EVERYONE.name}' THEN 1
-                    ELSE 2
-                END,
-                last_timestamp DESC
+            ORDER BY c.pinned DESC, last_timestamp DESC
             """.trimIndent(),
             emptyArray()
         ).use { cursor ->
@@ -143,6 +145,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                     peerId = cursor.getString(cursor.getColumnIndexOrThrow("peer_id")),
                     verified = cursor.getInt(cursor.getColumnIndexOrThrow("verified")) == 1,
                     unreadCount = cursor.getInt(cursor.getColumnIndexOrThrow("unread_count")),
+                    pinned = cursor.getInt(cursor.getColumnIndexOrThrow("pinned")) == 1,
                     lastBody = cursor.getString(cursor.getColumnIndexOrThrow("last_body")),
                     lastImagePath = cursor.getString(cursor.getColumnIndexOrThrow("last_image_path")),
                     lastTimestamp = cursor.getLong(cursor.getColumnIndexOrThrow("last_timestamp")),
@@ -151,6 +154,15 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             }
         }
         return rows
+    }
+
+    fun setChatPinned(chatKey: String, pinned: Boolean) {
+        writableDatabase.update(
+            "chats",
+            ContentValues().apply { put("pinned", if (pinned) 1 else 0) },
+            "chat_key = ?",
+            arrayOf(chatKey)
+        )
     }
 
     fun loadMessages(chatKey: String): List<StoredMessage> {
@@ -206,6 +218,15 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         writableDatabase.update("messages", values, "mesh_message_id = ?", arrayOf(meshMessageId))
     }
 
+    fun updateMessageBody(localId: Long, body: String) {
+        val values = ContentValues().apply { put("body", body) }
+        writableDatabase.update("messages", values, "id = ?", arrayOf(localId.toString()))
+    }
+
+    fun deleteMessage(localId: Long) {
+        writableDatabase.delete("messages", "id = ?", arrayOf(localId.toString()))
+    }
+
     fun updateMineAuthor(author: String) {
         writableDatabase.update(
             "messages",
@@ -245,6 +266,14 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         touchChat(chatKey, System.currentTimeMillis())
     }
 
+    fun deleteChat(chatKey: String, peerId: String?) {
+        writableDatabase.delete("messages", "chat_key = ?", arrayOf(chatKey))
+        writableDatabase.delete("chats", "chat_key = ?", arrayOf(chatKey))
+        if (!peerId.isNullOrBlank()) {
+            writableDatabase.delete("peers", "node_id = ?", arrayOf(peerId))
+        }
+    }
+
     private fun createMessages(db: SQLiteDatabase) {
         db.execSQL(
             """
@@ -275,6 +304,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 peer_id TEXT,
                 verified INTEGER NOT NULL DEFAULT 0,
                 unread_count INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
@@ -372,6 +402,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             put("peer_id", peerId)
             put("verified", if (verified) 1 else 0)
             put("unread_count", unreadCount)
+            put("pinned", if (pinned) 1 else 0)
             put("created_at", createdAt)
             put("updated_at", updatedAt)
         }
@@ -396,10 +427,37 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
 
     companion object {
         private const val DB_NAME = "truskawka_chats.db"
-        private const val DB_VERSION = 3
+        private const val DB_VERSION = 4
         const val CHAT_EVERYONE = "everyone"
         const val CHAT_SAVED = "saved"
         private const val LEGACY_CHAT_MESH = "mesh"
+    }
+
+    private data class ChatMeta(
+        val unreadCount: Int,
+        val pinned: Boolean,
+        val createdAt: Long,
+        val updatedAt: Long
+    )
+
+    private fun getChatMeta(chatKey: String): ChatMeta? {
+        readableDatabase.query(
+            "chats",
+            arrayOf("unread_count", "pinned", "created_at", "updated_at"),
+            "chat_key = ?",
+            arrayOf(chatKey),
+            null,
+            null,
+            null
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return null
+            return ChatMeta(
+                unreadCount = cursor.getInt(cursor.getColumnIndexOrThrow("unread_count")),
+                pinned = cursor.getInt(cursor.getColumnIndexOrThrow("pinned")) == 1,
+                createdAt = cursor.getLong(cursor.getColumnIndexOrThrow("created_at")),
+                updatedAt = cursor.getLong(cursor.getColumnIndexOrThrow("updated_at"))
+            )
+        }
     }
 }
 
@@ -416,6 +474,7 @@ data class StoredChat(
     val peerId: String? = null,
     val verified: Boolean = false,
     val unreadCount: Int = 0,
+    val pinned: Boolean = false,
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = createdAt
 )
@@ -450,6 +509,7 @@ data class ChatSummary(
     val peerId: String?,
     val verified: Boolean,
     val unreadCount: Int,
+    val pinned: Boolean,
     val lastBody: String,
     val lastImagePath: String?,
     val lastTimestamp: Long,
