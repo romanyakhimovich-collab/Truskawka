@@ -104,14 +104,19 @@ class MeshNetworkService : Service() {
             if (senderId == localNodeId) {
                 return@setFileListener
             }
-            val file = writeIncomingImage(fileName, bytes)
+            val file = writeIncomingFile(fileName, mimeType, bytes)
             val scope = if (isBroadcast) "broadcast" else "private"
+            val isAudio = mimeType.startsWith("audio/", ignoreCase = true)
             showIncomingNotification(
                 title = if (isBroadcast) "Broadcast from ${meshManager.getAlias(senderId)}" else meshManager.getAlias(senderId),
-                body = "sent an image",
+                body = if (isAudio) "sent a voice message" else "sent an image",
                 notificationId = senderId.hashCode() xor timestamp.toInt()
             )
-            publish("image from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: ${file.absolutePath}|$mimeType")
+            if (isAudio) {
+                publish("audio from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: ${file.absolutePath}|$mimeType")
+            } else {
+                publish("image from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: ${file.absolutePath}|$mimeType")
+            }
         }
         meshManager.setPeerListener { nodeId, event ->
             val label = when (event) {
@@ -352,11 +357,13 @@ class MeshNetworkService : Service() {
         }
     }
 
-    private fun writeIncomingImage(fileName: String, bytes: ByteArray): File {
-        val directory = File(filesDir, "incoming_images").apply { mkdirs() }
+    private fun writeIncomingFile(fileName: String, mimeType: String, bytes: ByteArray): File {
+        val isAudio = mimeType.startsWith("audio/", ignoreCase = true)
+        val folder = if (isAudio) "incoming_audio" else "incoming_images"
+        val directory = File(filesDir, folder).apply { mkdirs() }
         val safeName = fileName
             .replace(Regex("[^A-Za-z0-9._-]"), "_")
-            .ifBlank { "image.jpg" }
+            .ifBlank { if (isAudio) "voice.m4a" else "image.jpg" }
         return File(directory, "${System.currentTimeMillis()}_$safeName").also {
             it.writeBytes(bytes)
         }

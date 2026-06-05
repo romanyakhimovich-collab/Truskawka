@@ -23,6 +23,8 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.location.LocationManager
+import android.media.MediaPlayer
+import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -77,6 +79,15 @@ class MainActivity : Activity() {
     private var nicknameDialogShowing = false
     private var currentNickname = "@your name"
     private var chatListShownAtStartup = false
+    private var darkThemeEnabled = false
+    private var selectedLanguage = AppLanguage.EN
+    private var isRecordingVoice = false
+    private var recorder: MediaRecorder? = null
+    private var recordingFile: File? = null
+    private var recordingStartedAt: Long = 0L
+    private var activePlayer: MediaPlayer? = null
+    private var activePlayingPath: String? = null
+    private val audioDurationCache = mutableMapOf<String, String>()
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val messages = mutableListOf(
@@ -100,12 +111,19 @@ class MainActivity : Activity() {
     private lateinit var chatStore: ChatStore
     private val messageTimeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
     private val messageDateFormat = SimpleDateFormat("d MMMM yyyy", Locale.getDefault())
+    private val voiceStopRunnable = Runnable {
+        if (isRecordingVoice) {
+            stopVoiceRecordingAndSend(forceSend = true)
+        }
+    }
 
     private val logListener: (String) -> Unit = { line ->
         runOnUiThread {
             updateNetworkStatusFromLog(line)
             if (line.startsWith("image from ")) {
                 addReceivedImage(line)
+            } else if (line.startsWith("audio from ")) {
+                addReceivedAudio(line)
             } else if (line.startsWith("image progress:")) {
                 updateImageProgress(line.substringAfter("image progress:").trim())
             } else if (line.startsWith("message from ")) {
@@ -146,6 +164,8 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        loadUiSettings()
+        applyThemePalette()
         chatStore = ChatStore(this)
         loadStoredMessages()
         buildUi()
@@ -170,6 +190,8 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         meshService?.removeLogListener(logListener)
+        stopVoiceRecording(cleanupOnly = true)
+        releaseAudioPlayer()
         if (serviceBound) {
             unbindService(connection)
             serviceBound = false
@@ -224,7 +246,7 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
 
-                addView(terminalAction("< Back to chats").apply {
+                addView(terminalAction("< ${tr("back_to_chats")}").apply {
                     textSize = 12f
                     setTextColor(BERRY_TEXT)
                     background = roundedDrawable(INPUT_SURFACE, dp(14), SOFT_PINK_STROKE)
@@ -290,7 +312,7 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ))
 
-            networkStatusView = terminalText("Offline").apply {
+            networkStatusView = terminalText(tr("offline")).apply {
                 textSize = 13f
                 setTextColor(BERRY_TEXT_DIM)
                 gravity = Gravity.START
@@ -310,19 +332,8 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(8), 0, dp(6))
 
-            addView(ImageView(this@MainActivity).apply {
-                minimumWidth = dp(44)
-                minimumHeight = dp(44)
-                background = roundedDrawable(0x26FF4359, dp(22), 0x55FF4359)
-                setImageResource(android.R.drawable.ic_menu_gallery)
-                setColorFilter(STRAWBERRY_RED, PorterDuff.Mode.SRC_IN)
-                scaleType = ImageView.ScaleType.CENTER
-                setPadding(dp(10), dp(10), dp(10), dp(10))
-                setOnClickListener { openImagePicker() }
-            })
-
             messageInput = EditText(this@MainActivity).apply {
-                hint = "type a message..."
+                hint = tr("hint_type_message")
                 setSingleLine(false)
                 maxLines = 4
                 setHorizontallyScrolling(false)
@@ -346,18 +357,49 @@ class MainActivity : Activity() {
                 })
             }
             addView(messageInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = dp(8)
+                marginEnd = dp(8)
+            })
+
+            addView(terminalAction("\uD83D\uDCCE").apply {
+                textSize = 18f
+                gravity = Gravity.CENTER
+                minWidth = dp(44)
+                minHeight = dp(44)
+                background = roundedDrawable(0x26FF4359, dp(22), 0x55FF4359)
+                setPadding(dp(10), dp(8), dp(10), dp(10))
+                setOnClickListener { openImagePicker() }
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
                 marginEnd = dp(8)
             })
 
             actionButton = terminalAction(">").apply {
                 background = circleDrawable(STRAWBERRY_RED)
-                setTextColor(CREAM_BACKGROUND)
+                setTextColor(Color.WHITE)
                 textSize = 22f
                 gravity = Gravity.CENTER
                 minWidth = dp(46)
                 minHeight = dp(46)
                 setOnClickListener { handleInputAction() }
+                setOnTouchListener { v, event ->
+                    if (messageInput.text.toString().isNotBlank()) return@setOnTouchListener false
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            startVoiceRecording()
+                            true
+                        }
+                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                            v.performClick()
+                            if (isRecordingVoice) {
+                                stopVoiceRecordingAndSend(forceSend = false)
+                            }
+                            true
+                        }
+                        else -> false
+                    }
+                }
             }
             addView(actionButton)
         }
@@ -413,7 +455,7 @@ class MainActivity : Activity() {
             }
         })
 
-        val saveButton = terminalAction("Start chatting").apply {
+        val saveButton = terminalAction(tr("start_chatting")).apply {
             textSize = 16f
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
@@ -422,7 +464,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 val requested = input.text.toString().trim().prefixAt().take(MAX_NICKNAME_LENGTH)
                 if (requested.length < 2) {
-                    Toast.makeText(this@MainActivity, "Choose a nickname", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, tr("choose_nickname"), Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
 
@@ -451,7 +493,7 @@ class MainActivity : Activity() {
                 setPadding(dp(8), dp(8), dp(8), dp(8))
             }, LinearLayout.LayoutParams(dp(72), dp(72)))
 
-            addView(terminalText("Welcome to Truskawka").apply {
+            addView(terminalText(tr("welcome_truskawka")).apply {
                 textSize = 22f
                 typeface = Typeface.DEFAULT_BOLD
                 gravity = Gravity.CENTER
@@ -459,7 +501,7 @@ class MainActivity : Activity() {
                 setPadding(0, dp(16), 0, dp(6))
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-            addView(terminalText("Choose your mesh nickname").apply {
+            addView(terminalText(tr("choose_mesh_nickname")).apply {
                 textSize = 14f
                 gravity = Gravity.CENTER
                 setTextColor(BERRY_TEXT_DIM)
@@ -468,7 +510,7 @@ class MainActivity : Activity() {
 
             addView(input, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-            addView(terminalText("The @ stays fixed. Max 12 characters.").apply {
+            addView(terminalText(tr("nickname_rules")).apply {
                 textSize = 12f
                 gravity = Gravity.CENTER
                 setTextColor(BERRY_TEXT_DIM)
@@ -519,7 +561,7 @@ class MainActivity : Activity() {
         if (service == null) {
             usernameField.setText(previous)
             usernameField.setSelection(usernameField.text.length)
-            Toast.makeText(this, "Nickname can be changed when mesh is online", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, tr("nickname_change_online_only"), Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -529,7 +571,7 @@ class MainActivity : Activity() {
             usernameField.setSelection(usernameField.text.length)
         }
         if (requested != display) {
-            Toast.makeText(this, "Nickname can be changed once a week", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, tr("nickname_change_once_week"), Toast.LENGTH_SHORT).show()
         }
         if (previous != display) {
             currentNickname = display
@@ -540,40 +582,10 @@ class MainActivity : Activity() {
     private fun handleInputAction() {
         val text = messageInput.text.toString().trim()
         if (text.isEmpty()) {
-            addMessage("system", "voice placeholder", false)
             return
         }
-
-        val author = usernameField.text.toString().prefixAt()
-        val targetId = selectedRecipientId
-        if (savedMessagesSelected) {
-            saveLocalMessage(ChatMessage(author, text, true, status = MessageStatus.READ))
-            messageInput.text.clear()
-            return
-        }
-
-        val localMessage = addMessage(
-            author = author,
-            body = text,
-            mine = true,
-            status = if (targetId == null) null else MessageStatus.SENDING
-        )
         messageInput.text.clear()
-        val result = if (targetId == null) {
-            meshService?.broadcastMessage(text)
-        } else {
-            meshService?.sendMessage(targetId.toString(), text)
-        } ?: SendResult.Failed("service offline")
-        when (result) {
-            is SendResult.Sent -> {
-                if (targetId != null) {
-                    localMessage.messageId = result.messageId
-                    persistChatMessageIdentity(localMessage)
-                }
-            }
-            is SendResult.Failed -> addMessage("mesh", result.toUiText(), false)
-            is SendResult.Queued -> Unit
-        }
+        sendTextMessage(text)
     }
 
     private fun openImagePicker() {
@@ -595,19 +607,96 @@ class MainActivity : Activity() {
         if (requestCode != IMAGE_PICK_REQUEST || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
         takePersistableUriPermissionIfPossible(uri, data.flags)
-        sendSelectedImage(uri)
+        showSelectedImageComposer(uri)
     }
 
-    private fun sendSelectedImage(uri: Uri) {
+    private fun showSelectedImageComposer(uri: Uri) {
+        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
+        val captionInput = EditText(this).apply {
+            hint = tr("add_caption")
+            setSingleLine(false)
+            maxLines = 3
+            typeface = Typeface.DEFAULT
+            textSize = 15f
+            setTextColor(BERRY_TEXT)
+            setHintTextColor(BERRY_TEXT_DIM)
+            background = roundedDrawable(INPUT_SURFACE, dp(22), SOFT_PINK_STROKE)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+        }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(CREAM_BACKGROUND)
+            setPadding(dp(12), dp(18), dp(12), dp(12))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(terminalText(tr("preview_image")).apply {
+                    textSize = 16f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(BERRY_TEXT)
+                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(terminalAction("X").apply {
+                    textSize = 18f
+                    setOnClickListener { dialog.dismiss() }
+                })
+            })
+            addView(ImageView(this@MainActivity).apply {
+                adjustViewBounds = true
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setImageURI(uri)
+                background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                setPadding(dp(6), dp(6), dp(6), dp(6))
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            ).apply {
+                topMargin = dp(10)
+                bottomMargin = dp(10)
+            })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(captionInput, LinearLayout.LayoutParams(
+                    0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    1f
+                ).apply {
+                    marginEnd = dp(8)
+                })
+                addView(terminalAction(tr("send")).apply {
+                    textSize = 15f
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.WHITE)
+                    background = roundedDrawable(STRAWBERRY_RED, dp(20))
+                    setPadding(dp(14), dp(10), dp(14), dp(10))
+                    setOnClickListener {
+                        val caption = captionInput.text?.toString().orEmpty().trim()
+                        dialog.dismiss()
+                        sendSelectedImage(uri, caption)
+                    }
+                })
+            })
+        }
+        dialog.setContentView(root)
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        dialog.show()
+        dialog.window?.setLayout(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT
+        )
+    }
+
+    private fun sendSelectedImage(uri: Uri, caption: String) {
         val fileName = queryDisplayName(uri)
-        showImageProgress("preparing image...")
+        showImageProgress(tr("preparing_image"))
 
         thread(name = "image-compress-send") {
             val prepared = prepareImageForTransfer(uri, fileName)
             if (prepared == null) {
                 runOnUiThread {
                     hideImageProgress()
-                    Toast.makeText(this, "Could not read image", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, tr("could_not_read_image"), Toast.LENGTH_SHORT).show()
                 }
                 return@thread
             }
@@ -615,7 +704,7 @@ class MainActivity : Activity() {
             if (prepared.bytes.size > MAX_IMAGE_BYTES) {
                 runOnUiThread {
                     hideImageProgress()
-                    Toast.makeText(this, "Image is too large", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, tr("image_too_large"), Toast.LENGTH_SHORT).show()
                 }
                 return@thread
             }
@@ -626,10 +715,13 @@ class MainActivity : Activity() {
             runOnUiThread {
                 if (savedMessagesSelected) {
                     saveLocalMessage(ChatMessage(author, "", true, localPath, status = MessageStatus.READ))
+                    if (caption.isNotBlank()) {
+                        saveLocalMessage(ChatMessage(author, caption, true, status = MessageStatus.READ))
+                    }
                     hideImageProgress()
                 } else {
                     addImageMessage(author, localPath, mine = true)
-                    showImageProgress("sending image...")
+                    showImageProgress(tr("sending_image"))
                 }
             }
 
@@ -646,15 +738,182 @@ class MainActivity : Activity() {
                     hideImageProgress()
                     addMessage("mesh", result.toUiText(), false)
                 } else {
-                    showImageProgress("image sent")
+                    if (caption.isNotBlank()) {
+                        sendTextMessage(caption)
+                    }
+                    showImageProgress(tr("image_sent"))
                     mainHandler.postDelayed({ hideImageProgress() }, 1_200)
                 }
             }
         }
     }
 
+    private fun sendTextMessage(text: String) {
+        if (text.isBlank()) return
+        val author = usernameField.text.toString().prefixAt()
+        val targetId = selectedRecipientId
+        if (savedMessagesSelected) {
+            saveLocalMessage(ChatMessage(author, text, true, status = MessageStatus.READ))
+            return
+        }
+        val localMessage = addMessage(
+            author = author,
+            body = text,
+            mine = true,
+            status = if (targetId == null) null else MessageStatus.SENDING
+        )
+        val result = if (targetId == null) {
+            meshService?.broadcastMessage(text)
+        } else {
+            meshService?.sendMessage(targetId.toString(), text)
+        } ?: SendResult.Failed("service offline")
+        when (result) {
+            is SendResult.Sent -> {
+                if (targetId != null) {
+                    localMessage.messageId = result.messageId
+                    persistChatMessageIdentity(localMessage)
+                }
+            }
+            is SendResult.Failed -> addMessage("mesh", result.toUiText(), false)
+            is SendResult.Queued -> Unit
+        }
+    }
+
+    private fun startVoiceRecording() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestMissingPermissions()
+            Toast.makeText(this, tr("mic_permission_needed"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (isRecordingVoice) return
+        val file = File(filesDir, "voice_notes").apply { mkdirs() }
+            .resolve("voice_${System.currentTimeMillis()}.m4a")
+        val nextRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            MediaRecorder(this)
+        } else {
+            @Suppress("DEPRECATION")
+            MediaRecorder()
+        }
+        runCatching {
+            nextRecorder.apply {
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioEncodingBitRate(64_000)
+                setAudioSamplingRate(22_050)
+                setMaxDuration(VOICE_MAX_DURATION_MS.toInt())
+                setOutputFile(file.absolutePath)
+                prepare()
+                start()
+            }
+        }.onFailure {
+            nextRecorder.release()
+            Toast.makeText(this, tr("voice_record_failed"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        recorder = nextRecorder
+        recordingFile = file
+        recordingStartedAt = System.currentTimeMillis()
+        isRecordingVoice = true
+        updateActionButton()
+        showImageProgress(tr("recording_voice"))
+        mainHandler.postDelayed(voiceStopRunnable, VOICE_MAX_DURATION_MS)
+    }
+
+    private fun stopVoiceRecordingAndSend(forceSend: Boolean) {
+        val file = recordingFile
+        val duration = System.currentTimeMillis() - recordingStartedAt
+        stopVoiceRecording(cleanupOnly = false)
+        if (file == null || !file.exists() || file.length() <= 0L) return
+        if (!forceSend && duration < VOICE_MIN_DURATION_MS) {
+            file.delete()
+            Toast.makeText(this, tr("voice_too_short"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (file.length() > MAX_VOICE_BYTES) {
+            addMessage("mesh", tr("voice_too_large"), false)
+            file.delete()
+            return
+        }
+        sendPreparedVoice(file)
+    }
+
+    private fun stopVoiceRecording(cleanupOnly: Boolean) {
+        mainHandler.removeCallbacks(voiceStopRunnable)
+        val current = recorder
+        recorder = null
+        if (current != null) {
+            runCatching { current.stop() }
+            runCatching { current.reset() }
+            current.release()
+        }
+        isRecordingVoice = false
+        updateActionButton()
+        if (cleanupOnly) {
+            recordingFile = null
+            recordingStartedAt = 0L
+            hideImageProgress()
+            return
+        }
+        recordingStartedAt = 0L
+        hideImageProgress()
+    }
+
+    private fun sendPreparedVoice(file: File) {
+        val bytes = runCatching { file.readBytes() }.getOrNull()
+        if (bytes == null || bytes.isEmpty()) {
+            addMessage("mesh", tr("voice_read_failed"), false)
+            return
+        }
+        val author = usernameField.text.toString().prefixAt()
+        val timestamp = System.currentTimeMillis()
+        if (savedMessagesSelected) {
+            addAudioMessage(
+                author = author,
+                audioPath = file.absolutePath,
+                mine = true,
+                timestamp = timestamp,
+                status = MessageStatus.READ
+            )
+            return
+        }
+        val localMessage = addAudioMessage(
+            author = author,
+            audioPath = file.absolutePath,
+            mine = true,
+            timestamp = timestamp,
+            status = if (selectedRecipientId == null) null else MessageStatus.SENDING
+        )
+        showImageProgress(tr("sending_voice"))
+        thread(name = "voice-send") {
+            val result = meshService?.sendImage(
+                selectedRecipientId?.toString(),
+                file.name,
+                "audio/mp4",
+                bytes
+            ) ?: SendResult.Failed("service offline")
+            runOnUiThread {
+                if (result is SendResult.Failed) {
+                    localMessage.status = null
+                    persistChatMessageIdentity(localMessage)
+                    addMessage("mesh", result.toUiText(), false)
+                } else if (result is SendResult.Sent && selectedRecipientId != null) {
+                    localMessage.messageId = result.messageId
+                    persistChatMessageIdentity(localMessage)
+                }
+                showImageProgress(if (result is SendResult.Failed) tr("voice_send_failed") else tr("voice_sent"))
+                mainHandler.postDelayed({ hideImageProgress() }, 1_200)
+            }
+        }
+    }
+
     private fun updateActionButton() {
-        actionButton.text = if (messageInput.text.toString().isBlank()) "^" else ">"
+        actionButton.text = when {
+            isRecordingVoice -> tr("recording_short")
+            messageInput.text.toString().isBlank() -> tr("mic_icon")
+            else -> ">"
+        }
+        actionButton.textSize = if (messageInput.text.toString().isBlank() || isRecordingVoice) 16f else 22f
     }
 
     private fun showChatList() {
@@ -673,7 +932,7 @@ class MainActivity : Activity() {
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(terminalText("Chats").apply {
+            addView(terminalText(tr("chats")).apply {
                 textSize = 22f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
@@ -708,6 +967,10 @@ class MainActivity : Activity() {
             onProfile = {
                 dialog.dismiss()
                 showOwnProfilePage()
+            },
+            onSettings = {
+                dialog.dismiss()
+                showSettingsPage()
             }
         ), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -719,18 +982,27 @@ class MainActivity : Activity() {
         val summaries = chatStore.listChats()
             .filter { it.kind != ChatKind.PEER.name || it.peerId != null }
         if (summaries.isEmpty()) {
-            listContent.addView(terminalText("No chats yet").apply {
+            listContent.addView(terminalText(tr("no_chats_yet")).apply {
                 textSize = 14f
                 setTextColor(BERRY_TEXT_DIM)
                 setPadding(0, dp(24), 0, 0)
             })
         } else {
             summaries.forEach { summary ->
-                listContent.addView(chatSummaryRow(summary) {
-                    val peerId = summary.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
-                    selectChat(summary.chatKey, summary.title, peerId)
-                    dialog.dismiss()
-                }, LinearLayout.LayoutParams(
+                listContent.addView(chatSummaryRow(
+                    summary = summary,
+                    onClick = {
+                        val peerId = summary.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+                        selectChat(summary.chatKey, summary.title, peerId)
+                        dialog.dismiss()
+                    },
+                    onLongClick = {
+                        showChatRowActions(summary) {
+                            dialog.dismiss()
+                            showChatList()
+                        }
+                    }
+                ), LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply {
@@ -750,47 +1022,69 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(if (selected) CREAM_BACKGROUND else BERRY_TEXT_DIM)
+            setTextColor(if (selected) Color.WHITE else BERRY_TEXT_DIM)
             background = roundedDrawable(if (selected) STRAWBERRY_RED else Color.TRANSPARENT, dp(20))
             setOnClickListener { onClick() }
         }
 
-    private enum class PageTab { NEW_CONTACTS, CONTACTS, PROFILE }
+    private enum class PageTab { NEW_CONTACTS, CONTACTS, PROFILE, SETTINGS }
+
+    private enum class AppLanguage(val code: String, val label: String) {
+        EN("en", "EN"),
+        PL("pl", "PL"),
+        ES("es", "ES"),
+        RU("ru", "RU");
+
+        companion object {
+            fun fromCode(code: String?): AppLanguage =
+                entries.firstOrNull { it.code == code } ?: EN
+        }
+    }
 
     private fun buildPageBottomNav(
         selected: PageTab,
         onNewContacts: () -> Unit,
         onContacts: () -> Unit,
-        onProfile: () -> Unit
+        onProfile: () -> Unit,
+        onSettings: () -> Unit
     ): LinearLayout =
         LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             setPadding(dp(6), dp(8), dp(6), dp(8))
-            background = roundedDrawable(Color.WHITE, dp(24), SOFT_PINK_STROKE)
+            background = roundedDrawable(INPUT_SURFACE, dp(24), SOFT_PINK_STROKE)
 
-            addView(chatListBottomItem("New contacts", selected == PageTab.NEW_CONTACTS, onNewContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+            addView(chatListBottomItem(tr("new_contacts"), selected == PageTab.NEW_CONTACTS, onNewContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
                 marginEnd = dp(4)
             })
-            addView(chatListBottomItem("Contacts", selected == PageTab.CONTACTS, onContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+            addView(chatListBottomItem(tr("contacts"), selected == PageTab.CONTACTS, onContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
                 marginStart = dp(4)
                 marginEnd = dp(4)
             })
-            addView(chatListBottomItem("Profile", selected == PageTab.PROFILE, onProfile), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+            addView(chatListBottomItem(tr("profile"), selected == PageTab.PROFILE, onProfile), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+                marginStart = dp(4)
+                marginEnd = dp(4)
+            })
+            addView(chatListBottomItem(tr("settings"), selected == PageTab.SETTINGS, onSettings), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
                 marginStart = dp(4)
             })
         }
 
-    private fun chatSummaryRow(summary: ChatSummary, onClick: () -> Unit): LinearLayout {
+    private fun chatSummaryRow(
+        summary: ChatSummary,
+        onClick: () -> Unit,
+        onLongClick: () -> Unit
+    ): LinearLayout {
         val presence = summaryPresence(summary)
         val displayTitle = summaryDisplayTitle(summary)
         val preview = when {
-            summary.lastImagePath != null -> "photo"
+            summary.lastImagePath != null -> tr("photo")
+            summary.lastAudioPath != null -> tr("voice_message")
             summary.lastBody.isNotBlank() -> summary.lastBody
-            summary.kind == ChatKind.SAVED.name -> "private notes for yourself"
-            summary.kind == ChatKind.EVERYONE.name -> "nearby public mesh"
-            summary.verified -> "verified contact"
-            else -> "tap to open chat"
+            summary.kind == ChatKind.SAVED.name -> tr("private_notes")
+            summary.kind == ChatKind.EVERYONE.name -> tr("nearby_public_mesh")
+            summary.verified -> tr("verified_contact")
+            else -> tr("tap_open_chat")
         }
         val selected = summary.chatKey == currentChatKey()
         return LinearLayout(this).apply {
@@ -825,7 +1119,7 @@ class MainActivity : Activity() {
                     maxLines = 1
                 })
                 if (summary.pinned) {
-                    addView(terminalText("pinned").apply {
+                    addView(terminalText(tr("pinned")).apply {
                         textSize = 11f
                         typeface = Typeface.DEFAULT_BOLD
                         setTextColor(STRAWBERRY_RED)
@@ -858,7 +1152,7 @@ class MainActivity : Activity() {
             }
             setOnClickListener { onClick() }
             setOnLongClickListener {
-                showChatRowActions(summary)
+                onLongClick()
                 true
             }
         }
@@ -883,11 +1177,11 @@ class MainActivity : Activity() {
             setBackgroundColor(SOFT_PINK_PANEL)
         }
 
-        val nearbyTitle = terminalText("Patch ${meshService?.peerCount() ?: 0}").apply {
+        val nearbyTitle = terminalText("${tr("patch")} ${meshService?.peerCount() ?: 0}").apply {
             textSize = 20f
             setTextColor(BERRY_TEXT)
         }
-        val transportStatus = terminalText(meshService?.meshTransportStatus() ?: "Mesh starting...").apply {
+        val transportStatus = terminalText(meshService?.meshTransportStatus() ?: tr("mesh_starting")).apply {
             textSize = 12f
             setTextColor(BERRY_TEXT_DIM)
             setPadding(0, 0, 0, dp(10))
@@ -904,7 +1198,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
         }
         val searchInput = EditText(this).apply {
-            hint = "search in patch..."
+            hint = tr("search_in_patch")
             setSingleLine(true)
             typeface = Typeface.DEFAULT
             textSize = 14f
@@ -915,8 +1209,8 @@ class MainActivity : Activity() {
         }
         fun refreshPeopleRows() {
             val peerCount = meshService?.peerCount() ?: 0
-            nearbyTitle.text = "Patch $peerCount"
-            transportStatus.text = meshService?.meshTransportStatus() ?: "Mesh starting..."
+            nearbyTitle.text = "${tr("patch")} $peerCount"
+            transportStatus.text = meshService?.meshTransportStatus() ?: tr("mesh_starting")
             counterView.text = peerCount.toString()
             peopleContainer.removeAllViews()
 
@@ -934,14 +1228,14 @@ class MainActivity : Activity() {
             val meshPeers = peers.filterNot { it.isDirect || it.hopCount <= 1 }
             radarView.setPeerCounts(directPeers.size, meshPeers.size)
 
-            peopleContainer.addView(terminalText("Direct in range (${directPeers.size})").apply {
+            peopleContainer.addView(terminalText("${tr("direct_in_range")} (${directPeers.size})").apply {
                 textSize = 13f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
                 setPadding(0, 0, 0, dp(8))
             })
             if (directPeers.isEmpty()) {
-                peopleContainer.addView(terminalText(if (query.isBlank()) "No direct peers in Bluetooth range" else "No direct matches").apply {
+                peopleContainer.addView(terminalText(if (query.isBlank()) tr("no_direct_peers") else tr("no_direct_matches")).apply {
                     textSize = 14f
                     setTextColor(BERRY_TEXT_DIM)
                     setPadding(0, 0, 0, dp(8))
@@ -952,9 +1246,9 @@ class MainActivity : Activity() {
                     val stored = chatStore.getPeer(peer.nodeId.toString())
                     val verified = stored?.verified == true
                     val subtitle = listOfNotNull(
-                        "direct BLE",
-                        if (verified) "verified" else null,
-                        stored?.let { formatPeerPresence(it.lastSeen) } ?: "online now"
+                        tr("direct_ble"),
+                        if (verified) tr("verified") else null,
+                        stored?.let { formatPeerPresence(it.lastSeen) } ?: tr("online_now")
                     ).joinToString(" / ")
                     peopleContainer.addView(patchPeerRow(label, subtitle, !savedMessagesSelected && selectedRecipientId == peer.nodeId) {
                         rememberPeer(peer.nodeId, label)
@@ -968,14 +1262,14 @@ class MainActivity : Activity() {
                 }
             }
 
-            peopleContainer.addView(terminalText("Reachable via hops (${meshPeers.size})").apply {
+            peopleContainer.addView(terminalText("${tr("reachable_via_hops")} (${meshPeers.size})").apply {
                 textSize = 13f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
                 setPadding(0, dp(6), 0, dp(8))
             })
             if (meshPeers.isEmpty()) {
-                peopleContainer.addView(terminalText(if (query.isBlank()) "No multi-hop routes discovered yet" else "No hop matches").apply {
+                peopleContainer.addView(terminalText(if (query.isBlank()) tr("no_multihop_routes") else tr("no_hop_matches")).apply {
                     textSize = 14f
                     setTextColor(BERRY_TEXT_DIM)
                 })
@@ -983,7 +1277,7 @@ class MainActivity : Activity() {
                 meshPeers.forEach { peer ->
                     val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
                     val hops = peer.hopCount.coerceAtLeast(2)
-                    val subtitle = "via $hops hops / ${formatPeerPresence(peer.lastSeen)}"
+                    val subtitle = "${tr("via")} $hops ${tr("hops")} / ${formatPeerPresence(peer.lastSeen)}"
                     peopleContainer.addView(patchPeerRow(label, subtitle, !savedMessagesSelected && selectedRecipientId == peer.nodeId) {
                         rememberPeer(peer.nodeId, label)
                         meshService?.prepareChatWith(peer.nodeId.toString())
@@ -1008,7 +1302,7 @@ class MainActivity : Activity() {
         }
         val contentContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(terminalText("PATCH").apply {
+            addView(terminalText(tr("patch_upper")).apply {
                 textSize = 15f
                 setPadding(0, dp(18), 0, dp(10))
                 setTextColor(BERRY_TEXT)
@@ -1046,6 +1340,10 @@ class MainActivity : Activity() {
             onProfile = {
                 dialog.dismiss()
                 showOwnProfilePage()
+            },
+            onSettings = {
+                dialog.dismiss()
+                showSettingsPage()
             }
         ), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1103,28 +1401,28 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(20), dp(20), dp(18))
             background = roundedDrawable(SOFT_PINK_PANEL, dp(24), SOFT_PINK_STROKE)
-            addView(terminalText("Grow").apply {
+            addView(terminalText(tr("grow")).apply {
                 textSize = 24f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
             })
-            addView(terminalText("Bring phones close to exchange local keys and join each other's patch.").apply {
+            addView(terminalText(tr("grow_desc")).apply {
                 textSize = 13f
                 setTextColor(BERRY_TEXT_DIM)
                 setPadding(0, dp(8), 0, dp(14))
             })
-            addView(patchPeerRow("Start discovery", "scan nearby BLE mesh nodes", false) {
+            addView(patchPeerRow(tr("start_discovery"), tr("scan_nearby_ble"), false) {
                 triggerMeshScan()
-                Toast.makeText(this@MainActivity, "Searching nearby patch", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, tr("searching_nearby_patch"), Toast.LENGTH_SHORT).show()
             })
-            addView(patchPeerRow("Open patch", "show direct and hop peers", false) {
+            addView(patchPeerRow(tr("open_patch"), tr("show_direct_hop"), false) {
                 dialog.dismiss()
                 showMeshPanel(scanFirst = true)
             }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(8) })
-            addView(terminalAction("Close").apply {
+            addView(terminalAction(tr("close")).apply {
                 textSize = 15f
                 setPadding(0, dp(14), 0, 0)
                 setOnClickListener { dialog.dismiss() }
@@ -1245,9 +1543,10 @@ class MainActivity : Activity() {
         imagePath: String,
         mine: Boolean,
         timestamp: Long = System.currentTimeMillis(),
-        chatKey: String = currentChatKey()
-    ) {
-        val message = ChatMessage(author, "", mine, imagePath, timestamp)
+        chatKey: String = currentChatKey(),
+        status: MessageStatus? = null
+    ): ChatMessage {
+        val message = ChatMessage(author, "", mine, imagePath = imagePath, timestamp = timestamp, status = status)
         val actualChatKey = if (author == "system" || author == "mesh") CHAT_EVERYONE else chatKey
         val buffer = messagesForChat(actualChatKey)
         if (buffer.isNotEmpty() && buffer.size == 1 && buffer.first().author == "system") {
@@ -1263,6 +1562,41 @@ class MainActivity : Activity() {
             chatList.post { chatList.setSelection(chatAdapter.count - 1) }
         }
         chatAdapter.notifyDataSetChanged()
+        return message
+    }
+
+    private fun addAudioMessage(
+        author: String,
+        audioPath: String,
+        mine: Boolean,
+        timestamp: Long = System.currentTimeMillis(),
+        chatKey: String = currentChatKey(),
+        status: MessageStatus? = null
+    ): ChatMessage {
+        val message = ChatMessage(
+            author = author,
+            body = tr("voice_message"),
+            mine = mine,
+            audioPath = audioPath,
+            timestamp = timestamp,
+            status = status
+        )
+        val actualChatKey = if (author == "system" || author == "mesh") CHAT_EVERYONE else chatKey
+        val buffer = messagesForChat(actualChatKey)
+        if (buffer.isNotEmpty() && buffer.size == 1 && buffer.first().author == "system") {
+            buffer.clear()
+        }
+        buffer += message
+        persistChatMessage(actualChatKey, message)
+        if (currentChatKey() == actualChatKey && !savedMessagesSelected) {
+            if (messages.size == 1 && messages.firstOrNull()?.author == "system") {
+                messages.clear()
+            }
+            messages += message
+            chatList.post { chatList.setSelection(chatAdapter.count - 1) }
+        }
+        chatAdapter.notifyDataSetChanged()
+        return message
     }
 
     private fun addReceivedText(line: String) {
@@ -1298,14 +1632,38 @@ class MainActivity : Activity() {
         val imagePath = payload.substringBefore("|")
         if (imagePath.isBlank()) return
         if (!File(imagePath).exists()) {
-            addMessage("mesh", "incoming image not available on device", false)
+            addMessage("mesh", tr("incoming_image_unavailable"), false)
             return
         }
         sender.nodeId?.let { rememberPeer(it, author) }
         val chatKey = incomingChatKey(sender)
         if (chatKey != currentChatKey()) chatStore.incrementUnread(chatKey)
         addImageMessage(author, imagePath, mine = false, timestamp = timestamp, chatKey = chatKey)
-        showImageProgress("image received")
+        showImageProgress(tr("image_received"))
+        mainHandler.postDelayed({ hideImageProgress() }, 1_200)
+    }
+
+    private fun addReceivedAudio(line: String) {
+        val meta = line.substringAfter("audio from ", "")
+        val sender = parseIncomingSender(meta.substringBefore(" at ", "@peer"))
+        if (isSelfSender(sender.nodeId)) return
+        val author = sender.label
+        val timestampAndPayload = meta.substringAfter(" at ", "")
+        val timestamp = timestampAndPayload.substringBefore(": ", "")
+            .toLongOrNull()
+            ?: System.currentTimeMillis()
+        val payload = timestampAndPayload.substringAfter(": ", line.substringAfter(": ", ""))
+        val audioPath = payload.substringBefore("|")
+        if (audioPath.isBlank()) return
+        if (!File(audioPath).exists()) {
+            addMessage("mesh", tr("incoming_audio_unavailable"), false)
+            return
+        }
+        sender.nodeId?.let { rememberPeer(it, author) }
+        val chatKey = incomingChatKey(sender)
+        if (chatKey != currentChatKey()) chatStore.incrementUnread(chatKey)
+        addAudioMessage(author, audioPath, mine = false, timestamp = timestamp, chatKey = chatKey)
+        showImageProgress(tr("voice_received"))
         mainHandler.postDelayed({ hideImageProgress() }, 1_200)
     }
 
@@ -1313,11 +1671,11 @@ class MainActivity : Activity() {
         val sent = value.substringBefore("/").toIntOrNull()
         val total = value.substringAfter("/", "").toIntOrNull()
         if (sent == null || total == null || total <= 0) {
-            showImageProgress("sending image...")
+            showImageProgress(tr("sending_image"))
             return
         }
         val percent = ((sent * 100f) / total).toInt().coerceIn(0, 100)
-        showImageProgress("sending image $percent% ($sent/$total)")
+            showImageProgress("${tr("sending_image")} $percent% ($sent/$total)")
     }
 
     private fun updateMessageStatus(messageIdText: String, status: MessageStatus) {
@@ -1342,7 +1700,7 @@ class MainActivity : Activity() {
     private fun saveLocalMessage(message: ChatMessage) {
         savedMessages += message
         persistChatMessage(CHAT_SAVED, message)
-        if (messages.size == 1 && messages.firstOrNull()?.body == "saved messages are empty") {
+        if (messages.size == 1 && messages.firstOrNull()?.body == tr("saved_empty")) {
             messages.clear()
         }
         messages += message
@@ -1353,7 +1711,7 @@ class MainActivity : Activity() {
     private fun showSavedMessages() {
         messages.clear()
         if (savedMessages.isEmpty()) {
-            messages += ChatMessage("system", "saved messages are empty", false)
+            messages += ChatMessage("system", tr("saved_empty"), false)
         } else {
             messages += savedMessages
         }
@@ -1386,7 +1744,7 @@ class MainActivity : Activity() {
         messages.clear()
         messages += messagesForChat(chatKey)
         if (messages.isEmpty()) {
-            messages += ChatMessage("system", if (chatKey == CHAT_EVERYONE) "broadcast is empty" else "chat is empty", false)
+            messages += ChatMessage("system", if (chatKey == CHAT_EVERYONE) tr("broadcast_empty") else tr("chat_empty"), false)
         }
         chatAdapter.notifyDataSetChanged()
         chatList.post { chatList.setSelection(chatAdapter.count - 1) }
@@ -1469,10 +1827,11 @@ class MainActivity : Activity() {
 
         stored.lineSequence()
             .mapNotNull { line ->
-                val parts = line.split("\t", limit = 5)
+                val parts = line.split("\t", limit = 6)
                 val author = parts.firstOrNull().orEmpty().ifBlank { "@me" }
                 val body = parts.getOrNull(1)?.decodeStoredText() ?: return@mapNotNull null
                 val imagePath = parts.getOrNull(2)?.decodeStoredText()?.ifBlank { null }
+                val audioPath = parts.getOrNull(5)?.decodeStoredText()?.ifBlank { null }
                 val timestamp = parts.getOrNull(3)?.toLongOrNull() ?: 0L
                 val status = parts.getOrNull(4)
                     ?.takeIf { it.isNotBlank() }
@@ -1483,6 +1842,7 @@ class MainActivity : Activity() {
                     body = body,
                     mine = true,
                     imagePath = imagePath,
+                    audioPath = audioPath,
                     timestamp = timestamp.takeIf { it > 0L } ?: estimateLegacyTimestamp(),
                     status = status
                 )
@@ -1533,6 +1893,7 @@ class MainActivity : Activity() {
             body = body,
             mine = mine,
             imagePath = imagePath,
+            audioPath = audioPath,
             timestamp = timestamp,
             meshMessageId = messageId?.toString(),
             status = status?.name
@@ -1544,6 +1905,7 @@ class MainActivity : Activity() {
             body = body,
             mine = mine,
             imagePath = imagePath,
+            audioPath = audioPath,
             timestamp = timestamp,
             messageId = meshMessageId?.let { runCatching { UUID.fromString(it) }.getOrNull() },
             status = status?.let { runCatching { MessageStatus.valueOf(it) }.getOrNull() } ?: defaultStatus,
@@ -1567,8 +1929,8 @@ class MainActivity : Activity() {
         val today = Calendar.getInstance()
         val yesterday = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
         return when {
-            messageDay.isSameDay(today) -> "Today"
-            messageDay.isSameDay(yesterday) -> "Yesterday"
+            messageDay.isSameDay(today) -> tr("today")
+            messageDay.isSameDay(yesterday) -> tr("yesterday")
             else -> messageDateFormat.format(Date(timestamp))
         }
     }
@@ -1579,9 +1941,9 @@ class MainActivity : Activity() {
 
     private fun updateRecipientHint() {
         messageInput.hint = when {
-            savedMessagesSelected -> "save a message..."
-            selectedRecipientId == null -> "type a message..."
-            else -> "message $selectedRecipientLabel..."
+            savedMessagesSelected -> tr("hint_save_message")
+            selectedRecipientId == null -> tr("hint_type_message")
+            else -> "${tr("hint_message")} $selectedRecipientLabel..."
         }
     }
 
@@ -1591,13 +1953,13 @@ class MainActivity : Activity() {
         }
         if (::networkStatusView.isInitialized) {
             networkStatusView.text = when {
-                savedMessagesSelected -> "Saved messages"
+                savedMessagesSelected -> tr("saved_messages")
                 selectedRecipientId != null -> {
                     if (isPeerOnline(selectedRecipientId)) {
-                        "online now"
+                        tr("online_now")
                     } else {
                         val peer = chatStore.getPeer(selectedRecipientId.toString())
-                        "Last seen: ${formatPeerPresence(peer?.lastSeen ?: 0L)}"
+                        "${tr("last_seen_prefix")} ${formatPeerPresence(peer?.lastSeen ?: 0L)}"
                     }
                 }
                 else -> networkStatusView.text
@@ -1609,24 +1971,24 @@ class MainActivity : Activity() {
         if (selectedRecipientId != null && !savedMessagesSelected) {
             if (::networkStatusView.isInitialized) {
                 networkStatusView.text = if (isPeerOnline(selectedRecipientId)) {
-                    "online now"
+                    tr("online_now")
                 } else {
                     val peer = chatStore.getPeer(selectedRecipientId.toString())
-                    "Last seen: ${formatPeerPresence(peer?.lastSeen ?: 0L)}"
+                    "${tr("last_seen_prefix")} ${formatPeerPresence(peer?.lastSeen ?: 0L)}"
                 }
             }
             return
         }
         val status = when {
-            line.startsWith("search people:") -> "Searching nearby..."
-            line.startsWith("mesh started") || line.startsWith("service connected") -> "Mesh online"
-            line.startsWith("discovered:") -> "Nearby person found"
-            line.startsWith("secure session:") -> "Secure chat ready"
-            line.startsWith("message delivered:") -> "Delivered"
-            line.startsWith("message read:") -> "Read"
-            line.startsWith("mesh service disconnected") -> "Offline"
-            line.contains("permission missing", ignoreCase = true) -> "Permissions needed"
-            line.contains("bluetooth disabled", ignoreCase = true) -> "Bluetooth disabled"
+            line.startsWith("search people:") -> tr("status_searching_nearby")
+            line.startsWith("mesh started") || line.startsWith("service connected") -> tr("status_mesh_online")
+            line.startsWith("discovered:") -> tr("status_person_found")
+            line.startsWith("secure session:") -> tr("status_secure_ready")
+            line.startsWith("message delivered:") -> tr("delivered")
+            line.startsWith("message read:") -> tr("read")
+            line.startsWith("mesh service disconnected") -> tr("offline")
+            line.contains("permission missing", ignoreCase = true) -> tr("status_permissions_needed")
+            line.contains("bluetooth disabled", ignoreCase = true) -> tr("status_bt_disabled")
             else -> null
         } ?: return
         if (::networkStatusView.isInitialized) {
@@ -1645,15 +2007,15 @@ class MainActivity : Activity() {
         val fingerprint = peerId?.let { storedPeer?.fingerprint ?: peerFingerprint(it) }
         val verified = storedPeer?.verified == true
         val subtitle = when {
-            savedMessagesSelected -> "Private local chat stored on this device."
-            selectedRecipientId == null -> "Broadcast chat for everyone nearby."
-            else -> "Last seen: ${formatPeerPresence(storedPeer?.lastSeen ?: 0L)} / Peer ID: ${peerId.toString().take(8)}...${peerId.toString().takeLast(6)}"
+            savedMessagesSelected -> tr("private_local_chat_desc")
+            selectedRecipientId == null -> tr("broadcast_chat_desc")
+            else -> "${tr("last_seen_prefix")} ${formatPeerPresence(storedPeer?.lastSeen ?: 0L)} / ${tr("peer_id")}: ${peerId.toString().take(8)}...${peerId.toString().takeLast(6)}"
         }
         val action = when {
-            savedMessagesSelected -> "Saved messages are automatically marked as read."
-            selectedRecipientId == null -> "Messages here are public to nearby mesh users."
-            verified -> "This contact is marked as verified on this device."
-            else -> "Compare the code with your friend, then mark it verified."
+            savedMessagesSelected -> tr("saved_auto_read")
+            selectedRecipientId == null -> tr("messages_public_mesh")
+            verified -> tr("contact_verified_local")
+            else -> tr("compare_code_verify")
         }
 
         val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
@@ -1679,7 +2041,7 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER
                 setPadding(0, 0, 0, dp(18))
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            addView(terminalAction("Search messages").apply {
+            addView(terminalAction(tr("search_messages")).apply {
                 textSize = 16f
                 gravity = Gravity.CENTER
                 background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
@@ -1701,14 +2063,14 @@ class MainActivity : Activity() {
                 }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                     bottomMargin = dp(10)
                 })
-                addView(terminalAction(if (verified) "Verified" else "Mark as verified").apply {
+                addView(terminalAction(if (verified) tr("verified") else tr("mark_verified")).apply {
                     textSize = 16f
                     gravity = Gravity.CENTER
                     background = roundedDrawable(if (verified) 0x33FF4D6D else ACCENT_PINK, dp(18), SOFT_PINK_STROKE)
                     setOnClickListener {
                         rememberPeer(peerId, selectedRecipientLabel)
                         chatStore.setPeerVerified(peerId.toString(), true)
-                        Toast.makeText(this@MainActivity, "Contact verified", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this@MainActivity, tr("contact_verified"), Toast.LENGTH_SHORT).show()
                         dialog.dismiss()
                         updateChatTitle()
                     }
@@ -1716,7 +2078,7 @@ class MainActivity : Activity() {
                     bottomMargin = dp(10)
                 })
             }
-            addView(terminalAction("Close").apply {
+            addView(terminalAction(tr("close")).apply {
                 textSize = 16f
                 gravity = Gravity.CENTER
                 background = roundedDrawable(ACCENT_PINK, dp(18), SOFT_PINK_STROKE)
@@ -1747,7 +2109,7 @@ class MainActivity : Activity() {
             textSize = 16f
             setTextColor(BERRY_TEXT)
             setHintTextColor(BERRY_TEXT_DIM)
-            hint = "Display name"
+            hint = tr("display_name")
             filters = arrayOf(InputFilter.LengthFilter(24))
             background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
             setPadding(dp(14), dp(10), dp(14), dp(10))
@@ -1758,13 +2120,13 @@ class MainActivity : Activity() {
             setPadding(dp(20), dp(44), dp(20), dp(20))
             setBackgroundColor(CREAM_BACKGROUND)
 
-            addView(terminalText("Profile").apply {
+            addView(terminalText(tr("profile")).apply {
                 textSize = 24f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
             })
 
-            addView(terminalText("Original name (fixed)").apply {
+            addView(terminalText(tr("original_name_fixed")).apply {
                 textSize = 12f
                 setTextColor(BERRY_TEXT_DIM)
                 setPadding(0, dp(16), 0, dp(6))
@@ -1777,14 +2139,14 @@ class MainActivity : Activity() {
                 setPadding(dp(14), dp(10), dp(14), dp(10))
             })
 
-            addView(terminalText("Display name (editable)").apply {
+            addView(terminalText(tr("display_name_editable")).apply {
                 textSize = 12f
                 setTextColor(BERRY_TEXT_DIM)
                 setPadding(0, dp(14), 0, dp(6))
             })
             addView(input)
 
-            addView(terminalAction("Save").apply {
+            addView(terminalAction(tr("save")).apply {
                 textSize = 16f
                 gravity = Gravity.CENTER
                 setTextColor(Color.WHITE)
@@ -1793,7 +2155,7 @@ class MainActivity : Activity() {
                 setOnClickListener {
                     setDisplayName(input.text?.toString().orEmpty())
                     usernameField.setText(contactDisplayName())
-                    Toast.makeText(this@MainActivity, "Profile updated", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, tr("profile_updated"), Toast.LENGTH_SHORT).show()
                     dialog.dismiss()
                     showChatList()
                 }
@@ -1814,14 +2176,18 @@ class MainActivity : Activity() {
                     dialog.dismiss()
                     showMeshPanel(scanFirst = true)
                 },
-                onContacts = {
-                    dialog.dismiss()
-                    showChatList()
-                },
-                onProfile = { }
-            ), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
+            onContacts = {
+                dialog.dismiss()
+                showChatList()
+            },
+            onProfile = { },
+            onSettings = {
+                dialog.dismiss()
+                showSettingsPage()
+            }
+        ), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply {
                 topMargin = dp(10)
             })
@@ -1834,6 +2200,772 @@ class MainActivity : Activity() {
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT
         )
+    }
+
+    private fun showSettingsPage() {
+        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
+        var draftDark = darkThemeEnabled
+        var draftLanguage = selectedLanguage
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(44), dp(20), dp(20))
+            setBackgroundColor(CREAM_BACKGROUND)
+
+            addView(terminalText(tr("settings")).apply {
+                textSize = 24f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+            })
+
+            addView(terminalText(tr("theme")).apply {
+                textSize = 12f
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(0, dp(16), 0, dp(8))
+            })
+        }
+
+        val themeRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val lightButton = chatListBottomItem(tr("theme_light"), !draftDark) { }
+        val darkButton = chatListBottomItem(tr("theme_dark"), draftDark) { }
+        lightButton.setOnClickListener {
+            draftDark = false
+            lightButton.background = roundedDrawable(STRAWBERRY_RED, dp(20))
+            lightButton.setTextColor(Color.WHITE)
+            darkButton.background = roundedDrawable(Color.TRANSPARENT, dp(20))
+            darkButton.setTextColor(BERRY_TEXT_DIM)
+        }
+        darkButton.setOnClickListener {
+            draftDark = true
+            darkButton.background = roundedDrawable(STRAWBERRY_RED, dp(20))
+            darkButton.setTextColor(Color.WHITE)
+            lightButton.background = roundedDrawable(Color.TRANSPARENT, dp(20))
+            lightButton.setTextColor(BERRY_TEXT_DIM)
+        }
+        themeRow.addView(lightButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(6) })
+        themeRow.addView(darkButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(6) })
+        root.addView(themeRow)
+
+        root.addView(terminalText(tr("language")).apply {
+            textSize = 12f
+            setTextColor(BERRY_TEXT_DIM)
+            setPadding(0, dp(16), 0, dp(8))
+        })
+
+        val langButtons = linkedMapOf<AppLanguage, TextView>()
+        val langRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        AppLanguage.entries.forEachIndexed { index, lang ->
+            val button = chatListBottomItem(lang.label, draftLanguage == lang) { }
+            button.setOnClickListener {
+                draftLanguage = lang
+                langButtons.forEach { (candidate, view) ->
+                    if (candidate == lang) {
+                        view.background = roundedDrawable(STRAWBERRY_RED, dp(20))
+                        view.setTextColor(Color.WHITE)
+                    } else {
+                        view.background = roundedDrawable(Color.TRANSPARENT, dp(20))
+                        view.setTextColor(BERRY_TEXT_DIM)
+                    }
+                }
+            }
+            langButtons[lang] = button
+            langRow.addView(button, LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                if (index > 0) marginStart = dp(4)
+                if (index < AppLanguage.entries.lastIndex) marginEnd = dp(4)
+            })
+        }
+        root.addView(langRow)
+
+        root.addView(terminalAction(tr("save")).apply {
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = roundedDrawable(STRAWBERRY_RED, dp(18))
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            setOnClickListener {
+                darkThemeEnabled = draftDark
+                selectedLanguage = draftLanguage
+                saveUiSettings()
+                applyThemePalette()
+                dialog.dismiss()
+                recreate()
+            }
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            topMargin = dp(18)
+        })
+
+        root.addView(View(this), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            0,
+            1f
+        ))
+
+        root.addView(buildPageBottomNav(
+            selected = PageTab.SETTINGS,
+            onNewContacts = {
+                dialog.dismiss()
+                showMeshPanel(scanFirst = true)
+            },
+            onContacts = {
+                dialog.dismiss()
+                showChatList()
+            },
+            onProfile = {
+                dialog.dismiss()
+                showOwnProfilePage()
+            },
+            onSettings = { }
+        ), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            topMargin = dp(10)
+        })
+
+        dialog.setContentView(root)
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        dialog.show()
+        dialog.window?.setLayout(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT
+        )
+    }
+
+    private fun loadUiSettings() {
+        val prefs = getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+        darkThemeEnabled = prefs.getBoolean(UI_SETTINGS_THEME_DARK, false)
+        selectedLanguage = AppLanguage.fromCode(prefs.getString(UI_SETTINGS_LANGUAGE, AppLanguage.EN.code))
+    }
+
+    private fun saveUiSettings() {
+        getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(UI_SETTINGS_THEME_DARK, darkThemeEnabled)
+            .putString(UI_SETTINGS_LANGUAGE, selectedLanguage.code)
+            .apply()
+    }
+
+    private fun applyThemePalette() {
+        if (darkThemeEnabled) {
+            CREAM_BACKGROUND = DARK_BACKGROUND
+            BERRY_TEXT = DARK_TEXT
+            BERRY_TEXT_DIM = DARK_TEXT_DIM
+            ACCENT_PINK = DARK_ACCENT
+            STRAWBERRY_RED = DARK_STRAWBERRY
+            LEAF_GREEN = LIGHT_LEAF_GREEN
+            INPUT_SURFACE = DARK_SURFACE
+            PINK_SHADOW_STROKE = DARK_STROKE
+            MUTED_CORAL = DARK_CORAL
+            SERVICE_BUBBLE = DARK_SERVICE_BUBBLE
+            SERVICE_BUBBLE_STROKE = DARK_SERVICE_STROKE
+            INCOMING_BUBBLE = DARK_INCOMING_BUBBLE
+            INCOMING_BUBBLE_STROKE = DARK_INCOMING_BUBBLE_STROKE
+            INCOMING_TEXT = DARK_INCOMING_TEXT
+            OUTGOING_BUBBLE = DARK_OUTGOING_BUBBLE
+            OUTGOING_BUBBLE_STROKE = DARK_OUTGOING_BUBBLE_STROKE
+            IMAGE_BORDER = DARK_IMAGE_BORDER
+            SOFT_PINK_PANEL = DARK_PANEL
+            SOFT_PINK_STROKE = DARK_SOFT_STROKE
+        } else {
+            CREAM_BACKGROUND = LIGHT_CREAM_BACKGROUND
+            BERRY_TEXT = LIGHT_BERRY_TEXT
+            BERRY_TEXT_DIM = LIGHT_BERRY_TEXT_DIM
+            ACCENT_PINK = LIGHT_ACCENT_PINK
+            STRAWBERRY_RED = LIGHT_STRAWBERRY_RED
+            LEAF_GREEN = LIGHT_LEAF_GREEN
+            INPUT_SURFACE = LIGHT_INPUT_SURFACE
+            PINK_SHADOW_STROKE = LIGHT_PINK_SHADOW_STROKE
+            MUTED_CORAL = LIGHT_MUTED_CORAL
+            SERVICE_BUBBLE = LIGHT_SERVICE_BUBBLE
+            SERVICE_BUBBLE_STROKE = LIGHT_SERVICE_BUBBLE_STROKE
+            INCOMING_BUBBLE = LIGHT_INCOMING_BUBBLE
+            INCOMING_BUBBLE_STROKE = LIGHT_INCOMING_BUBBLE_STROKE
+            INCOMING_TEXT = LIGHT_INCOMING_TEXT
+            OUTGOING_BUBBLE = LIGHT_OUTGOING_BUBBLE
+            OUTGOING_BUBBLE_STROKE = LIGHT_OUTGOING_BUBBLE_STROKE
+            IMAGE_BORDER = LIGHT_IMAGE_BORDER
+            SOFT_PINK_PANEL = LIGHT_SOFT_PINK_PANEL
+            SOFT_PINK_STROKE = LIGHT_SOFT_PINK_STROKE
+        }
+    }
+
+    private fun tr(key: String): String {
+        val en = mapOf(
+            "chats" to "Chats",
+            "new_contacts" to "New contacts",
+            "contacts" to "Contacts",
+            "profile" to "Profile",
+            "settings" to "Settings",
+            "no_chats_yet" to "No chats yet",
+            "theme" to "Theme",
+            "theme_light" to "Light",
+            "theme_dark" to "Black pink",
+            "language" to "Language",
+            "save" to "Save",
+            "profile_updated" to "Profile updated",
+            "original_name_fixed" to "Original name (fixed)",
+            "display_name_editable" to "Display name (editable)",
+            "display_name" to "Display name",
+            "everyone" to "Everyone",
+            "saved_messages" to "Saved messages",
+            "today" to "Today",
+            "yesterday" to "Yesterday",
+            "hint_save_message" to "save a message...",
+            "hint_type_message" to "type a message...",
+            "hint_message" to "message",
+            "online_now" to "online now",
+            "last_seen_prefix" to "Last seen:",
+            "status_searching_nearby" to "Searching nearby...",
+            "status_mesh_online" to "Mesh online",
+            "status_person_found" to "Nearby person found",
+            "status_secure_ready" to "Secure chat ready",
+            "status_permissions_needed" to "Permissions needed",
+            "status_bt_disabled" to "Bluetooth disabled",
+            "delivered" to "Delivered",
+            "read" to "Read",
+            "offline" to "Offline",
+            "patch" to "Patch",
+            "patch_upper" to "PATCH",
+            "mesh_starting" to "Mesh starting...",
+            "search_in_patch" to "search in patch...",
+            "direct_in_range" to "Direct in range",
+            "no_direct_peers" to "No direct peers in Bluetooth range",
+            "no_direct_matches" to "No direct matches",
+            "direct_ble" to "direct BLE",
+            "verified" to "Verified",
+            "reachable_via_hops" to "Reachable via hops",
+            "no_multihop_routes" to "No multi-hop routes discovered yet",
+            "no_hop_matches" to "No hop matches",
+            "via" to "via",
+            "hops" to "hops",
+            "photo" to "photo",
+            "private_notes" to "private notes for yourself",
+            "nearby_public_mesh" to "nearby public mesh",
+            "verified_contact" to "verified contact",
+            "tap_open_chat" to "tap to open chat",
+            "private_local_chat_desc" to "Private local chat stored on this device.",
+            "broadcast_chat_desc" to "Broadcast chat for everyone nearby.",
+            "peer_id" to "Peer ID",
+            "saved_auto_read" to "Saved messages are automatically marked as read.",
+            "messages_public_mesh" to "Messages here are public to nearby mesh users.",
+            "contact_verified_local" to "This contact is marked as verified on this device.",
+            "compare_code_verify" to "Compare the code with your friend, then mark it verified.",
+            "search_messages" to "Search messages",
+            "mark_verified" to "Mark as verified",
+            "contact_verified" to "Contact verified",
+            "close" to "Close",
+            "delete" to "Delete",
+            "edit" to "Edit",
+            "cancel" to "Cancel",
+            "delete_for_everyone_q" to "delete for everyone?",
+            "delete_for_myself_q" to "Delete for myself?",
+            "search_messages_hint" to "search messages...",
+            "type_to_search_chat" to "Type to search this chat",
+            "no_matches" to "No matches",
+            "search" to "Search",
+            "seen_recently" to "seen recently",
+            "seen" to "seen",
+            "min_ago" to "min ago",
+            "h_ago" to "h ago",
+            "d_ago" to "d ago",
+            "local" to "local",
+            "online" to "online",
+            "pin" to "Pin",
+            "unpin" to "Unpin",
+            "pinned" to "pinned",
+            "saved_empty" to "saved messages are empty",
+            "broadcast_empty" to "broadcast is empty",
+            "chat_empty" to "chat is empty",
+            "grow" to "Grow",
+            "grow_desc" to "Bring phones close to exchange local keys and join each other's patch.",
+            "start_discovery" to "Start discovery",
+            "scan_nearby_ble" to "scan nearby BLE mesh nodes",
+            "searching_nearby_patch" to "Searching nearby patch",
+            "open_patch" to "Open patch",
+            "show_direct_hop" to "show direct and hop peers",
+            "back_to_chats" to "Back to chats",
+            "start_chatting" to "Start chatting",
+            "choose_nickname" to "Choose a nickname",
+            "welcome_truskawka" to "Welcome to Truskawka",
+            "choose_mesh_nickname" to "Choose your mesh nickname",
+            "nickname_rules" to "The @ stays fixed. Max 12 characters.",
+            "nickname_change_online_only" to "Nickname can be changed when mesh is online",
+            "nickname_change_once_week" to "Nickname can be changed once a week",
+            "could_not_read_image" to "Could not read image",
+            "image_too_large" to "Image is too large",
+            "incoming_image_unavailable" to "incoming image not available on device",
+            "incoming_audio_unavailable" to "incoming voice message not available on device",
+            "status_sprouting" to "Sprouting",
+            "status_ripe" to "Ripe",
+            "broadcast" to "Broadcast",
+            "enable_nearby_chat" to "Enable nearby chat",
+            "permissions_intro_desc" to "Truskawka needs Bluetooth, Nearby devices, Location, and Microphone access so mesh radio can discover phones and send voice notes. Internet and router Wi-Fi are not required.",
+            "continue" to "Continue",
+            "permissions_recovery_toast" to "Allow Bluetooth, Nearby devices, Location, and Microphone for mesh radio",
+            "preparing_image" to "preparing image...",
+            "sending_image" to "sending image...",
+            "image_sent" to "image sent",
+            "image_received" to "image received",
+            "you" to "You",
+            "direct" to "Direct",
+            "mesh_hops" to "Mesh hops"
+            ,
+            "send" to "Send",
+            "add_caption" to "Add a caption...",
+            "preview_image" to "Image preview",
+            "voice_message" to "voice message",
+            "recording_voice" to "recording voice...",
+            "sending_voice" to "sending voice...",
+            "voice_sent" to "voice sent",
+            "voice_received" to "voice received",
+            "voice_send_failed" to "voice send failed",
+            "voice_too_large" to "voice message is too large",
+            "voice_too_short" to "hold to record a bit longer",
+            "voice_read_failed" to "could not read recorded voice",
+            "play" to "Play",
+            "stop" to "Stop",
+            "mic_permission_needed" to "Microphone permission is required",
+            "voice_record_failed" to "Could not start recording",
+            "mic" to "MIC",
+            "mic_icon" to "\uD83C\uDFA4",
+            "recording_short" to "REC"
+        )
+        val ru = mapOf(
+            "chats" to "Чаты",
+            "new_contacts" to "Новые контакты",
+            "contacts" to "Контакты",
+            "profile" to "Профиль",
+            "settings" to "Настройки",
+            "no_chats_yet" to "Чатов пока нет",
+            "theme" to "Тема",
+            "theme_light" to "Светлая",
+            "theme_dark" to "Черно-розовая",
+            "language" to "Язык",
+            "save" to "Сохранить",
+            "profile_updated" to "Профиль обновлен",
+            "original_name_fixed" to "Оригинальное имя (фиксированное)",
+            "display_name_editable" to "Отображаемое имя (изменяемое)",
+            "display_name" to "Отображаемое имя",
+            "everyone" to "Все",
+            "saved_messages" to "Избранное",
+            "today" to "Сегодня",
+            "yesterday" to "Вчера",
+            "hint_save_message" to "сохранить сообщение...",
+            "hint_type_message" to "введите сообщение...",
+            "hint_message" to "сообщение",
+            "online_now" to "в сети",
+            "last_seen_prefix" to "Был(а) в сети:",
+            "status_searching_nearby" to "Поиск рядом...",
+            "status_mesh_online" to "Mesh онлайн",
+            "status_person_found" to "Найден человек рядом",
+            "status_secure_ready" to "Защищенный чат готов",
+            "status_permissions_needed" to "Нужны разрешения",
+            "status_bt_disabled" to "Bluetooth выключен",
+            "delivered" to "Доставлено",
+            "read" to "Прочитано",
+            "offline" to "Оффлайн",
+            "patch" to "Патч",
+            "patch_upper" to "ПАТЧ",
+            "mesh_starting" to "Mesh запускается...",
+            "search_in_patch" to "поиск в патче...",
+            "direct_in_range" to "Прямо в зоне",
+            "no_direct_peers" to "Нет прямых устройств в зоне Bluetooth",
+            "no_direct_matches" to "Нет прямых совпадений",
+            "direct_ble" to "прямой BLE",
+            "verified" to "Подтверждено",
+            "reachable_via_hops" to "Доступно через хопы",
+            "no_multihop_routes" to "Маршруты через хопы пока не найдены",
+            "no_hop_matches" to "Нет совпадений по хопам",
+            "via" to "через",
+            "hops" to "хопов",
+            "photo" to "фото",
+            "private_notes" to "личные заметки",
+            "nearby_public_mesh" to "публичный nearby mesh",
+            "verified_contact" to "подтвержденный контакт",
+            "tap_open_chat" to "нажмите, чтобы открыть чат",
+            "private_local_chat_desc" to "Локальный приватный чат на этом устройстве.",
+            "broadcast_chat_desc" to "Публичный чат для всех рядом.",
+            "peer_id" to "Peer ID",
+            "saved_auto_read" to "Избранное автоматически считается прочитанным.",
+            "messages_public_mesh" to "Сообщения здесь публичны для nearby mesh.",
+            "contact_verified_local" to "Этот контакт помечен как подтвержденный на этом устройстве.",
+            "compare_code_verify" to "Сверьте код с другом и подтвердите контакт.",
+            "search_messages" to "Поиск сообщений",
+            "mark_verified" to "Отметить как подтвержденный",
+            "contact_verified" to "Контакт подтвержден",
+            "close" to "Закрыть",
+            "delete" to "Удалить",
+            "edit" to "Изменить",
+            "cancel" to "Отмена",
+            "delete_for_everyone_q" to "удалить для всех?",
+            "delete_for_myself_q" to "Удалить только у себя?",
+            "search_messages_hint" to "поиск сообщений...",
+            "type_to_search_chat" to "Введите текст для поиска в чате",
+            "no_matches" to "Совпадений нет",
+            "search" to "Поиск",
+            "seen_recently" to "был(а) недавно",
+            "seen" to "был(а)",
+            "min_ago" to "мин назад",
+            "h_ago" to "ч назад",
+            "d_ago" to "д назад",
+            "local" to "локально",
+            "online" to "онлайн",
+            "pin" to "Закрепить",
+            "unpin" to "Открепить",
+            "pinned" to "закреплено",
+            "saved_empty" to "избранное пусто",
+            "broadcast_empty" to "эфир пуст",
+            "chat_empty" to "чат пуст",
+            "grow" to "Grow",
+            "grow_desc" to "Поднесите телефоны ближе для обмена ключами и входа в патч.",
+            "start_discovery" to "Начать поиск",
+            "scan_nearby_ble" to "скан nearby BLE mesh узлов",
+            "searching_nearby_patch" to "Идет поиск nearby patch",
+            "open_patch" to "Открыть патч",
+            "show_direct_hop" to "показать прямые и hop узлы",
+            "back_to_chats" to "Назад к чатам",
+            "start_chatting" to "Начать чат",
+            "choose_nickname" to "Выберите никнейм",
+            "welcome_truskawka" to "Добро пожаловать в Truskawka",
+            "choose_mesh_nickname" to "Выберите mesh никнейм",
+            "nickname_rules" to "Символ @ фиксирован. Максимум 12 символов.",
+            "nickname_change_online_only" to "Ник можно менять, когда mesh онлайн",
+            "nickname_change_once_week" to "Ник можно менять раз в неделю",
+            "could_not_read_image" to "Не удалось прочитать изображение",
+            "image_too_large" to "Изображение слишком большое",
+            "incoming_image_unavailable" to "полученное изображение недоступно на устройстве",
+            "incoming_audio_unavailable" to "полученное голосовое недоступно на устройстве",
+            "status_sprouting" to "В пути",
+            "status_ripe" to "Доставлено",
+            "broadcast" to "Эфир",
+            "enable_nearby_chat" to "Включить nearby чат",
+            "permissions_intro_desc" to "Truskawka требует полный доступ к Bluetooth, Nearby devices и Location, чтобы mesh radio мог рекламироваться и сканировать телефоны рядом. Интернет и роутерный Wi-Fi не нужны.",
+            "continue" to "Продолжить",
+            "permissions_recovery_toast" to "Разрешите Bluetooth, Nearby devices и Location для mesh radio",
+            "preparing_image" to "подготовка изображения...",
+            "sending_image" to "отправка изображения...",
+            "image_sent" to "изображение отправлено",
+            "image_received" to "изображение получено",
+            "you" to "Вы",
+            "direct" to "Прямые",
+            "mesh_hops" to "Mesh хопы"
+            ,
+            "send" to "Отправить",
+            "add_caption" to "Добавить подпись...",
+            "preview_image" to "Предпросмотр изображения",
+            "voice_message" to "голосовое сообщение",
+            "recording_voice" to "запись голосового...",
+            "sending_voice" to "отправка голосового...",
+            "voice_sent" to "голосовое отправлено",
+            "voice_received" to "голосовое получено",
+            "voice_send_failed" to "ошибка отправки голосового",
+            "voice_too_large" to "голосовое слишком большое",
+            "voice_too_short" to "удерживайте кнопку чуть дольше",
+            "voice_read_failed" to "не удалось прочитать запись",
+            "play" to "Слушать",
+            "stop" to "Стоп",
+            "mic_permission_needed" to "Нужно разрешение на микрофон",
+            "voice_record_failed" to "Не удалось начать запись",
+            "mic" to "МИК",
+            "mic_icon" to "\uD83C\uDFA4",
+            "recording_short" to "ЗАП"
+        )
+        val pl = mapOf(
+            "chats" to "Czaty",
+            "new_contacts" to "Nowe kontakty",
+            "contacts" to "Kontakty",
+            "profile" to "Profil",
+            "settings" to "Ustawienia",
+            "no_chats_yet" to "Brak czatow",
+            "theme" to "Motyw",
+            "theme_light" to "Jasny",
+            "theme_dark" to "Czarno-rozowy",
+            "language" to "Jezyk",
+            "save" to "Zapisz",
+            "profile_updated" to "Profil zaktualizowany",
+            "original_name_fixed" to "Oryginalna nazwa (stala)",
+            "display_name_editable" to "Nazwa wyswietlana (edytowalna)",
+            "display_name" to "Nazwa wyswietlana",
+            "everyone" to "Wszyscy",
+            "saved_messages" to "Zapisane",
+            "today" to "Dzis",
+            "yesterday" to "Wczoraj",
+            "hint_save_message" to "zapisz wiadomosc...",
+            "hint_type_message" to "napisz wiadomosc...",
+            "hint_message" to "wiadomosc",
+            "online_now" to "online",
+            "last_seen_prefix" to "Ostatnio widziany:",
+            "status_searching_nearby" to "Szukanie w poblizu...",
+            "status_mesh_online" to "Mesh online",
+            "status_person_found" to "Znaleziono osobe",
+            "status_secure_ready" to "Bezpieczny chat gotowy",
+            "status_permissions_needed" to "Wymagane uprawnienia",
+            "status_bt_disabled" to "Bluetooth wylaczony",
+            "delivered" to "Dostarczono",
+            "read" to "Przeczytano",
+            "offline" to "Offline",
+            "patch" to "Patch",
+            "patch_upper" to "PATCH",
+            "mesh_starting" to "Mesh startuje...",
+            "search_in_patch" to "szukaj w patch...",
+            "direct_in_range" to "Bezposrednio w zasiegu",
+            "no_direct_peers" to "Brak bezposrednich urzadzen w zasiegu Bluetooth",
+            "no_direct_matches" to "Brak bezposrednich dopasowan",
+            "direct_ble" to "bezposredni BLE",
+            "verified" to "Zweryfikowano",
+            "reachable_via_hops" to "Dostepne przez hop",
+            "no_multihop_routes" to "Brak tras wielohopowych",
+            "no_hop_matches" to "Brak dopasowan hop",
+            "via" to "przez",
+            "hops" to "hop",
+            "photo" to "zdjecie",
+            "private_notes" to "prywatne notatki",
+            "nearby_public_mesh" to "publiczny nearby mesh",
+            "verified_contact" to "zweryfikowany kontakt",
+            "tap_open_chat" to "dotknij, aby otworzyc chat",
+            "private_local_chat_desc" to "Prywatny lokalny chat na tym urzadzeniu.",
+            "broadcast_chat_desc" to "Publiczny chat dla wszystkich w poblizu.",
+            "peer_id" to "Peer ID",
+            "saved_auto_read" to "Zapisane wiadomosci sa automatycznie przeczytane.",
+            "messages_public_mesh" to "Wiadomosci tutaj sa publiczne dla nearby mesh.",
+            "contact_verified_local" to "Ten kontakt jest zweryfikowany na tym urzadzeniu.",
+            "compare_code_verify" to "Porownaj kod z znajomym i oznacz jako zweryfikowany.",
+            "search_messages" to "Szukaj wiadomosci",
+            "mark_verified" to "Oznacz jako zweryfikowany",
+            "contact_verified" to "Kontakt zweryfikowany",
+            "close" to "Zamknij",
+            "delete" to "Usun",
+            "edit" to "Edytuj",
+            "cancel" to "Anuluj",
+            "delete_for_everyone_q" to "usun dla wszystkich?",
+            "delete_for_myself_q" to "Usun tylko u mnie?",
+            "search_messages_hint" to "szukaj wiadomosci...",
+            "type_to_search_chat" to "Wpisz, aby szukac w tym chacie",
+            "no_matches" to "Brak wynikow",
+            "search" to "Szukaj",
+            "seen_recently" to "widziany niedawno",
+            "seen" to "widziany",
+            "min_ago" to "min temu",
+            "h_ago" to "h temu",
+            "d_ago" to "d temu",
+            "local" to "lokalnie",
+            "online" to "online",
+            "pin" to "Przypnij",
+            "unpin" to "Odepnij",
+            "pinned" to "przypiete",
+            "saved_empty" to "zapisane wiadomosci sa puste",
+            "broadcast_empty" to "broadcast jest pusty",
+            "chat_empty" to "chat jest pusty",
+            "grow" to "Grow",
+            "grow_desc" to "Zbliz telefony, aby wymienic klucze i dolaczyc do patch.",
+            "start_discovery" to "Rozpocznij wykrywanie",
+            "scan_nearby_ble" to "skanuj nearby BLE mesh",
+            "searching_nearby_patch" to "Szukanie nearby patch",
+            "open_patch" to "Otworz patch",
+            "show_direct_hop" to "pokaz bezposrednie i hop wezly",
+            "back_to_chats" to "Wroc do chatow",
+            "start_chatting" to "Zacznij chat",
+            "choose_nickname" to "Wybierz nickname",
+            "welcome_truskawka" to "Witamy w Truskawka",
+            "choose_mesh_nickname" to "Wybierz mesh nickname",
+            "nickname_rules" to "@ pozostaje stale. Maks 12 znakow.",
+            "nickname_change_online_only" to "Nickname mozna zmienic, gdy mesh jest online",
+            "nickname_change_once_week" to "Nickname mozna zmienic raz w tygodniu",
+            "could_not_read_image" to "Nie mozna odczytac obrazu",
+            "image_too_large" to "Obraz jest za duzy",
+            "incoming_image_unavailable" to "odebrany obraz niedostepny na urzadzeniu",
+            "incoming_audio_unavailable" to "odebrana wiadomosc glosowa niedostepna",
+            "status_sprouting" to "W drodze",
+            "status_ripe" to "Dostarczono",
+            "broadcast" to "Broadcast",
+            "enable_nearby_chat" to "Wlacz nearby chat",
+            "permissions_intro_desc" to "Truskawka wymaga pelnego dostepu do Bluetooth, Nearby devices i Location, aby mesh radio moglo reklamowac i skanowac telefony obok. Internet i Wi-Fi routera nie sa wymagane.",
+            "continue" to "Kontynuuj",
+            "permissions_recovery_toast" to "Zezwol na Bluetooth, Nearby devices i Location dla mesh radio",
+            "preparing_image" to "przygotowywanie obrazu...",
+            "sending_image" to "wysylanie obrazu...",
+            "image_sent" to "obraz wyslany",
+            "image_received" to "obraz odebrany",
+            "you" to "Ty",
+            "direct" to "Direct",
+            "mesh_hops" to "Mesh hops"
+            ,
+            "send" to "Wyslij",
+            "add_caption" to "Dodaj podpis...",
+            "preview_image" to "Podglad obrazu",
+            "voice_message" to "wiadomosc glosowa",
+            "recording_voice" to "nagrywanie glosu...",
+            "sending_voice" to "wysylanie glosu...",
+            "voice_sent" to "glos wyslany",
+            "voice_received" to "glos odebrany",
+            "voice_send_failed" to "blad wysylania glosu",
+            "voice_too_large" to "wiadomosc glosowa jest za duza",
+            "voice_too_short" to "przytrzymaj przycisk troche dluzej",
+            "voice_read_failed" to "nie mozna odczytac nagrania",
+            "play" to "Play",
+            "stop" to "Stop",
+            "mic_permission_needed" to "Wymagane uprawnienie mikrofonu",
+            "voice_record_failed" to "Nie mozna rozpoczac nagrywania",
+            "mic" to "MIK",
+            "mic_icon" to "\uD83C\uDFA4",
+            "recording_short" to "REC"
+        )
+        val es = mapOf(
+            "chats" to "Chats",
+            "new_contacts" to "Nuevos contactos",
+            "contacts" to "Contactos",
+            "profile" to "Perfil",
+            "settings" to "Ajustes",
+            "no_chats_yet" to "Sin chats todavia",
+            "theme" to "Tema",
+            "theme_light" to "Claro",
+            "theme_dark" to "Negro rosa",
+            "language" to "Idioma",
+            "save" to "Guardar",
+            "profile_updated" to "Perfil actualizado",
+            "original_name_fixed" to "Nombre original (fijo)",
+            "display_name_editable" to "Nombre visible (editable)",
+            "display_name" to "Nombre visible",
+            "everyone" to "Todos",
+            "saved_messages" to "Guardados",
+            "today" to "Hoy",
+            "yesterday" to "Ayer",
+            "hint_save_message" to "guardar mensaje...",
+            "hint_type_message" to "escribe un mensaje...",
+            "hint_message" to "mensaje",
+            "online_now" to "en linea",
+            "last_seen_prefix" to "Ultima vez:",
+            "status_searching_nearby" to "Buscando cerca...",
+            "status_mesh_online" to "Mesh en linea",
+            "status_person_found" to "Persona cercana encontrada",
+            "status_secure_ready" to "Chat seguro listo",
+            "status_permissions_needed" to "Permisos necesarios",
+            "status_bt_disabled" to "Bluetooth desactivado",
+            "delivered" to "Entregado",
+            "read" to "Leido",
+            "offline" to "Offline",
+            "patch" to "Patch",
+            "patch_upper" to "PATCH",
+            "mesh_starting" to "Mesh iniciando...",
+            "search_in_patch" to "buscar en patch...",
+            "direct_in_range" to "Directo en rango",
+            "no_direct_peers" to "No hay pares directos en rango Bluetooth",
+            "no_direct_matches" to "Sin coincidencias directas",
+            "direct_ble" to "BLE directo",
+            "verified" to "Verificado",
+            "reachable_via_hops" to "Alcanzable por hops",
+            "no_multihop_routes" to "No hay rutas multi-hop aun",
+            "no_hop_matches" to "Sin coincidencias de hops",
+            "via" to "via",
+            "hops" to "hops",
+            "photo" to "foto",
+            "private_notes" to "notas privadas",
+            "nearby_public_mesh" to "nearby mesh publico",
+            "verified_contact" to "contacto verificado",
+            "tap_open_chat" to "toca para abrir chat",
+            "private_local_chat_desc" to "Chat local privado guardado en este dispositivo.",
+            "broadcast_chat_desc" to "Chat publico para todos cerca.",
+            "peer_id" to "Peer ID",
+            "saved_auto_read" to "Guardados se marcan como leidos automaticamente.",
+            "messages_public_mesh" to "Los mensajes aqui son publicos para nearby mesh.",
+            "contact_verified_local" to "Este contacto esta marcado como verificado en este dispositivo.",
+            "compare_code_verify" to "Compara el codigo con tu amigo y luego verificalo.",
+            "search_messages" to "Buscar mensajes",
+            "mark_verified" to "Marcar como verificado",
+            "contact_verified" to "Contacto verificado",
+            "close" to "Cerrar",
+            "delete" to "Eliminar",
+            "edit" to "Editar",
+            "cancel" to "Cancelar",
+            "delete_for_everyone_q" to "eliminar para todos?",
+            "delete_for_myself_q" to "Eliminar solo para mi?",
+            "search_messages_hint" to "buscar mensajes...",
+            "type_to_search_chat" to "Escribe para buscar en este chat",
+            "no_matches" to "Sin coincidencias",
+            "search" to "Buscar",
+            "seen_recently" to "visto recientemente",
+            "seen" to "visto",
+            "min_ago" to "min atras",
+            "h_ago" to "h atras",
+            "d_ago" to "d atras",
+            "local" to "local",
+            "online" to "online",
+            "pin" to "Fijar",
+            "unpin" to "Desfijar",
+            "pinned" to "fijado",
+            "saved_empty" to "guardados vacio",
+            "broadcast_empty" to "broadcast vacio",
+            "chat_empty" to "chat vacio",
+            "grow" to "Grow",
+            "grow_desc" to "Acerca los telefonos para intercambiar claves y unirte al patch.",
+            "start_discovery" to "Iniciar descubrimiento",
+            "scan_nearby_ble" to "escanear nodos nearby BLE mesh",
+            "searching_nearby_patch" to "Buscando nearby patch",
+            "open_patch" to "Abrir patch",
+            "show_direct_hop" to "mostrar nodos directos y hop",
+            "back_to_chats" to "Volver a chats",
+            "start_chatting" to "Comenzar chat",
+            "choose_nickname" to "Elige un nickname",
+            "welcome_truskawka" to "Bienvenido a Truskawka",
+            "choose_mesh_nickname" to "Elige tu mesh nickname",
+            "nickname_rules" to "@ se mantiene fijo. Maximo 12 caracteres.",
+            "nickname_change_online_only" to "El nickname puede cambiarse cuando mesh esta online",
+            "nickname_change_once_week" to "El nickname puede cambiarse una vez por semana",
+            "could_not_read_image" to "No se pudo leer la imagen",
+            "image_too_large" to "La imagen es demasiado grande",
+            "incoming_image_unavailable" to "la imagen recibida no esta disponible en el dispositivo",
+            "incoming_audio_unavailable" to "el audio recibido no esta disponible en el dispositivo",
+            "status_sprouting" to "En ruta",
+            "status_ripe" to "Entregado",
+            "broadcast" to "Broadcast",
+            "enable_nearby_chat" to "Activar chat nearby",
+            "permissions_intro_desc" to "Truskawka necesita acceso completo a Bluetooth, Nearby devices y Location para que mesh radio pueda anunciarse y escanear telefonos cercanos. Internet y Wi-Fi de router no son necesarios.",
+            "continue" to "Continuar",
+            "permissions_recovery_toast" to "Permite Bluetooth, Nearby devices y Location para mesh radio",
+            "preparing_image" to "preparando imagen...",
+            "sending_image" to "enviando imagen...",
+            "image_sent" to "imagen enviada",
+            "image_received" to "imagen recibida",
+            "you" to "Tu",
+            "direct" to "Directo",
+            "mesh_hops" to "Mesh hops"
+            ,
+            "send" to "Enviar",
+            "add_caption" to "Agregar texto...",
+            "preview_image" to "Vista previa de imagen",
+            "voice_message" to "mensaje de voz",
+            "recording_voice" to "grabando voz...",
+            "sending_voice" to "enviando voz...",
+            "voice_sent" to "voz enviada",
+            "voice_received" to "voz recibida",
+            "voice_send_failed" to "error al enviar voz",
+            "voice_too_large" to "el mensaje de voz es demasiado grande",
+            "voice_too_short" to "manten pulsado un poco mas",
+            "voice_read_failed" to "no se pudo leer la grabacion",
+            "play" to "Play",
+            "stop" to "Stop",
+            "mic_permission_needed" to "Se requiere permiso de microfono",
+            "voice_record_failed" to "No se pudo iniciar la grabacion",
+            "mic" to "MIC",
+            "mic_icon" to "\uD83C\uDFA4",
+            "recording_short" to "REC"
+        )
+        val source = when (selectedLanguage) {
+            AppLanguage.EN -> en
+            AppLanguage.PL -> pl
+            AppLanguage.ES -> es
+            AppLanguage.RU -> ru
+        }
+        return source[key] ?: en[key] ?: key
     }
 
     private fun getDisplayName(): String =
@@ -1864,7 +2996,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
         }
         val input = EditText(this).apply {
-            hint = "search messages..."
+            hint = tr("search_messages_hint")
             setSingleLine(true)
             typeface = Typeface.MONOSPACE
             textSize = 15f
@@ -1878,7 +3010,7 @@ class MainActivity : Activity() {
             val query = input.text?.toString().orEmpty().trim().lowercase(Locale.getDefault())
             resultsContainer.removeAllViews()
             if (query.isBlank()) {
-                resultsContainer.addView(terminalText("Type to search this chat").apply {
+                resultsContainer.addView(terminalText(tr("type_to_search_chat")).apply {
                     textSize = 14f
                     setTextColor(BERRY_TEXT_DIM)
                     setPadding(0, dp(18), 0, 0)
@@ -1891,12 +3023,13 @@ class MainActivity : Activity() {
                 .filter { message ->
                     message.body.lowercase(Locale.getDefault()).contains(query) ||
                         message.author.lowercase(Locale.getDefault()).contains(query) ||
-                        (message.imagePath != null && "photo".contains(query))
+                        (message.imagePath != null && tr("photo").lowercase(Locale.getDefault()).contains(query)) ||
+                        (message.audioPath != null && tr("voice_message").lowercase(Locale.getDefault()).contains(query))
                 }
                 .take(25)
 
             if (results.isEmpty()) {
-                resultsContainer.addView(terminalText("No matches").apply {
+                resultsContainer.addView(terminalText(tr("no_matches")).apply {
                     textSize = 14f
                     setTextColor(BERRY_TEXT_DIM)
                     setPadding(0, dp(18), 0, 0)
@@ -1920,7 +3053,7 @@ class MainActivity : Activity() {
         root.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(terminalText("Search").apply {
+            addView(terminalText(tr("search")).apply {
                 textSize = 22f
                 typeface = Typeface.DEFAULT_BOLD
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -1960,7 +3093,13 @@ class MainActivity : Activity() {
                 textSize = 12f
                 setTextColor(BERRY_TEXT_DIM)
             })
-            addView(terminalText(message.body.ifBlank { "photo" }).apply {
+            addView(terminalText(message.body.ifBlank {
+                when {
+                    message.imagePath != null -> tr("photo")
+                    message.audioPath != null -> tr("voice_message")
+                    else -> ""
+                }
+            }).apply {
                 textSize = 14f
                 setTextColor(BERRY_TEXT)
                 maxLines = 2
@@ -1970,19 +3109,19 @@ class MainActivity : Activity() {
         }
 
     private fun String.toDisplayTitle(): String = when (this) {
-        "everyone" -> "Everyone"
-        "saved" -> "Saved messages"
+        "everyone" -> tr("everyone")
+        "saved" -> tr("saved_messages")
         else -> this
     }
 
     private fun formatPeerPresence(lastSeen: Long): String {
-        if (lastSeen <= 0L) return "seen recently"
+        if (lastSeen <= 0L) return tr("seen_recently")
         val elapsed = System.currentTimeMillis() - lastSeen
         return when {
-            elapsed < 2L * 60L * 1000L -> "online now"
-            elapsed < 60L * 60L * 1000L -> "seen ${elapsed / 60_000L} min ago"
-            elapsed < 24L * 60L * 60L * 1000L -> "seen ${elapsed / 3_600_000L} h ago"
-            else -> "seen ${elapsed / 86_400_000L} d ago"
+            elapsed < 2L * 60L * 1000L -> tr("online_now")
+            elapsed < 60L * 60L * 1000L -> "${tr("seen")} ${elapsed / 60_000L} ${tr("min_ago")}"
+            elapsed < 24L * 60L * 60L * 1000L -> "${tr("seen")} ${elapsed / 3_600_000L} ${tr("h_ago")}"
+            else -> "${tr("seen")} ${elapsed / 86_400_000L} ${tr("d_ago")}"
         }
     }
 
@@ -1992,19 +3131,19 @@ class MainActivity : Activity() {
     }
 
     private fun summaryPresence(summary: ChatSummary): Pair<String, Boolean> {
-        if (summary.kind == ChatKind.SAVED.name) return "local" to true
+        if (summary.kind == ChatKind.SAVED.name) return tr("local") to true
         if (summary.kind == ChatKind.EVERYONE.name) {
             val hasPeers = (meshService?.peerCount() ?: 0) > 0
-            return if (hasPeers) "online" to true else "offline" to false
+            return if (hasPeers) tr("online") to true else tr("offline") to false
         }
         val peerId = summary.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
-            ?: return "offline" to false
+            ?: return tr("offline") to false
         val active = meshService?.knownPeers().orEmpty().any { it.nodeId == peerId }
-        if (active) return "online" to true
+        if (active) return tr("online") to true
 
         val lastSeen = chatStore.getPeer(peerId.toString())?.lastSeen ?: 0L
         val recentlyOnline = lastSeen > 0L && (System.currentTimeMillis() - lastSeen) < 2L * 60L * 1000L
-        return if (recentlyOnline) "online" to true else "offline" to false
+        return if (recentlyOnline) tr("online") to true else tr("offline") to false
     }
 
     private fun isPeerOnline(peerId: UUID?): Boolean {
@@ -2012,20 +3151,23 @@ class MainActivity : Activity() {
         return meshService?.knownPeers().orEmpty().any { it.nodeId == peerId }
     }
 
-    private fun showChatRowActions(summary: ChatSummary) {
-        val pinLabel = if (summary.pinned) "Unpin" else "Pin"
+    private fun showChatRowActions(summary: ChatSummary, onChanged: () -> Unit) {
+        val pinLabel = if (summary.pinned) tr("unpin") else tr("pin")
         val options = if (summary.kind == ChatKind.PEER.name) {
-            arrayOf(pinLabel, "Delete")
+            arrayOf(pinLabel, tr("delete"))
         } else {
             arrayOf(pinLabel)
         }
         AlertDialog.Builder(this)
             .setItems(options) { _, which ->
                 when (options[which]) {
-                    "Delete" -> deleteChatSummary(summary, deleteForEveryone = true)
+                    tr("delete") -> {
+                        deleteChatSummary(summary, deleteForEveryone = true)
+                        onChanged()
+                    }
                     else -> {
                         chatStore.setChatPinned(summary.chatKey, !summary.pinned)
-                        showChatList()
+                        onChanged()
                     }
                 }
             }
@@ -2044,17 +3186,20 @@ class MainActivity : Activity() {
             updateChatTitle()
         }
         chatAdapter.notifyDataSetChanged()
-        showChatList()
     }
 
     private fun showMessageActions(message: ChatMessage) {
         if (message.author == "system" || message.author == "mesh") return
-        val options = if (message.imagePath == null) arrayOf("Delete", "Edit") else arrayOf("Delete")
+        val options = if (message.imagePath == null && message.audioPath == null) {
+            arrayOf(tr("delete"), tr("edit"))
+        } else {
+            arrayOf(tr("delete"))
+        }
         AlertDialog.Builder(this)
             .setItems(options) { _, which ->
                 when (options[which]) {
-                    "Delete" -> confirmDeleteMessage(message)
-                    "Edit" -> editMessage(message)
+                    tr("delete") -> confirmDeleteMessage(message)
+                    tr("edit") -> editMessage(message)
                 }
             }
             .show()
@@ -2062,14 +3207,14 @@ class MainActivity : Activity() {
 
     private fun confirmDeleteMessage(target: ChatMessage) {
         val checkbox = CheckBox(this).apply {
-            text = "delete for everyone?"
+            text = tr("delete_for_everyone_q")
             setTextColor(BERRY_TEXT)
             isChecked = false
         }
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(10), dp(20), dp(4))
-            addView(terminalText("Delete for myself?").apply {
+            addView(terminalText(tr("delete_for_myself_q")).apply {
                 textSize = 16f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
@@ -2080,10 +3225,10 @@ class MainActivity : Activity() {
 
         AlertDialog.Builder(this)
             .setView(panel)
-            .setPositiveButton("Delete") { _, _ ->
+            .setPositiveButton(tr("delete")) { _, _ ->
                 deleteMessage(target, deleteForEveryone = checkbox.isChecked)
             }
-            .setNegativeButton("Cancel", null)
+            .setNegativeButton(tr("cancel"), null)
             .show()
     }
 
@@ -2118,11 +3263,15 @@ class MainActivity : Activity() {
         val bodyEncoded = java.util.Base64.getUrlEncoder()
             .withoutPadding()
             .encodeToString(message.body.toByteArray(Charsets.UTF_8))
-        val imageFlag = if (message.imagePath != null) "1" else "0"
-        val token = messageDeleteToken(message.body, imageFlag == "1")
+        val kind = when {
+            message.imagePath != null -> "i"
+            message.audioPath != null -> "a"
+            else -> "t"
+        }
+        val token = messageDeleteToken(message.body, kind)
         val ownerMineOnSender = if (message.mine) "1" else "0"
         val payload =
-            "$CONTROL_PREFIX$CONTROL_DELETE_MESSAGE|${message.timestamp}|$imageFlag|$bodyEncoded|$token|$ownerMineOnSender"
+            "$CONTROL_PREFIX$CONTROL_DELETE_MESSAGE|${message.timestamp}|$kind|$bodyEncoded|$token|$ownerMineOnSender"
         if (currentChatKey() == CHAT_EVERYONE) {
             meshService?.broadcastMessage(payload)
         } else {
@@ -2153,7 +3302,11 @@ class MainActivity : Activity() {
         val parts = payload.split("|")
         if (parts.size < 4) return
         val timestamp = parts.getOrNull(1)?.toLongOrNull() ?: return
-        val imageFlag = parts.getOrNull(2) == "1"
+        val kind = when (parts.getOrNull(2).orEmpty()) {
+            "1" -> "i"
+            "0", "" -> "t"
+            else -> parts.getOrNull(2).orEmpty()
+        }
         val bodyValue = runCatching {
             String(java.util.Base64.getUrlDecoder().decode(parts.getOrNull(3).orEmpty()), Charsets.UTF_8)
         }.getOrDefault("")
@@ -2163,18 +3316,21 @@ class MainActivity : Activity() {
 
         val chatKey = incomingChatKey(sender)
         val buffer = messagesForChat(chatKey)
-        val incomingCandidates = buffer.filter { it ->
+        val typedCandidates = buffer.filter { it ->
+            matchesDeleteKind(it, kind)
+        }
+        val incomingCandidates = typedCandidates.filter { it ->
             (expectedMine == null || it.mine == expectedMine) &&
-                ((imageFlag && it.imagePath != null) || (!imageFlag && it.imagePath == null))
+                matchesDeleteKind(it, kind)
         }
 
         var match = incomingCandidates.lastOrNull {
             it.timestamp == timestamp &&
-                ((imageFlag && it.imagePath != null) || (!imageFlag && it.imagePath == null && it.body == bodyValue))
+                (if (kind == "t") it.body == bodyValue else true)
         }
         if (match == null && token.isNotBlank()) {
             match = incomingCandidates.lastOrNull {
-                messageDeleteToken(it.body, it.imagePath != null) == token
+                messageDeleteToken(it.body, kindForDelete(it)) == token
             }
         }
         if (match == null && bodyValue.isNotBlank()) {
@@ -2182,6 +3338,12 @@ class MainActivity : Activity() {
         }
         if (match == null) {
             match = incomingCandidates.lastOrNull { it.timestamp == timestamp }
+        }
+        if (match == null) {
+            match = typedCandidates.lastOrNull {
+                (bodyValue.isBlank() || it.body == bodyValue) &&
+                    (it.timestamp == timestamp || token.isBlank() || messageDeleteToken(it.body, kindForDelete(it)) == token)
+            }
         }
         match ?: return
 
@@ -2196,7 +3358,7 @@ class MainActivity : Activity() {
     }
 
     private fun editMessage(target: ChatMessage) {
-        if (target.imagePath != null) return
+        if (target.imagePath != null || target.audioPath != null) return
         val input = EditText(this).apply {
             setText(target.body)
             setSingleLine(false)
@@ -2207,9 +3369,9 @@ class MainActivity : Activity() {
             background = roundedDrawable(INPUT_SURFACE, dp(16), SOFT_PINK_STROKE)
         }
         AlertDialog.Builder(this)
-            .setTitle("Edit")
+            .setTitle(tr("edit"))
             .setView(input)
-            .setPositiveButton("Save") { _, _ ->
+            .setPositiveButton(tr("save")) { _, _ ->
                 val next = input.text?.toString()?.trim().orEmpty()
                 if (next.isBlank()) return@setPositiveButton
                 target.body = next
@@ -2220,7 +3382,7 @@ class MainActivity : Activity() {
                 }
                 chatAdapter.notifyDataSetChanged()
             }
-            .setNegativeButton("Cancel", null)
+            .setNegativeButton(tr("cancel"), null)
             .show()
     }
 
@@ -2235,7 +3397,8 @@ class MainActivity : Activity() {
                         it.timestamp == target.timestamp &&
                             it.body == target.body &&
                             it.mine == target.mine &&
-                            ((it.imagePath == null) == (target.imagePath == null))
+                            ((it.imagePath == null) == (target.imagePath == null)) &&
+                            ((it.audioPath == null) == (target.audioPath == null))
                         )
                 }
             }
@@ -2248,10 +3411,26 @@ class MainActivity : Activity() {
         return removedAny
     }
 
-    private fun messageDeleteToken(body: String, isImage: Boolean): String {
-        val source = if (isImage) "img" else "txt:${body.trim()}"
+    private fun messageDeleteToken(body: String, kind: String): String {
+        val source = when (kind) {
+            "i" -> "img"
+            "a" -> "aud"
+            else -> "txt:${body.trim()}"
+        }
         val bytes = MessageDigest.getInstance("SHA-256").digest(source.toByteArray(Charsets.UTF_8))
         return bytes.joinToString("") { b -> "%02x".format(b) }.take(16)
+    }
+
+    private fun kindForDelete(message: ChatMessage): String = when {
+        message.imagePath != null -> "i"
+        message.audioPath != null -> "a"
+        else -> "t"
+    }
+
+    private fun matchesDeleteKind(message: ChatMessage, kind: String): Boolean = when (kind) {
+        "i" -> message.imagePath != null
+        "a" -> message.audioPath != null
+        else -> message.imagePath == null && message.audioPath == null
     }
 
     private fun peerFingerprint(peerId: UUID): String =
@@ -2293,19 +3472,19 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(22), dp(24), dp(22), dp(22))
             background = roundedDrawable(SOFT_PINK_PANEL, dp(26), SOFT_PINK_STROKE)
-            addView(terminalText("Enable nearby chat").apply {
+            addView(terminalText(tr("enable_nearby_chat")).apply {
                 textSize = 22f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
                 gravity = Gravity.CENTER
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            addView(terminalText("Truskawka needs full Bluetooth, Nearby devices, and Location access so mesh radio can advertise and scan for phones around you. Internet and router Wi-Fi are not required.").apply {
+            addView(terminalText(tr("permissions_intro_desc")).apply {
                 textSize = 14f
                 setTextColor(BERRY_TEXT_DIM)
                 gravity = Gravity.CENTER
                 setPadding(0, dp(14), 0, dp(18))
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            addView(terminalAction("Continue").apply {
+            addView(terminalAction(tr("continue")).apply {
                 textSize = 16f
                 gravity = Gravity.CENTER
                 setTextColor(Color.WHITE)
@@ -2392,6 +3571,7 @@ class MainActivity : Activity() {
     private fun requiredPermissions(): List<String> = buildList {
         add(Manifest.permission.ACCESS_COARSE_LOCATION)
         add(Manifest.permission.ACCESS_FINE_LOCATION)
+        add(Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             add(Manifest.permission.BLUETOOTH_SCAN)
             add(Manifest.permission.BLUETOOTH_ADVERTISE)
@@ -2406,7 +3586,7 @@ class MainActivity : Activity() {
     private fun showPermissionRecovery() {
         Toast.makeText(
             this,
-            "Allow Bluetooth, Nearby devices, and Location for mesh radio",
+            tr("permissions_recovery_toast"),
             Toast.LENGTH_LONG
         ).show()
         runCatching {
@@ -2647,6 +3827,59 @@ class MainActivity : Activity() {
         transferStatusView.visibility = View.GONE
     }
 
+    private fun toggleAudioPlayback(path: String?, button: TextView) {
+        val audioPath = path?.takeIf { it.isNotBlank() } ?: return
+        if (!File(audioPath).exists()) return
+        if (activePlayingPath == audioPath) {
+            releaseAudioPlayer()
+            button.text = tr("play")
+            return
+        }
+        releaseAudioPlayer()
+        val player = MediaPlayer()
+        runCatching {
+            player.setDataSource(audioPath)
+            player.prepare()
+            player.start()
+        }.onFailure {
+            player.release()
+            button.text = tr("play")
+            return
+        }
+        activePlayer = player
+        activePlayingPath = audioPath
+        button.text = tr("stop")
+        player.setOnCompletionListener {
+            releaseAudioPlayer()
+            chatAdapter.notifyDataSetChanged()
+        }
+    }
+
+    private fun audioDurationLabel(path: String?): String {
+        val audioPath = path?.takeIf { it.isNotBlank() } ?: return "00:00"
+        audioDurationCache[audioPath]?.let { return it }
+        val durationMs = runCatching {
+            val probe = MediaPlayer()
+            probe.setDataSource(audioPath)
+            probe.prepare()
+            val d = probe.duration
+            probe.release()
+            d
+        }.getOrDefault(0)
+        val totalSec = (durationMs / 1000).coerceAtLeast(0)
+        val label = "%02d:%02d".format(totalSec / 60, totalSec % 60)
+        audioDurationCache[audioPath] = label
+        return label
+    }
+
+    private fun releaseAudioPlayer() {
+        runCatching { activePlayer?.stop() }
+        runCatching { activePlayer?.reset() }
+        runCatching { activePlayer?.release() }
+        activePlayer = null
+        activePlayingPath = null
+    }
+
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private inner class PatchRadarView(context: Context) : View(context) {
@@ -2692,7 +3925,7 @@ class MainActivity : Activity() {
             canvas.drawCircle(cx, cy, radius * 0.72f, ringPaint)
             canvas.drawCircle(cx, cy, radius * 0.45f, ringPaint)
             canvas.drawCircle(cx, cy, radius * 0.18f, centerPaint)
-            canvas.drawText("You", cx, cy + dp(4), Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            canvas.drawText(tr("you"), cx, cy + dp(4), Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.WHITE
                 textSize = dp(10).toFloat()
                 textAlign = Paint.Align.CENTER
@@ -2701,8 +3934,8 @@ class MainActivity : Activity() {
             drawPeers(canvas, cx, cy, radius * 0.52f, directCount, directPaint)
             drawPeers(canvas, cx, cy, radius * 0.84f, meshCount, meshPaint)
 
-            canvas.drawText("Direct: $directCount", cx, height - dp(26).toFloat(), textPaint)
-            canvas.drawText("Mesh hops: $meshCount", cx, height - dp(10).toFloat(), textPaint)
+            canvas.drawText("${tr("direct")}: $directCount", cx, height - dp(26).toFloat(), textPaint)
+            canvas.drawText("${tr("mesh_hops")}: $meshCount", cx, height - dp(10).toFloat(), textPaint)
         }
 
         private fun drawPeers(canvas: Canvas, cx: Float, cy: Float, radius: Float, count: Int, paint: Paint) {
@@ -2763,6 +3996,13 @@ class MainActivity : Activity() {
                         setPadding(0, dp(4), dp(4), 0)
                     }, LinearLayout.LayoutParams(
                         imageSize.first,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ))
+                    return@apply
+                }
+                if (item.audioPath != null) {
+                    addView(voiceBubble(item), LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT
                     ))
                     return@apply
@@ -2852,13 +4092,60 @@ class MainActivity : Activity() {
                 })
             }
 
+        private fun voiceBubble(item: ChatMessage): LinearLayout =
+            LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                background = if (item.mine) {
+                    roundedDrawable(OUTGOING_BUBBLE, dp(26), OUTGOING_BUBBLE_STROKE)
+                } else {
+                    roundedDrawable(INCOMING_BUBBLE, dp(26), INCOMING_BUBBLE_STROKE)
+                }
+                setPadding(dp(16), dp(10), dp(14), dp(8))
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    val action = terminalAction(
+                        if (activePlayingPath == item.audioPath) tr("stop") else tr("play")
+                    ).apply {
+                        textSize = 12f
+                        setTextColor(if (item.mine) Color.WHITE else INCOMING_TEXT)
+                        background = roundedDrawable(
+                            if (item.mine) 0x40FFFFFF else 0x22FF4359,
+                            dp(12),
+                            if (item.mine) 0x55FFFFFF else SOFT_PINK_STROKE
+                        )
+                        setPadding(dp(10), dp(6), dp(10), dp(6))
+                        setOnClickListener {
+                            toggleAudioPlayback(item.audioPath, this)
+                        }
+                    }
+                    addView(action)
+                    addView(terminalText(audioDurationLabel(item.audioPath)).apply {
+                        textSize = 12f
+                        setTextColor(if (item.mine) 0xE6FFFFFF.toInt() else BERRY_TEXT_DIM)
+                        setPadding(dp(10), 0, 0, 0)
+                    })
+                })
+                addView(messageTimeView(item, overOutgoing = item.mine), LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    gravity = Gravity.RIGHT
+                    topMargin = dp(2)
+                })
+                setOnLongClickListener {
+                    showMessageActions(item)
+                    true
+                }
+            }
+
         private fun messageTimeView(item: ChatMessage, overOutgoing: Boolean): View {
             val tint = if (overOutgoing) 0xE6FFFFFF.toInt() else BERRY_TEXT_DIM
             val statusLabel = when (item.status) {
-                MessageStatus.SENDING -> "Sprouting"
-                MessageStatus.DELIVERED -> "Ripe"
-                MessageStatus.READ -> "Ripe"
-                null -> if (selectedRecipientId == null) "Broadcast" else ""
+                MessageStatus.SENDING -> tr("status_sprouting")
+                MessageStatus.DELIVERED -> tr("status_ripe")
+                MessageStatus.READ -> tr("status_ripe")
+                null -> if (selectedRecipientId == null) tr("broadcast") else ""
             }
             if (!item.mine || item.status == null) {
                 return TextView(this@MainActivity).apply {
@@ -3144,6 +4431,7 @@ class MainActivity : Activity() {
         var body: String,
         val mine: Boolean,
         val imagePath: String? = null,
+        val audioPath: String? = null,
         val timestamp: Long = System.currentTimeMillis(),
         var messageId: UUID? = null,
         var status: MessageStatus? = null,
@@ -3169,34 +4457,80 @@ class MainActivity : Activity() {
     )
 
     companion object {
-        private const val CREAM_BACKGROUND = 0xFFFFFDF9.toInt()
-        private const val BERRY_TEXT = 0xFF3C2328.toInt()
-        private const val BERRY_TEXT_DIM = 0xFF8B6A71.toInt()
-        private const val ACCENT_PINK = 0xFFFFD9DE.toInt()
-        private const val STRAWBERRY_RED = 0xFFFF4359.toInt()
-        private const val LEAF_GREEN = 0xFF2ECC71.toInt()
-        private const val INPUT_SURFACE = 0xFFFFFDFD.toInt()
-        private const val PINK_SHADOW_STROKE = 0xFFFFCBD3.toInt()
-        private const val MUTED_CORAL = 0xFFE88E8E.toInt()
-        private const val SERVICE_BUBBLE = 0xFFFFF0F2.toInt()
-        private const val SERVICE_BUBBLE_STROKE = 0xFFFFD0D7.toInt()
-        private const val INCOMING_BUBBLE = 0xD9FFFFFF.toInt()
-        private const val INCOMING_BUBBLE_STROKE = 0xCCF1D7DC.toInt()
-        private const val INCOMING_TEXT = 0xFF536174.toInt()
-        private const val OUTGOING_BUBBLE = 0xD9FF8A99.toInt()
-        private const val OUTGOING_BUBBLE_STROKE = 0xCCFF7184.toInt()
-        private const val IMAGE_BORDER = 0xFFFF7086.toInt()
-        private const val SOFT_PINK_PANEL = 0xFFFFF3F5.toInt()
-        private const val SOFT_PINK_STROKE = 0xFFFFE0E5.toInt()
+        private const val LIGHT_CREAM_BACKGROUND = 0xFFFFFDF9.toInt()
+        private const val LIGHT_BERRY_TEXT = 0xFF3C2328.toInt()
+        private const val LIGHT_BERRY_TEXT_DIM = 0xFF8B6A71.toInt()
+        private const val LIGHT_ACCENT_PINK = 0xFFFFD9DE.toInt()
+        private const val LIGHT_STRAWBERRY_RED = 0xFFFF4359.toInt()
+        private const val LIGHT_LEAF_GREEN = 0xFF2ECC71.toInt()
+        private const val LIGHT_INPUT_SURFACE = 0xFFFFFDFD.toInt()
+        private const val LIGHT_PINK_SHADOW_STROKE = 0xFFFFCBD3.toInt()
+        private const val LIGHT_MUTED_CORAL = 0xFFE88E8E.toInt()
+        private const val LIGHT_SERVICE_BUBBLE = 0xFFFFF0F2.toInt()
+        private const val LIGHT_SERVICE_BUBBLE_STROKE = 0xFFFFD0D7.toInt()
+        private const val LIGHT_INCOMING_BUBBLE = 0xD9FFFFFF.toInt()
+        private const val LIGHT_INCOMING_BUBBLE_STROKE = 0xCCF1D7DC.toInt()
+        private const val LIGHT_INCOMING_TEXT = 0xFF536174.toInt()
+        private const val LIGHT_OUTGOING_BUBBLE = 0xD9FF8A99.toInt()
+        private const val LIGHT_OUTGOING_BUBBLE_STROKE = 0xCCFF7184.toInt()
+        private const val LIGHT_IMAGE_BORDER = 0xFFFF7086.toInt()
+        private const val LIGHT_SOFT_PINK_PANEL = 0xFFFFF3F5.toInt()
+        private const val LIGHT_SOFT_PINK_STROKE = 0xFFFFE0E5.toInt()
+
+        private const val DARK_BACKGROUND = 0xFF1A0B0E.toInt()
+        private const val DARK_TEXT = 0xFFFCECEF.toInt()
+        private const val DARK_TEXT_DIM = 0xFFC8AAB1.toInt()
+        private const val DARK_ACCENT = 0xFF442026.toInt()
+        private const val DARK_STRAWBERRY = 0xFFFF5E76.toInt()
+        private const val DARK_SURFACE = 0xFF2A1117.toInt()
+        private const val DARK_STROKE = 0xFF5C2B34.toInt()
+        private const val DARK_CORAL = 0xFFE39AAB.toInt()
+        private const val DARK_SERVICE_BUBBLE = 0xFF2E151B.toInt()
+        private const val DARK_SERVICE_STROKE = 0xFF5A2A34.toInt()
+        private const val DARK_INCOMING_BUBBLE = 0xD93C2228.toInt()
+        private const val DARK_INCOMING_BUBBLE_STROKE = 0xCC70414C.toInt()
+        private const val DARK_INCOMING_TEXT = 0xFFF6E8EB.toInt()
+        private const val DARK_OUTGOING_BUBBLE = 0xD9FF5E76.toInt()
+        private const val DARK_OUTGOING_BUBBLE_STROKE = 0xCCFF7E90.toInt()
+        private const val DARK_IMAGE_BORDER = 0xFFFF8FA1.toInt()
+        private const val DARK_PANEL = 0xFF241015.toInt()
+        private const val DARK_SOFT_STROKE = 0xFF4C2430.toInt()
+
+        private var CREAM_BACKGROUND = LIGHT_CREAM_BACKGROUND
+        private var BERRY_TEXT = LIGHT_BERRY_TEXT
+        private var BERRY_TEXT_DIM = LIGHT_BERRY_TEXT_DIM
+        private var ACCENT_PINK = LIGHT_ACCENT_PINK
+        private var STRAWBERRY_RED = LIGHT_STRAWBERRY_RED
+        private var LEAF_GREEN = LIGHT_LEAF_GREEN
+        private var INPUT_SURFACE = LIGHT_INPUT_SURFACE
+        private var PINK_SHADOW_STROKE = LIGHT_PINK_SHADOW_STROKE
+        private var MUTED_CORAL = LIGHT_MUTED_CORAL
+        private var SERVICE_BUBBLE = LIGHT_SERVICE_BUBBLE
+        private var SERVICE_BUBBLE_STROKE = LIGHT_SERVICE_BUBBLE_STROKE
+        private var INCOMING_BUBBLE = LIGHT_INCOMING_BUBBLE
+        private var INCOMING_BUBBLE_STROKE = LIGHT_INCOMING_BUBBLE_STROKE
+        private var INCOMING_TEXT = LIGHT_INCOMING_TEXT
+        private var OUTGOING_BUBBLE = LIGHT_OUTGOING_BUBBLE
+        private var OUTGOING_BUBBLE_STROKE = LIGHT_OUTGOING_BUBBLE_STROKE
+        private var IMAGE_BORDER = LIGHT_IMAGE_BORDER
+        private var SOFT_PINK_PANEL = LIGHT_SOFT_PINK_PANEL
+        private var SOFT_PINK_STROKE = LIGHT_SOFT_PINK_STROKE
+
         private const val MAX_NICKNAME_LENGTH = 12
         private const val CHAT_EVERYONE = "everyone"
         private const val CHAT_SAVED = "saved"
         private const val SAVED_MESSAGES_PREFS = "saved_messages"
         private const val SAVED_MESSAGES_KEY = "items"
+        private const val UI_SETTINGS_PREFS = "truskawka_ui_settings"
+        private const val UI_SETTINGS_THEME_DARK = "theme_dark"
+        private const val UI_SETTINGS_LANGUAGE = "language"
         private const val IMAGE_PICK_REQUEST = 93
         private const val MAX_IMAGE_BYTES = 2 * 1024 * 1024
         private const val TARGET_IMAGE_BYTES = 512 * 1024
         private const val MAX_IMAGE_DIMENSION = 1280
+        private const val VOICE_MIN_DURATION_MS = 400L
+        private const val VOICE_MAX_DURATION_MS = 60_000L
+        private const val MAX_VOICE_BYTES = 1_200_000L
         private const val BUBBLE_WRAP_CHARS = 24
         private const val CONTROL_PREFIX = "__truskawka_ctl__:"
         private const val CONTROL_DELETE_MESSAGE = "dm"

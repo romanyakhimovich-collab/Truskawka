@@ -28,6 +28,9 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         if (oldVersion < 4) {
             addColumnIfMissing(db, "chats", "pinned", "INTEGER NOT NULL DEFAULT 0")
         }
+        if (oldVersion < 5) {
+            addColumnIfMissing(db, "messages", "audio_path", "TEXT")
+        }
     }
 
     fun ensureChat(chat: StoredChat) {
@@ -41,8 +44,19 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
 
     fun ensureBaseChats() {
         writableDatabase.run {
-            ensureChat(StoredChat(CHAT_EVERYONE, "Everyone", ChatKind.EVERYONE.name))
-            ensureChat(StoredChat(CHAT_SAVED, "Saved messages", ChatKind.SAVED.name))
+            val now = System.currentTimeMillis()
+            insertWithOnConflict(
+                "chats",
+                null,
+                StoredChat(CHAT_EVERYONE, "Everyone", ChatKind.EVERYONE.name, createdAt = now, updatedAt = now).toValues(),
+                SQLiteDatabase.CONFLICT_IGNORE
+            )
+            insertWithOnConflict(
+                "chats",
+                null,
+                StoredChat(CHAT_SAVED, "Saved messages", ChatKind.SAVED.name, createdAt = now, updatedAt = now).toValues(),
+                SQLiteDatabase.CONFLICT_IGNORE
+            )
         }
     }
 
@@ -119,6 +133,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 c.pinned,
                 COALESCE(m.body, '') AS last_body,
                 m.image_path AS last_image_path,
+                m.audio_path AS last_audio_path,
                 COALESCE(m.timestamp, c.updated_at) AS last_timestamp,
                 (
                     SELECT COUNT(*)
@@ -148,6 +163,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                     pinned = cursor.getInt(cursor.getColumnIndexOrThrow("pinned")) == 1,
                     lastBody = cursor.getString(cursor.getColumnIndexOrThrow("last_body")),
                     lastImagePath = cursor.getString(cursor.getColumnIndexOrThrow("last_image_path")),
+                    lastAudioPath = cursor.getString(cursor.getColumnIndexOrThrow("last_audio_path")),
                     lastTimestamp = cursor.getLong(cursor.getColumnIndexOrThrow("last_timestamp")),
                     messageCount = cursor.getInt(cursor.getColumnIndexOrThrow("message_count"))
                 )
@@ -181,6 +197,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             val bodyIndex = cursor.getColumnIndexOrThrow("body")
             val mineIndex = cursor.getColumnIndexOrThrow("mine")
             val imageIndex = cursor.getColumnIndexOrThrow("image_path")
+            val audioIndex = cursor.getColumnIndexOrThrow("audio_path")
             val timestampIndex = cursor.getColumnIndexOrThrow("timestamp")
             val meshIdIndex = cursor.getColumnIndexOrThrow("mesh_message_id")
             val statusIndex = cursor.getColumnIndexOrThrow("status")
@@ -191,6 +208,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                     body = cursor.getString(bodyIndex),
                     mine = cursor.getInt(mineIndex) == 1,
                     imagePath = cursor.getString(imageIndex),
+                    audioPath = cursor.getString(audioIndex),
                     timestamp = cursor.getLong(timestampIndex),
                     meshMessageId = cursor.getString(meshIdIndex),
                     status = cursor.getString(statusIndex)
@@ -284,6 +302,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 body TEXT NOT NULL,
                 mine INTEGER NOT NULL,
                 image_path TEXT,
+                audio_path TEXT,
                 timestamp INTEGER NOT NULL,
                 mesh_message_id TEXT,
                 status TEXT
@@ -389,6 +408,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             put("body", body)
             put("mine", if (mine) 1 else 0)
             put("image_path", imagePath)
+            put("audio_path", audioPath)
             put("timestamp", timestamp)
             put("mesh_message_id", meshMessageId)
             put("status", status)
@@ -427,7 +447,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
 
     companion object {
         private const val DB_NAME = "truskawka_chats.db"
-        private const val DB_VERSION = 4
+        private const val DB_VERSION = 5
         const val CHAT_EVERYONE = "everyone"
         const val CHAT_SAVED = "saved"
         private const val LEGACY_CHAT_MESH = "mesh"
@@ -512,6 +532,7 @@ data class ChatSummary(
     val pinned: Boolean,
     val lastBody: String,
     val lastImagePath: String?,
+    val lastAudioPath: String?,
     val lastTimestamp: Long,
     val messageCount: Int
 )
@@ -522,6 +543,7 @@ data class StoredMessage(
     val body: String,
     val mine: Boolean,
     val imagePath: String?,
+    val audioPath: String?,
     val timestamp: Long,
     val meshMessageId: String?,
     val status: String?
