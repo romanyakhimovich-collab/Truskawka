@@ -3,10 +3,10 @@ package com.example.bluetoothmanager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ApplicationInfo
 import android.content.pm.ServiceInfo
 import android.net.wifi.p2p.WifiP2pDevice
 import android.os.Binder
@@ -90,11 +90,21 @@ class MeshNetworkService : Service() {
         )
         meshManager.setMessageListener { senderId, message, timestamp, isBroadcast ->
             val scope = if (isBroadcast) "broadcast" else "private"
+            showIncomingNotification(
+                title = if (isBroadcast) "Broadcast from ${meshManager.getAlias(senderId)}" else meshManager.getAlias(senderId),
+                body = message,
+                notificationId = senderId.hashCode() xor timestamp.toInt()
+            )
             publish("message from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: $message")
         }
         meshManager.setFileListener { senderId, fileName, mimeType, bytes, timestamp, isBroadcast ->
             val file = writeIncomingImage(fileName, bytes)
             val scope = if (isBroadcast) "broadcast" else "private"
+            showIncomingNotification(
+                title = if (isBroadcast) "Broadcast from ${meshManager.getAlias(senderId)}" else meshManager.getAlias(senderId),
+                body = "sent an image",
+                notificationId = senderId.hashCode() xor timestamp.toInt()
+            )
             publish("image from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: ${file.absolutePath}|$mimeType")
         }
         meshManager.setPeerListener { nodeId, event ->
@@ -153,7 +163,7 @@ class MeshNetworkService : Service() {
 
     fun getLocalFingerprint(): String = meshManager.getLocalFingerprint()
 
-    fun peerCount(): Int = meshManager.getKnownPeers().size + wifiDirectSocketManager.peerCount()
+    fun peerCount(): Int = knownPeers().size
 
     fun meshTransportStatus(): String {
         val relay = emulatorRelayTransport
@@ -378,13 +388,49 @@ class MeshNetworkService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
+            val meshChannel = NotificationChannel(
                 CHANNEL_ID,
                 "Mesh network",
                 NotificationManager.IMPORTANCE_LOW
             )
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+            val messagesChannel = NotificationChannel(
+                MESSAGES_CHANNEL_ID,
+                "Messages",
+                NotificationManager.IMPORTANCE_DEFAULT
+            )
+            getSystemService(NotificationManager::class.java).apply {
+                createNotificationChannel(meshChannel)
+                createNotificationChannel(messagesChannel)
+            }
         }
+    }
+
+    private fun showIncomingNotification(title: String, body: String, notificationId: Int) {
+        val manager = getSystemService(NotificationManager::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            notificationId,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = Notification.Builder(this, MESSAGES_CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .build()
+        manager.notify(notificationId, notification)
     }
 
     private fun UUID.shortId(): String = toString().take(8)
@@ -408,8 +454,7 @@ class MeshNetworkService : Service() {
     }
 
     private fun shouldUseDevRelay(): Boolean {
-        val isDebuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
-        return isDebuggable || isProbablyEmulator()
+        return isProbablyEmulator()
     }
 
     private fun SendResult.label(): String = when (this) {
@@ -420,6 +465,7 @@ class MeshNetworkService : Service() {
 
     companion object {
         private const val CHANNEL_ID = "mesh_network"
+        private const val MESSAGES_CHANNEL_ID = "mesh_messages"
         private const val NOTIFICATION_ID = 1001
         private const val MAX_NICKNAME_LENGTH = 12
         private const val KEY_NICKNAME_CHANGED_AT = "nickname_changed_at"

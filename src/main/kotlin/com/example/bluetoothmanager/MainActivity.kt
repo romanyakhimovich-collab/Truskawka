@@ -21,6 +21,7 @@ import android.graphics.PorterDuff
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -70,7 +71,7 @@ class MainActivity : Activity() {
     private var savedMessagesSelected = false
     private var normalizingNickname = false
     private var nicknameDialogShowing = false
-    private var currentNickname = "@jachimowicz"
+    private var currentNickname = "@your name"
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val messages = mutableListOf(
@@ -119,7 +120,7 @@ class MainActivity : Activity() {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             meshService = (service as MeshNetworkService.LocalBinder).service()
             meshService?.addLogListener(logListener)
-            currentNickname = meshService?.getNickname()?.take(MAX_NICKNAME_LENGTH) ?: "@jachimowicz"
+            currentNickname = meshService?.getNickname()?.take(MAX_NICKNAME_LENGTH) ?: "@your name"
             usernameField.setText(currentNickname)
             meshService?.startNearbyDiscovery(silent = true)
             syncKnownPeers()
@@ -1720,7 +1721,7 @@ class MainActivity : Activity() {
                 setTextColor(BERRY_TEXT)
                 gravity = Gravity.CENTER
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            addView(terminalText("Truskawka needs Bluetooth and Nearby permissions to find phones around you. Internet and router Wi-Fi are not required.").apply {
+            addView(terminalText("Truskawka needs full Bluetooth, Nearby devices, and Location access so mesh radio can advertise and scan for phones around you. Internet and router Wi-Fi are not required.").apply {
                 textSize = 14f
                 setTextColor(BERRY_TEXT_DIM)
                 gravity = Gravity.CENTER
@@ -1764,11 +1765,13 @@ class MainActivity : Activity() {
             startAppAfterPermissions()
         } else {
             addMessage("system", "permissions denied: mesh radio offline", false)
+            showPermissionRecovery()
         }
     }
 
     private fun startAppAfterPermissions() {
         if (!ensureBluetoothEnabled()) return
+        if (!ensureLocationEnabled()) return
         startAndBindMeshService()
     }
 
@@ -1787,13 +1790,30 @@ class MainActivity : Activity() {
         return true
     }
 
+    private fun ensureLocationEnabled(): Boolean {
+        val locationManager = getSystemService(LocationManager::class.java)
+        val enabled = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                locationManager.isLocationEnabled
+            } else {
+                locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+                    locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+            }
+        }.getOrDefault(false)
+        if (!enabled) {
+            addMessage("system", "location disabled: bluetooth scan may be blocked", false)
+            startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+            return false
+        }
+        return true
+    }
+
     private fun hasRequiredPermissions(): Boolean =
         requiredPermissions().all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
 
     private fun requiredPermissions(): List<String> = buildList {
-        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2) {
-            add(Manifest.permission.ACCESS_FINE_LOCATION)
-        }
+        add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        add(Manifest.permission.ACCESS_FINE_LOCATION)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             add(Manifest.permission.BLUETOOTH_SCAN)
             add(Manifest.permission.BLUETOOTH_ADVERTISE)
@@ -1802,6 +1822,21 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             add(Manifest.permission.NEARBY_WIFI_DEVICES)
             add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    private fun showPermissionRecovery() {
+        Toast.makeText(
+            this,
+            "Allow Bluetooth, Nearby devices, and Location for mesh radio",
+            Toast.LENGTH_LONG
+        ).show()
+        runCatching {
+            startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.fromParts("package", packageName, null)
+                }
+            )
         }
     }
 

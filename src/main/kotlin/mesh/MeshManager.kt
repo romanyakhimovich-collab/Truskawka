@@ -607,7 +607,12 @@ class MeshManager(
         this.transportLogListener = listener
     }
 
-    fun getKnownPeers(): List<PeerInfo> = knownPeers.values.toList()
+    fun getKnownPeers(): List<PeerInfo> {
+        pruneStalePeers()
+        return knownPeers.values
+            .sortedByDescending { it.lastSeen }
+            .toList()
+    }
 
     fun getAlias(nodeId: UUID): String = aliases[nodeId]
         ?: knownPeers[nodeId]?.displayName
@@ -619,6 +624,12 @@ class MeshManager(
         crypto.getSessionInfo(nodeId)?.peerFingerprint?.let {
             crypto.markPeerAsVerified(it)
         }
+    }
+
+    private fun pruneStalePeers() {
+        val now = System.currentTimeMillis()
+        knownPeers.entries.removeIf { now - it.value.lastSeen > KNOWN_PEER_MAX_AGE_MS }
+        aliases.entries.removeIf { (nodeId, _) -> !knownPeers.containsKey(nodeId) }
     }
 }
 
@@ -669,6 +680,7 @@ private val FILE_CHUNK_MAGIC = byteArrayOf('I'.code.toByte(), 'M'.code.toByte(),
 private const val FILE_CHUNK_SIZE = 384
 private const val MAX_IMAGE_BYTES = 2 * 1024 * 1024
 private const val MAX_IMAGE_CHUNKS = 6000
+private const val KNOWN_PEER_MAX_AGE_MS = 60_000L
 
 private fun ByteArray.asIterableChunks(size: Int): List<ByteArray> =
     indices.step(size).map { start ->
