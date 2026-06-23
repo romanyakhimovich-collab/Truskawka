@@ -9,6 +9,8 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -21,6 +23,7 @@ import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.location.LocationManager
 import android.media.MediaPlayer
@@ -55,18 +58,26 @@ import android.widget.ImageView
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import mesh.SendResult
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.charset.StandardCharsets
+import java.util.zip.CRC32
 import java.util.Calendar
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.text.DateFormat
 import java.security.MessageDigest
+import java.security.SecureRandom
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
@@ -81,6 +92,21 @@ class MainActivity : Activity() {
     private var chatListShownAtStartup = false
     private var darkThemeEnabled = false
     private var selectedLanguage = AppLanguage.EN
+    private var appLockEnabled = false
+    private var appLockPin = ""
+    private var appLockTimeoutMinutes = 5
+    private var lastUnlockAt = 0L
+    private var appLockDialogVisible = false
+    private var appWentBackgroundAt = 0L
+    private var notificationEnabled = true
+    private var notificationPreviewEnabled = true
+    private var notificationBroadcastEnabled = true
+    private var compactChatListEnabled = false
+    private var messageTextScale = 1.0f
+    private var use24HourFormat = true
+    private var shortDateFormatEnabled = false
+    private var meshAggressiveMode = true
+    private var meshMaxHops = 8
     private var isRecordingVoice = false
     private var recorder: MediaRecorder? = null
     private var recordingFile: File? = null
@@ -88,6 +114,14 @@ class MainActivity : Activity() {
     private var activePlayer: MediaPlayer? = null
     private var activePlayingPath: String? = null
     private val audioDurationCache = mutableMapOf<String, String>()
+    private var replyTarget: ChatMessage? = null
+    private lateinit var replyBar: LinearLayout
+    private lateinit var replyTextView: TextView
+    private var sentCounter = 0
+    private var deliveredCounter = 0
+    private var readCounter = 0
+    private var failedCounter = 0
+    private var lastRelayInfo = "-"
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val messages = mutableListOf(
@@ -108,12 +142,26 @@ class MainActivity : Activity() {
     private lateinit var transferStatusView: TextView
     private lateinit var messageInput: EditText
     private lateinit var actionButton: TextView
+    private var backupProgressDialog: Dialog? = null
+    private var backupProgressText: TextView? = null
+    private var backupOperationRunning = false
+    private var backupRestoreErrorMessage: String? = null
+    private val pendingSendTimeouts = mutableMapOf<Long, Runnable>()
+    private val pendingTextRetries = mutableMapOf<Long, Runnable>()
     private lateinit var chatStore: ChatStore
-    private val messageTimeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
-    private val messageDateFormat = SimpleDateFormat("d MMMM yyyy", Locale.getDefault())
+    private var messageTimeFormat: java.text.DateFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+    private var messageDateFormat: java.text.DateFormat = SimpleDateFormat("d MMMM yyyy", Locale.getDefault())
     private val voiceStopRunnable = Runnable {
         if (isRecordingVoice) {
             stopVoiceRecordingAndSend(forceSend = true)
+        }
+    }
+    private val recordingTicker = object : Runnable {
+        override fun run() {
+            if (!isRecordingVoice) return
+            val elapsed = (System.currentTimeMillis() - recordingStartedAt).coerceAtLeast(0L)
+            showImageProgress("${tr("recording_voice")} ${formatDuration(elapsed)} ${recordingWave(elapsed)}")
+            mainHandler.postDelayed(this, 220L)
         }
     }
 
@@ -129,10 +177,15 @@ class MainActivity : Activity() {
             } else if (line.startsWith("message from ")) {
                 addReceivedText(line)
             } else if (line.startsWith("message delivered:")) {
+                deliveredCounter += 1
                 updateMessageStatus(line.substringAfter(":").trim(), MessageStatus.DELIVERED)
             } else if (line.startsWith("message read:")) {
+                readCounter += 1
                 updateMessageStatus(line.substringAfter(":").trim(), MessageStatus.READ)
             } else if (!line.isScanNoise()) {
+                if (line.contains("relay", ignoreCase = true) || line.contains("wifi-direct", ignoreCase = true)) {
+                    lastRelayInfo = line
+                }
                 addMessage("mesh", line, false)
             }
             refreshHeader()
@@ -143,6 +196,13 @@ class MainActivity : Activity() {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             meshService = (service as MeshNetworkService.LocalBinder).service()
             meshService?.addLogListener(logListener)
+            meshService?.configureNotificationSettings(
+                enabled = notificationEnabled,
+                showPreview = notificationPreviewEnabled,
+                includeBroadcast = notificationBroadcastEnabled
+            )
+            meshService?.configureDiscovery(meshAggressiveMode)
+            meshService?.configureMaxRelayHops(meshMaxHops)
             currentNickname = meshService?.getNickname()?.take(MAX_NICKNAME_LENGTH) ?: "@your name"
             usernameField.setText(contactDisplayName())
             meshService?.startNearbyDiscovery(silent = true)
@@ -165,9 +225,11 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         loadUiSettings()
+        applyDateTimeFormat()
         applyThemePalette()
         chatStore = ChatStore(this)
         loadStoredMessages()
+        cleanupMediaCache()
         buildUi()
         if (!chatListShownAtStartup) {
             chatListShownAtStartup = true
@@ -183,15 +245,25 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        ensureAppUnlocked()
         if (hasRequiredPermissions() && !serviceBound) {
             startAppAfterPermissions()
         }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        appWentBackgroundAt = System.currentTimeMillis()
     }
 
     override fun onDestroy() {
         meshService?.removeLogListener(logListener)
         stopVoiceRecording(cleanupOnly = true)
         releaseAudioPlayer()
+        pendingSendTimeouts.values.forEach { mainHandler.removeCallbacks(it) }
+        pendingSendTimeouts.clear()
+        pendingTextRetries.values.forEach { mainHandler.removeCallbacks(it) }
+        pendingTextRetries.clear()
         if (serviceBound) {
             unbindService(connection)
             serviceBound = false
@@ -230,11 +302,37 @@ class MainActivity : Activity() {
         transferStatusView = buildTransferStatus()
         root.addView(transferStatusView)
 
+        replyBar = buildReplyBar()
+        root.addView(replyBar)
+
         val inputBar = buildInputBar()
         root.addView(inputBar)
         applySafeArea(root, inputBar)
         setContentView(root)
     }
+
+    private fun buildReplyBar(): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = roundedDrawable(SERVICE_BUBBLE, dp(14), SERVICE_BUBBLE_STROKE)
+            visibility = View.GONE
+            replyTextView = terminalText("").apply {
+                textSize = 12f
+                setTextColor(BERRY_TEXT_DIM)
+                maxLines = 2
+            }
+            addView(replyTextView, LinearLayout.LayoutParams(
+                0,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                1f
+            ))
+            addView(terminalAction("X").apply {
+                textSize = 14f
+                setOnClickListener { clearReplyTarget() }
+            })
+        }
 
     private fun buildHeader(): LinearLayout {
         return LinearLayout(this).apply {
@@ -383,16 +481,29 @@ class MainActivity : Activity() {
                 minWidth = dp(46)
                 minHeight = dp(46)
                 setOnClickListener { handleInputAction() }
+                var downX = 0f
+                var canceledBySwipe = false
                 setOnTouchListener { v, event ->
                     if (messageInput.text.toString().isNotBlank()) return@setOnTouchListener false
                     when (event.actionMasked) {
                         MotionEvent.ACTION_DOWN -> {
+                            downX = event.x
+                            canceledBySwipe = false
                             startVoiceRecording()
+                            true
+                        }
+                        MotionEvent.ACTION_MOVE -> {
+                            if (isRecordingVoice && event.x < downX - dp(64)) {
+                                canceledBySwipe = true
+                                stopVoiceRecording(cleanupOnly = true)
+                                showImageProgress(tr("voice_canceled"))
+                                mainHandler.postDelayed({ hideImageProgress() }, 900L)
+                            }
                             true
                         }
                         MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                             v.performClick()
-                            if (isRecordingVoice) {
+                            if (isRecordingVoice && !canceledBySwipe) {
                                 stopVoiceRecordingAndSend(forceSend = false)
                             }
                             true
@@ -402,6 +513,7 @@ class MainActivity : Activity() {
                 }
             }
             addView(actionButton)
+            updateActionButton()
         }
     }
 
@@ -604,10 +716,14 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated Android callback is enough for this minimal Activity.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != IMAGE_PICK_REQUEST || resultCode != RESULT_OK) return
+        if (resultCode != RESULT_OK) return
         val uri = data?.data ?: return
         takePersistableUriPermissionIfPossible(uri, data.flags)
-        showSelectedImageComposer(uri)
+        when (requestCode) {
+            IMAGE_PICK_REQUEST -> showSelectedImageComposer(uri)
+            BACKUP_EXPORT_REQUEST -> exportEncryptedBackupTo(uri)
+            BACKUP_IMPORT_REQUEST -> importEncryptedBackup(uri)
+        }
     }
 
     private fun showSelectedImageComposer(uri: Uri) {
@@ -688,6 +804,10 @@ class MainActivity : Activity() {
     }
 
     private fun sendSelectedImage(uri: Uri, caption: String) {
+        if (!isRecipientWithinHopLimit(selectedRecipientId)) {
+            addMessage("mesh", tr("mesh_hop_limit_reached"), false)
+            return
+        }
         val fileName = queryDisplayName(uri)
         showImageProgress(tr("preparing_image"))
 
@@ -711,6 +831,7 @@ class MainActivity : Activity() {
 
             val localPath = copyImageToLocalFile(prepared.fileName, prepared.bytes).absolutePath
             val author = usernameField.text.toString().prefixAt()
+            val localImageHolder = arrayOfNulls<ChatMessage>(1)
 
             runOnUiThread {
                 if (savedMessagesSelected) {
@@ -720,13 +841,19 @@ class MainActivity : Activity() {
                     }
                     hideImageProgress()
                 } else {
-                    addImageMessage(author, localPath, mine = true)
+                    localImageHolder[0] = addImageMessage(
+                        author = author,
+                        imagePath = localPath,
+                        mine = true,
+                        status = if (selectedRecipientId == null) null else MessageStatus.SENDING
+                    )
                     showImageProgress(tr("sending_image"))
                 }
             }
 
             if (savedMessagesSelected) return@thread
 
+            sentCounter += 1
             val result = meshService?.sendImage(
                 selectedRecipientId?.toString(),
                 prepared.fileName,
@@ -735,9 +862,18 @@ class MainActivity : Activity() {
             ) ?: SendResult.Failed("service offline")
             runOnUiThread {
                 if (result is SendResult.Failed) {
+                    localImageHolder[0]?.let {
+                        it.status = null
+                        persistChatMessageIdentity(it)
+                    }
+                    failedCounter += 1
                     hideImageProgress()
                     addMessage("mesh", result.toUiText(), false)
                 } else {
+                    localImageHolder[0]?.let {
+                        it.status = if (selectedRecipientId == null) null else MessageStatus.DELIVERED
+                        persistChatMessageIdentity(it)
+                    }
                     if (caption.isNotBlank()) {
                         sendTextMessage(caption)
                     }
@@ -750,38 +886,58 @@ class MainActivity : Activity() {
 
     private fun sendTextMessage(text: String) {
         if (text.isBlank()) return
+        val payloadText = applyReplyToBody(text)
         val author = usernameField.text.toString().prefixAt()
         val targetId = selectedRecipientId
+        if (!isRecipientWithinHopLimit(targetId)) {
+            addMessage("mesh", tr("mesh_hop_limit_reached"), false)
+            return
+        }
         if (savedMessagesSelected) {
-            saveLocalMessage(ChatMessage(author, text, true, status = MessageStatus.READ))
+            saveLocalMessage(ChatMessage(author, payloadText, true, status = MessageStatus.READ))
             return
         }
         val localMessage = addMessage(
             author = author,
-            body = text,
+            body = payloadText,
             mine = true,
             status = if (targetId == null) null else MessageStatus.SENDING
         )
-        val result = if (targetId == null) {
-            meshService?.broadcastMessage(text)
-        } else {
-            meshService?.sendMessage(targetId.toString(), text)
-        } ?: SendResult.Failed("service offline")
+        if (targetId != null) {
+            scheduleSendTimeout(localMessage)
+        }
+        sentCounter += 1
+        val result = attemptTextSend(targetId, payloadText)
         when (result) {
             is SendResult.Sent -> {
                 if (targetId != null) {
                     localMessage.messageId = result.messageId
                     persistChatMessageIdentity(localMessage)
+                    clearTextRetry(localMessage.localId)
                 }
             }
-            is SendResult.Failed -> addMessage("mesh", result.toUiText(), false)
-            is SendResult.Queued -> Unit
+            is SendResult.Failed -> {
+                if (targetId != null) {
+                    scheduleTextRetry(localMessage, targetId, payloadText)
+                } else {
+                    localMessage.status = MessageStatus.FAILED
+                    persistChatMessageIdentity(localMessage)
+                    clearSendTimeout(localMessage.localId)
+                    failedCounter += 1
+                    addMessage("mesh", result.toUiText(), false)
+                }
+            }
+            is SendResult.Queued -> {
+                if (targetId != null) {
+                    scheduleTextRetry(localMessage, targetId, payloadText)
+                }
+            }
         }
     }
 
     private fun startVoiceRecording() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestMissingPermissions()
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), RECORD_AUDIO_REQUEST_CODE)
             Toast.makeText(this, tr("mic_permission_needed"), Toast.LENGTH_SHORT).show()
             return
         }
@@ -816,7 +972,8 @@ class MainActivity : Activity() {
         recordingStartedAt = System.currentTimeMillis()
         isRecordingVoice = true
         updateActionButton()
-        showImageProgress(tr("recording_voice"))
+        showImageProgress("${tr("recording_voice")} 00:00")
+        mainHandler.post(recordingTicker)
         mainHandler.postDelayed(voiceStopRunnable, VOICE_MAX_DURATION_MS)
     }
 
@@ -840,6 +997,8 @@ class MainActivity : Activity() {
 
     private fun stopVoiceRecording(cleanupOnly: Boolean) {
         mainHandler.removeCallbacks(voiceStopRunnable)
+        mainHandler.removeCallbacks(recordingTicker)
+        val pendingFile = recordingFile
         val current = recorder
         recorder = null
         if (current != null) {
@@ -852,6 +1011,9 @@ class MainActivity : Activity() {
         if (cleanupOnly) {
             recordingFile = null
             recordingStartedAt = 0L
+            if (pendingFile != null && pendingFile.exists()) {
+                runCatching { pendingFile.delete() }
+            }
             hideImageProgress()
             return
         }
@@ -859,7 +1021,22 @@ class MainActivity : Activity() {
         hideImageProgress()
     }
 
+    private fun isRecipientWithinHopLimit(targetId: UUID?): Boolean {
+        if (targetId == null || savedMessagesSelected) return true
+        val peer = meshService?.knownPeers().orEmpty().firstOrNull { it.nodeId == targetId } ?: return true
+        return peer.hopCount <= meshMaxHops
+    }
+
     private fun sendPreparedVoice(file: File) {
+        val targetId = selectedRecipientId
+        if (!isRecipientWithinHopLimit(targetId)) {
+            addMessage("mesh", tr("mesh_hop_limit_reached"), false)
+            return
+        }
+        if (targetId != null && !isPeerOnline(targetId)) {
+            addMessage("mesh", "${tr("voice_send_failed")}: ${tr("offline")}", false)
+            return
+        }
         val bytes = runCatching { file.readBytes() }.getOrNull()
         if (bytes == null || bytes.isEmpty()) {
             addMessage("mesh", tr("voice_read_failed"), false)
@@ -877,27 +1054,40 @@ class MainActivity : Activity() {
             )
             return
         }
+        targetId?.let { meshService?.prepareChatWith(it.toString()) }
         val localMessage = addAudioMessage(
             author = author,
             audioPath = file.absolutePath,
             mine = true,
             timestamp = timestamp,
-            status = if (selectedRecipientId == null) null else MessageStatus.SENDING
+            status = if (targetId == null) null else MessageStatus.SENDING
         )
         showImageProgress(tr("sending_voice"))
+        sentCounter += 1
         thread(name = "voice-send") {
-            val result = meshService?.sendImage(
-                selectedRecipientId?.toString(),
+            var result = meshService?.sendImage(
+                targetId?.toString(),
                 file.name,
                 "audio/mp4",
                 bytes
             ) ?: SendResult.Failed("service offline")
+            if (result is SendResult.Failed && targetId != null) {
+                meshService?.prepareChatWith(targetId.toString())
+                Thread.sleep(220L)
+                result = meshService?.sendImage(
+                    targetId.toString(),
+                    file.name,
+                    "audio/mp4",
+                    bytes
+                ) ?: SendResult.Failed("service offline")
+            }
             runOnUiThread {
                 if (result is SendResult.Failed) {
                     localMessage.status = null
                     persistChatMessageIdentity(localMessage)
+                    failedCounter += 1
                     addMessage("mesh", result.toUiText(), false)
-                } else if (result is SendResult.Sent && selectedRecipientId != null) {
+                } else if (result is SendResult.Sent && targetId != null) {
                     localMessage.messageId = result.messageId
                     persistChatMessageIdentity(localMessage)
                 }
@@ -981,6 +1171,58 @@ class MainActivity : Activity() {
 
         val summaries = chatStore.listChats()
             .filter { it.kind != ChatKind.PEER.name || it.peerId != null }
+        val uiPrefs = getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+        val quickStartHidden = uiPrefs.getBoolean(UI_SETTINGS_QUICK_START_HIDDEN, false)
+        if (!quickStartHidden) {
+            listContent.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                setPadding(dp(12), dp(12), dp(12), dp(12))
+                addView(terminalText(tr("quick_start_title")).apply {
+                    textSize = 15f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(BERRY_TEXT)
+                })
+                addView(terminalText("1. ${tr("quick_start_step_1")}").apply {
+                    textSize = 12f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setPadding(0, dp(6), 0, 0)
+                })
+                addView(terminalText("2. ${tr("quick_start_step_2")}").apply {
+                    textSize = 12f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setPadding(0, dp(4), 0, 0)
+                })
+                addView(terminalText("3. ${tr("quick_start_step_3")}").apply {
+                    textSize = 12f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setPadding(0, dp(4), 0, 0)
+                })
+                addView(terminalAction(tr("got_it")).apply {
+                    textSize = 13f
+                    setTextColor(Color.WHITE)
+                    gravity = Gravity.CENTER
+                    background = roundedDrawable(STRAWBERRY_RED, dp(14))
+                    setPadding(dp(12), dp(7), dp(12), dp(7))
+                    setOnClickListener {
+                        uiPrefs.edit().putBoolean(UI_SETTINGS_QUICK_START_HIDDEN, true).apply()
+                        dialog.dismiss()
+                        showChatList()
+                    }
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    topMargin = dp(10)
+                    gravity = Gravity.END
+                })
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(10)
+            })
+        }
         if (summaries.isEmpty()) {
             listContent.addView(terminalText(tr("no_chats_yet")).apply {
                 textSize = 14f
@@ -1075,6 +1317,7 @@ class MainActivity : Activity() {
         onClick: () -> Unit,
         onLongClick: () -> Unit
     ): LinearLayout {
+        val compact = compactChatListEnabled
         val presence = summaryPresence(summary)
         val displayTitle = summaryDisplayTitle(summary)
         val preview = when {
@@ -1090,7 +1333,7 @@ class MainActivity : Activity() {
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14), dp(12), dp(14), dp(12))
+            setPadding(dp(14), if (compact) dp(9) else dp(12), dp(14), if (compact) dp(9) else dp(12))
             background = roundedDrawable(
                 if (selected) ACCENT_PINK else INPUT_SURFACE,
                 dp(20),
@@ -1103,38 +1346,38 @@ class MainActivity : Activity() {
                     else -> if (summary.verified) "ok" else "@"
                 }
                 typeface = Typeface.DEFAULT_BOLD
-                textSize = 13f
+                textSize = if (compact) 12f else 13f
                 gravity = Gravity.CENTER
                 setTextColor(STRAWBERRY_RED)
                 background = circleDrawable(0x33FFB7C5)
-            }, LinearLayout.LayoutParams(dp(38), dp(38)).apply {
+            }, LinearLayout.LayoutParams(if (compact) dp(34) else dp(38), if (compact) dp(34) else dp(38)).apply {
                 marginEnd = dp(12)
             })
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 addView(terminalText(displayTitle).apply {
-                    textSize = 16f
+                    textSize = if (compact) 15f else 16f
                     typeface = Typeface.DEFAULT_BOLD
                     setTextColor(BERRY_TEXT)
                     maxLines = 1
                 })
                 if (summary.pinned) {
                     addView(terminalText(tr("pinned")).apply {
-                        textSize = 11f
+                        textSize = if (compact) 10f else 11f
                         typeface = Typeface.DEFAULT_BOLD
                         setTextColor(STRAWBERRY_RED)
                         setPadding(0, dp(2), 0, 0)
                     })
                 }
                 addView(terminalText(preview).apply {
-                    textSize = 12f
+                    textSize = if (compact) 11f else 12f
                     setTextColor(BERRY_TEXT_DIM)
                     maxLines = 1
                     setPadding(0, dp(4), 0, 0)
                 })
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(terminalText(presence.first).apply {
-                textSize = 11f
+                textSize = if (compact) 10f else 11f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(if (presence.second) LEAF_GREEN else BERRY_TEXT_DIM)
                 background = roundedDrawable(0x14FF4359, dp(12), SOFT_PINK_STROKE)
@@ -1148,7 +1391,7 @@ class MainActivity : Activity() {
             if (summary.unreadCount > 0) {
                 addView(View(this@MainActivity).apply {
                     background = circleDrawable(STRAWBERRY_RED)
-                }, LinearLayout.LayoutParams(dp(10), dp(10)))
+                }, LinearLayout.LayoutParams(if (compact) dp(8) else dp(10), if (compact) dp(8) else dp(10)))
             }
             setOnClickListener { onClick() }
             setOnLongClickListener {
@@ -1177,7 +1420,7 @@ class MainActivity : Activity() {
             setBackgroundColor(SOFT_PINK_PANEL)
         }
 
-        val nearbyTitle = terminalText("${tr("patch")} ${meshService?.peerCount() ?: 0}").apply {
+        val nearbyTitle = terminalText(tr("new_contacts")).apply {
             textSize = 20f
             setTextColor(BERRY_TEXT)
         }
@@ -1209,7 +1452,6 @@ class MainActivity : Activity() {
         }
         fun refreshPeopleRows() {
             val peerCount = meshService?.peerCount() ?: 0
-            nearbyTitle.text = "${tr("patch")} $peerCount"
             transportStatus.text = meshService?.meshTransportStatus() ?: tr("mesh_starting")
             counterView.text = peerCount.toString()
             peopleContainer.removeAllViews()
@@ -1226,6 +1468,7 @@ class MainActivity : Activity() {
             }
             val directPeers = peers.filter { it.isDirect || it.hopCount <= 1 }
             val meshPeers = peers.filterNot { it.isDirect || it.hopCount <= 1 }
+                .filter { it.hopCount <= meshMaxHops }
             radarView.setPeerCounts(directPeers.size, meshPeers.size)
 
             peopleContainer.addView(terminalText("${tr("direct_in_range")} (${directPeers.size})").apply {
@@ -1302,11 +1545,6 @@ class MainActivity : Activity() {
         }
         val contentContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(terminalText(tr("patch_upper")).apply {
-                textSize = 15f
-                setPadding(0, dp(18), 0, dp(10))
-                setTextColor(BERRY_TEXT)
-            })
             addView(searchInput, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -1601,14 +1839,12 @@ class MainActivity : Activity() {
 
     private fun addReceivedText(line: String) {
         val meta = line.substringAfter("message from ", "")
-        val sender = parseIncomingSender(meta.substringBefore(" at ", "@peer"))
+        val incoming = parseIncomingMeta(meta)
+        val sender = parseIncomingSender(incoming.senderRaw)
         if (isSelfSender(sender.nodeId)) return
         val author = sender.label
-        val timestampAndBody = meta.substringAfter(" at ", "")
-        val timestamp = timestampAndBody.substringBefore(": ", "")
-            .toLongOrNull()
-            ?: System.currentTimeMillis()
-        val body = timestampAndBody.substringAfter(": ", line)
+        val timestamp = incoming.timestamp
+        val body = incoming.payload
         if (body.startsWith(CONTROL_PREFIX)) {
             handleIncomingControl(sender, body)
             return
@@ -1621,14 +1857,12 @@ class MainActivity : Activity() {
 
     private fun addReceivedImage(line: String) {
         val meta = line.substringAfter("image from ", "")
-        val sender = parseIncomingSender(meta.substringBefore(" at ", "@peer"))
+        val incoming = parseIncomingMeta(meta)
+        val sender = parseIncomingSender(incoming.senderRaw)
         if (isSelfSender(sender.nodeId)) return
         val author = sender.label
-        val timestampAndPayload = meta.substringAfter(" at ", "")
-        val timestamp = timestampAndPayload.substringBefore(": ", "")
-            .toLongOrNull()
-            ?: System.currentTimeMillis()
-        val payload = timestampAndPayload.substringAfter(": ", line.substringAfter(": ", ""))
+        val timestamp = incoming.timestamp
+        val payload = incoming.payload
         val imagePath = payload.substringBefore("|")
         if (imagePath.isBlank()) return
         if (!File(imagePath).exists()) {
@@ -1645,14 +1879,12 @@ class MainActivity : Activity() {
 
     private fun addReceivedAudio(line: String) {
         val meta = line.substringAfter("audio from ", "")
-        val sender = parseIncomingSender(meta.substringBefore(" at ", "@peer"))
+        val incoming = parseIncomingMeta(meta)
+        val sender = parseIncomingSender(incoming.senderRaw)
         if (isSelfSender(sender.nodeId)) return
         val author = sender.label
-        val timestampAndPayload = meta.substringAfter(" at ", "")
-        val timestamp = timestampAndPayload.substringBefore(": ", "")
-            .toLongOrNull()
-            ?: System.currentTimeMillis()
-        val payload = timestampAndPayload.substringAfter(": ", line.substringAfter(": ", ""))
+        val timestamp = incoming.timestamp
+        val payload = incoming.payload
         val audioPath = payload.substringBefore("|")
         if (audioPath.isBlank()) return
         if (!File(audioPath).exists()) {
@@ -1687,6 +1919,8 @@ class MainActivity : Activity() {
                     .forEach { message ->
                         if (message.status != MessageStatus.READ) {
                             message.status = status
+                            clearSendTimeout(message.localId)
+                            clearTextRetry(message.localId)
                             changed = true
                         }
                     }
@@ -1695,6 +1929,77 @@ class MainActivity : Activity() {
             chatStore.updateStatusByMeshMessageId(messageId.toString(), status.name)
             chatAdapter.notifyDataSetChanged()
         }
+    }
+
+    private fun attemptTextSend(targetId: UUID?, payload: String): SendResult {
+        if (targetId != null) {
+            meshService?.startNearbyDiscovery(silent = true)
+            meshService?.prepareChatWith(targetId.toString())
+        }
+        return if (targetId == null) {
+            meshService?.broadcastMessage(payload)
+        } else {
+            meshService?.sendMessage(targetId.toString(), payload)
+        } ?: SendResult.Failed("service offline")
+    }
+
+    private fun scheduleTextRetry(message: ChatMessage, targetId: UUID, payload: String) {
+        val localId = message.localId
+        if (localId <= 0L) return
+        clearTextRetry(localId)
+        var attempts = 0
+        lateinit var task: Runnable
+        task = Runnable {
+            if (message.status != MessageStatus.SENDING) {
+                clearTextRetry(localId)
+                return@Runnable
+            }
+            attempts += 1
+            val result = attemptTextSend(targetId, payload)
+            when (result) {
+                is SendResult.Sent -> {
+                    message.messageId = result.messageId
+                    persistChatMessageIdentity(message)
+                    clearTextRetry(localId)
+                }
+                is SendResult.Failed, is SendResult.Queued -> {
+                    if (attempts >= MESSAGE_RETRY_ATTEMPTS) {
+                        clearTextRetry(localId)
+                    } else {
+                        mainHandler.postDelayed(task, MESSAGE_RETRY_INTERVAL_MS)
+                    }
+                }
+            }
+        }
+        pendingTextRetries[localId] = task
+        mainHandler.postDelayed(task, MESSAGE_RETRY_INTERVAL_MS)
+    }
+
+    private fun clearTextRetry(localId: Long) {
+        if (localId <= 0L) return
+        pendingTextRetries.remove(localId)?.let { mainHandler.removeCallbacks(it) }
+    }
+
+    private fun scheduleSendTimeout(message: ChatMessage) {
+        val localId = message.localId
+        if (localId <= 0L) return
+        clearSendTimeout(localId)
+        val task = Runnable {
+            pendingSendTimeouts.remove(localId)
+            if (message.status != MessageStatus.SENDING) return@Runnable
+            message.status = MessageStatus.FAILED
+            persistChatMessageIdentity(message)
+            clearTextRetry(localId)
+            failedCounter += 1
+            chatAdapter.notifyDataSetChanged()
+        }
+        pendingSendTimeouts[localId] = task
+        mainHandler.postDelayed(task, MESSAGE_SEND_TIMEOUT_MS)
+    }
+
+    private fun clearSendTimeout(localId: Long) {
+        if (localId <= 0L) return
+        pendingSendTimeouts.remove(localId)?.let { mainHandler.removeCallbacks(it) }
     }
 
     private fun saveLocalMessage(message: ChatMessage) {
@@ -1725,6 +2030,7 @@ class MainActivity : Activity() {
     private fun selectChat(chatKey: String, title: String, peerId: UUID?) {
         savedMessagesSelected = chatKey == CHAT_SAVED
         selectedRecipientId = peerId
+        clearReplyTarget()
         selectedRecipientLabel = when {
             chatKey == CHAT_SAVED -> "saved"
             chatKey == CHAT_EVERYONE -> "everyone"
@@ -1796,6 +2102,22 @@ class MainActivity : Activity() {
         return IncomingSender(label, nodeId, isBroadcast)
     }
 
+    private fun parseIncomingMeta(meta: String): IncomingMeta {
+        val atIndex = meta.lastIndexOf(" at ")
+        if (atIndex <= 0) {
+            return IncomingMeta("@peer", System.currentTimeMillis(), meta)
+        }
+        val senderRaw = meta.substring(0, atIndex)
+        val tail = meta.substring(atIndex + 4)
+        val splitIndex = tail.indexOf(": ")
+        if (splitIndex <= 0) {
+            return IncomingMeta(senderRaw, System.currentTimeMillis(), tail)
+        }
+        val timestamp = tail.substring(0, splitIndex).toLongOrNull() ?: System.currentTimeMillis()
+        val payload = tail.substring(splitIndex + 2)
+        return IncomingMeta(senderRaw, timestamp, payload)
+    }
+
     private fun isSelfSender(nodeId: UUID?): Boolean =
         nodeId != null && nodeId == meshService?.nodeId
 
@@ -1827,11 +2149,12 @@ class MainActivity : Activity() {
 
         stored.lineSequence()
             .mapNotNull { line ->
-                val parts = line.split("\t", limit = 6)
+                val parts = line.split("\t", limit = 7)
                 val author = parts.firstOrNull().orEmpty().ifBlank { "@me" }
                 val body = parts.getOrNull(1)?.decodeStoredText() ?: return@mapNotNull null
                 val imagePath = parts.getOrNull(2)?.decodeStoredText()?.ifBlank { null }
                 val audioPath = parts.getOrNull(5)?.decodeStoredText()?.ifBlank { null }
+                val reaction = parts.getOrNull(6)?.decodeStoredText()?.ifBlank { null }
                 val timestamp = parts.getOrNull(3)?.toLongOrNull() ?: 0L
                 val status = parts.getOrNull(4)
                     ?.takeIf { it.isNotBlank() }
@@ -1843,6 +2166,7 @@ class MainActivity : Activity() {
                     mine = true,
                     imagePath = imagePath,
                     audioPath = audioPath,
+                    reaction = reaction,
                     timestamp = timestamp.takeIf { it > 0L } ?: estimateLegacyTimestamp(),
                     status = status
                 )
@@ -1894,6 +2218,7 @@ class MainActivity : Activity() {
             mine = mine,
             imagePath = imagePath,
             audioPath = audioPath,
+            reaction = reaction,
             timestamp = timestamp,
             meshMessageId = messageId?.toString(),
             status = status?.name
@@ -1906,6 +2231,7 @@ class MainActivity : Activity() {
             mine = mine,
             imagePath = imagePath,
             audioPath = audioPath,
+            reaction = reaction,
             timestamp = timestamp,
             messageId = meshMessageId?.let { runCatching { UUID.fromString(it) }.getOrNull() },
             status = status?.let { runCatching { MessageStatus.valueOf(it) }.getOrNull() } ?: defaultStatus,
@@ -1919,7 +2245,7 @@ class MainActivity : Activity() {
             ?: System.currentTimeMillis()
 
     private fun ChatMessage.displayAuthor(): String =
-        if (mine) currentNickname else author
+        if (mine) contactDisplayName() else author.removePrefix("@")
 
     private fun ChatMessage.displayTime(): String =
         messageTimeFormat.format(Date(timestamp))
@@ -1945,6 +2271,36 @@ class MainActivity : Activity() {
             selectedRecipientId == null -> tr("hint_type_message")
             else -> "${tr("hint_message")} $selectedRecipientLabel..."
         }
+    }
+
+    private fun setReplyTarget(message: ChatMessage) {
+        if (message.author == "system" || message.author == "mesh") return
+        replyTarget = message
+        val preview = when {
+            message.imagePath != null -> tr("photo")
+            message.audioPath != null -> tr("voice_message")
+            else -> message.body.take(42)
+        }
+        replyTextView.text = "${tr("replying_to")} ${message.displayAuthor()}: $preview"
+        replyBar.visibility = View.VISIBLE
+    }
+
+    private fun clearReplyTarget() {
+        replyTarget = null
+        if (::replyBar.isInitialized) {
+            replyBar.visibility = View.GONE
+        }
+    }
+
+    private fun applyReplyToBody(raw: String): String {
+        val target = replyTarget ?: return raw
+        val preview = when {
+            target.imagePath != null -> tr("photo")
+            target.audioPath != null -> tr("voice_message")
+            else -> target.body.take(40)
+        }
+        clearReplyTarget()
+        return "↪ ${target.displayAuthor()}: $preview\n$raw"
     }
 
     private fun updateChatTitle() {
@@ -2102,7 +2458,34 @@ class MainActivity : Activity() {
     private fun showOwnProfilePage() {
         val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
         val originalName = meshService?.getNickname()?.take(MAX_NICKNAME_LENGTH) ?: currentNickname
-        val input = EditText(this).apply {
+        val originalInput = EditText(this).apply {
+            setText(originalName)
+            setSingleLine(true)
+            typeface = Typeface.DEFAULT
+            textSize = 16f
+            setTextColor(BERRY_TEXT)
+            setHintTextColor(BERRY_TEXT_DIM)
+            hint = "@nickname"
+            filters = arrayOf(InputFilter.LengthFilter(MAX_NICKNAME_LENGTH))
+            background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+        }
+        var normalizingOriginal = false
+        originalInput.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+            override fun afterTextChanged(s: Editable?) {
+                if (normalizingOriginal) return
+                val current = s?.toString().orEmpty()
+                if (current.startsWith("@") && current.length <= MAX_NICKNAME_LENGTH) return
+                normalizingOriginal = true
+                val normalized = "@${current.removePrefix("@")}".take(MAX_NICKNAME_LENGTH)
+                originalInput.setText(normalized)
+                originalInput.setSelection(normalized.length.coerceAtLeast(1))
+                normalizingOriginal = false
+            }
+        })
+        val displayInput = EditText(this).apply {
             setText(getDisplayName())
             setSingleLine(true)
             typeface = Typeface.DEFAULT
@@ -2126,25 +2509,19 @@ class MainActivity : Activity() {
                 setTextColor(BERRY_TEXT)
             })
 
-            addView(terminalText(tr("original_name_fixed")).apply {
+            addView(terminalText(tr("original_name_editable")).apply {
                 textSize = 12f
                 setTextColor(BERRY_TEXT_DIM)
                 setPadding(0, dp(16), 0, dp(6))
             })
-            addView(terminalText(originalName).apply {
-                textSize = 17f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(BERRY_TEXT)
-                background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
-                setPadding(dp(14), dp(10), dp(14), dp(10))
-            })
+            addView(originalInput)
 
             addView(terminalText(tr("display_name_editable")).apply {
                 textSize = 12f
                 setTextColor(BERRY_TEXT_DIM)
                 setPadding(0, dp(14), 0, dp(6))
             })
-            addView(input)
+            addView(displayInput)
 
             addView(terminalAction(tr("save")).apply {
                 textSize = 16f
@@ -2153,7 +2530,29 @@ class MainActivity : Activity() {
                 background = roundedDrawable(STRAWBERRY_RED, dp(18))
                 setPadding(dp(14), dp(10), dp(14), dp(10))
                 setOnClickListener {
-                    setDisplayName(input.text?.toString().orEmpty())
+                    val previousNickname = currentNickname
+                    val requestedNickname = originalInput.text?.toString()
+                        .orEmpty()
+                        .trim()
+                        .ifBlank { previousNickname }
+                        .prefixAt()
+                        .take(MAX_NICKNAME_LENGTH)
+                    val service = meshService
+                    val appliedNickname = if (service == null) {
+                        Toast.makeText(this@MainActivity, tr("nickname_change_online_only"), Toast.LENGTH_SHORT).show()
+                        previousNickname
+                    } else {
+                        service.setNickname(requestedNickname).take(MAX_NICKNAME_LENGTH).also { display ->
+                            if (display != requestedNickname) {
+                                Toast.makeText(this@MainActivity, tr("nickname_change_once_week"), Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                    if (appliedNickname != previousNickname) {
+                        currentNickname = appliedNickname
+                        renameLocalMessages(previousNickname, appliedNickname)
+                    }
+                    setDisplayName(displayInput.text?.toString().orEmpty())
                     usernameField.setText(contactDisplayName())
                     Toast.makeText(this@MainActivity, tr("profile_updated"), Toast.LENGTH_SHORT).show()
                     dialog.dismiss()
@@ -2204,8 +2603,26 @@ class MainActivity : Activity() {
 
     private fun showSettingsPage() {
         val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
-        var draftDark = darkThemeEnabled
-        var draftLanguage = selectedLanguage
+        fun applySettingsNow(refreshMessages: Boolean = false, recreateUi: Boolean = false) {
+            applyDateTimeFormat()
+            saveUiSettings()
+            meshService?.configureNotificationSettings(
+                enabled = notificationEnabled,
+                showPreview = notificationPreviewEnabled,
+                includeBroadcast = notificationBroadcastEnabled
+            )
+            meshService?.configureDiscovery(meshAggressiveMode)
+            meshService?.configureMaxRelayHops(meshMaxHops)
+            if (refreshMessages) {
+                runCatching { chatAdapter.notifyDataSetChanged() }
+            }
+            refreshHeader()
+            if (recreateUi) {
+                applyThemePalette()
+                dialog.dismiss()
+                recreate()
+            }
+        }
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -2217,43 +2634,197 @@ class MainActivity : Activity() {
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
             })
-
-            addView(terminalText(tr("theme")).apply {
-                textSize = 12f
+            addView(terminalText(tr("settings_subtitle")).apply {
+                textSize = 13f
                 setTextColor(BERRY_TEXT_DIM)
-                setPadding(0, dp(16), 0, dp(8))
+                setPadding(0, dp(4), 0, dp(10))
             })
         }
+
+        val settingsContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        val settingsScroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(settingsContent, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
+        var currentSectionCard: LinearLayout? = null
+
+        fun sectionHost(): LinearLayout = currentSectionCard ?: settingsContent
+
+        fun addCardSpacing(host: LinearLayout) {
+            if (host.childCount > 0) {
+                host.addView(View(this), LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(8)
+                ))
+            }
+        }
+
+        fun addSection(titleKey: String, descriptionKey: String) {
+            settingsContent.addView(terminalText(tr(titleKey)).apply {
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(0, dp(16), 0, dp(4))
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                if (settingsContent.childCount > 0) topMargin = dp(8)
+            })
+            settingsContent.addView(terminalText(tr(descriptionKey)).apply {
+                textSize = 12f
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(0, 0, 0, dp(10))
+            })
+            currentSectionCard = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+            }
+            settingsContent.addView(currentSectionCard, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
+
+        fun addToolAction(
+            titleKey: String,
+            descriptionKey: String,
+            onClick: () -> Unit
+        ) {
+            val host = sectionHost()
+            addCardSpacing(host)
+            host.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = roundedDrawable(Color.TRANSPARENT, dp(14))
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+                addView(terminalText(tr(titleKey)).apply {
+                    textSize = 15f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(BERRY_TEXT)
+                })
+                addView(terminalText(tr(descriptionKey)).apply {
+                    textSize = 12f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setPadding(0, dp(2), 0, 0)
+                })
+                setOnClickListener { onClick() }
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
+
+        fun addToggle(
+            titleKey: String,
+            descriptionKey: String,
+            checked: Boolean,
+            onChanged: (Boolean) -> Unit
+        ): CheckBox {
+            lateinit var checkbox: CheckBox
+            val host = sectionHost()
+            addCardSpacing(host)
+            host.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = roundedDrawable(Color.TRANSPARENT, dp(14))
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(terminalText(tr(titleKey)).apply {
+                        textSize = 15f
+                        typeface = Typeface.DEFAULT_BOLD
+                        setTextColor(BERRY_TEXT)
+                    }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                    checkbox = CheckBox(this@MainActivity).apply {
+                        isChecked = checked
+                        setOnCheckedChangeListener { _, value -> onChanged(value) }
+                    }
+                    addView(checkbox)
+                })
+                addView(terminalText(tr(descriptionKey)).apply {
+                    textSize = 12f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setPadding(0, dp(2), 0, 0)
+                })
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+            return checkbox
+        }
+
+        fun addChoiceChips(
+            titleKey: String,
+            values: List<Pair<String, String>>,
+            selectedKey: String,
+            onSelected: (String) -> Unit
+        ) {
+            val host = sectionHost()
+            addCardSpacing(host)
+            host.addView(terminalText(tr(titleKey)).apply {
+                textSize = 12f
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(dp(8), 0, dp(8), dp(6))
+            })
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val map = linkedMapOf<String, TextView>()
+            values.forEachIndexed { index, pair ->
+                val button = chatListBottomItem(pair.second, pair.first == selectedKey) { }
+                button.setOnClickListener {
+                    onSelected(pair.first)
+                    map.forEach { (key, view) ->
+                        val isSelected = key == pair.first
+                        view.background = roundedDrawable(if (isSelected) STRAWBERRY_RED else Color.TRANSPARENT, dp(20))
+                        view.setTextColor(if (isSelected) Color.WHITE else BERRY_TEXT_DIM)
+                    }
+                }
+                map[pair.first] = button
+                row.addView(button, LinearLayout.LayoutParams(0, dp(42), 1f).apply {
+                    if (index > 0) marginStart = dp(4)
+                    if (index < values.lastIndex) marginEnd = dp(4)
+                })
+            }
+            host.addView(row)
+        }
+
+        addSection("settings_appearance", "settings_appearance_desc")
 
         val themeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val lightButton = chatListBottomItem(tr("theme_light"), !draftDark) { }
-        val darkButton = chatListBottomItem(tr("theme_dark"), draftDark) { }
+        val lightButton = chatListBottomItem(tr("theme_light"), !darkThemeEnabled) { }
+        val darkButton = chatListBottomItem(tr("theme_dark"), darkThemeEnabled) { }
         lightButton.setOnClickListener {
-            draftDark = false
+            darkThemeEnabled = false
             lightButton.background = roundedDrawable(STRAWBERRY_RED, dp(20))
             lightButton.setTextColor(Color.WHITE)
             darkButton.background = roundedDrawable(Color.TRANSPARENT, dp(20))
             darkButton.setTextColor(BERRY_TEXT_DIM)
+            applySettingsNow(recreateUi = true)
         }
         darkButton.setOnClickListener {
-            draftDark = true
+            darkThemeEnabled = true
             darkButton.background = roundedDrawable(STRAWBERRY_RED, dp(20))
             darkButton.setTextColor(Color.WHITE)
             lightButton.background = roundedDrawable(Color.TRANSPARENT, dp(20))
             lightButton.setTextColor(BERRY_TEXT_DIM)
+            applySettingsNow(recreateUi = true)
         }
         themeRow.addView(lightButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(6) })
         themeRow.addView(darkButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(6) })
-        root.addView(themeRow)
+        sectionHost().addView(themeRow)
 
-        root.addView(terminalText(tr("language")).apply {
-            textSize = 12f
-            setTextColor(BERRY_TEXT_DIM)
-            setPadding(0, dp(16), 0, dp(8))
-        })
+        addSection("language", "settings_language_desc")
 
         val langButtons = linkedMapOf<AppLanguage, TextView>()
         val langRow = LinearLayout(this).apply {
@@ -2261,9 +2832,9 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         AppLanguage.entries.forEachIndexed { index, lang ->
-            val button = chatListBottomItem(lang.label, draftLanguage == lang) { }
+            val button = chatListBottomItem(lang.label, selectedLanguage == lang) { }
             button.setOnClickListener {
-                draftLanguage = lang
+                selectedLanguage = lang
                 langButtons.forEach { (candidate, view) ->
                     if (candidate == lang) {
                         view.background = roundedDrawable(STRAWBERRY_RED, dp(20))
@@ -2273,6 +2844,7 @@ class MainActivity : Activity() {
                         view.setTextColor(BERRY_TEXT_DIM)
                     }
                 }
+                applySettingsNow(recreateUi = true)
             }
             langButtons[lang] = button
             langRow.addView(button, LinearLayout.LayoutParams(0, dp(44), 1f).apply {
@@ -2280,21 +2852,99 @@ class MainActivity : Activity() {
                 if (index < AppLanguage.entries.lastIndex) marginEnd = dp(4)
             })
         }
-        root.addView(langRow)
+        sectionHost().addView(langRow)
 
-        root.addView(terminalAction(tr("save")).apply {
+        addSection("settings_mesh_section", "settings_mesh_desc")
+        addChoiceChips(
+            "settings_mesh_mode",
+            listOf("balanced" to tr("mesh_mode_balanced"), "aggressive" to tr("mesh_mode_aggressive")),
+            if (meshAggressiveMode) "aggressive" else "balanced"
+        ) { selected ->
+            meshAggressiveMode = selected == "aggressive"
+            applySettingsNow()
+        }
+        addChoiceChips(
+            "settings_max_hops",
+            listOf("2" to "2", "4" to "4", "6" to "6", "8" to "8"),
+            meshMaxHops.toString()
+        ) { selected ->
+            meshMaxHops = selected.toIntOrNull()?.coerceIn(1, 8) ?: 8
+            applySettingsNow()
+        }
+        addToolAction("settings_restart_mesh", "settings_restart_mesh_desc") {
+            meshService?.startNearbyDiscovery(silent = false)
+            Toast.makeText(this, tr("status_searching_nearby"), Toast.LENGTH_SHORT).show()
+        }
+
+        addSection("settings_notifications", "settings_notifications_desc")
+        addToggle("settings_notify_enable", "settings_notify_enable_desc", notificationEnabled) {
+            notificationEnabled = it
+            applySettingsNow()
+        }
+        addToggle("settings_notify_preview", "settings_notify_preview_desc", notificationPreviewEnabled) {
+            notificationPreviewEnabled = it
+            applySettingsNow()
+        }
+        addToggle("settings_notify_broadcast", "settings_notify_broadcast_desc", notificationBroadcastEnabled) {
+            notificationBroadcastEnabled = it
+            applySettingsNow()
+        }
+
+        addSection("settings_chat_behavior", "settings_chat_behavior_desc")
+        addToggle("settings_chat_compact", "settings_chat_compact_desc", compactChatListEnabled) {
+            compactChatListEnabled = it
+            applySettingsNow(refreshMessages = true)
+        }
+        addChoiceChips(
+            "settings_chat_font",
+            listOf("0.9" to tr("small"), "1.0" to tr("normal"), "1.15" to tr("large")),
+            "%.1f".format(Locale.US, messageTextScale)
+        ) { selected ->
+            messageTextScale = selected.toFloatOrNull()?.coerceIn(0.9f, 1.3f) ?: 1.0f
+            applySettingsNow(refreshMessages = true)
+        }
+
+        addSection("settings_region", "settings_region_desc")
+        addChoiceChips(
+            "settings_time_format",
+            listOf("24" to "24h", "12" to "12h"),
+            if (use24HourFormat) "24" else "12"
+        ) { selected ->
+            use24HourFormat = selected == "24"
+            applySettingsNow(refreshMessages = true)
+        }
+        addChoiceChips(
+            "settings_date_format",
+            listOf("short" to tr("short"), "long" to tr("long")),
+            if (shortDateFormatEnabled) "short" else "long"
+        ) { selected ->
+            shortDateFormatEnabled = selected == "short"
+            applySettingsNow(refreshMessages = true)
+        }
+
+        addSection("settings_data_storage", "settings_data_storage_desc")
+        addToolAction("settings_export_backup", "settings_export_backup_desc") {
+            openBackupCreateDocument()
+        }
+        addToolAction("settings_import_backup", "settings_import_backup_desc") {
+            openBackupPicker()
+        }
+        addToolAction("settings_cleanup_cache", "settings_cleanup_cache_desc") {
+                cleanupMediaCache()
+                Toast.makeText(this@MainActivity, tr("cleanup_done"), Toast.LENGTH_SHORT).show()
+        }
+        addToolAction("settings_connection_diag", "settings_connection_diag_desc") {
+            showConnectionDiagnostics()
+        }
+
+        settingsContent.addView(terminalAction(tr("close")).apply {
             textSize = 16f
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
             background = roundedDrawable(STRAWBERRY_RED, dp(18))
             setPadding(dp(14), dp(10), dp(14), dp(10))
             setOnClickListener {
-                darkThemeEnabled = draftDark
-                selectedLanguage = draftLanguage
-                saveUiSettings()
-                applyThemePalette()
                 dialog.dismiss()
-                recreate()
             }
         }, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -2302,8 +2952,7 @@ class MainActivity : Activity() {
         ).apply {
             topMargin = dp(18)
         })
-
-        root.addView(View(this), LinearLayout.LayoutParams(
+        root.addView(settingsScroll, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             0,
             1f
@@ -2340,10 +2989,469 @@ class MainActivity : Activity() {
         )
     }
 
+    private fun openBackupPicker() {
+        if (backupOperationRunning) {
+            Toast.makeText(this, tr("backup_busy"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        startActivityForResult(intent, BACKUP_IMPORT_REQUEST)
+    }
+
+    private fun openBackupCreateDocument() {
+        if (backupOperationRunning) {
+            Toast.makeText(this, tr("backup_busy"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/octet-stream"
+            putExtra(Intent.EXTRA_TITLE, "truskawka_backup_$timestamp.tbk")
+        }
+        startActivityForResult(intent, BACKUP_EXPORT_REQUEST)
+    }
+
+    private fun exportEncryptedBackupTo(uri: Uri) {
+        if (backupOperationRunning) {
+            Toast.makeText(this, tr("backup_busy"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        backupOperationRunning = true
+        showBackupProgress("${tr("export_backup")}...")
+        thread(name = "export-backup") {
+            val payload = buildBackupPayload().toByteArray(StandardCharsets.UTF_8)
+            val encrypted = encryptBackup(payload) ?: run {
+                hideBackupProgress()
+                backupOperationRunning = false
+                runOnUiThread { Toast.makeText(this, tr("backup_failed"), Toast.LENGTH_SHORT).show() }
+                return@thread
+            }
+            runCatching {
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(encrypted)
+                    out.flush()
+                } ?: error("output stream is null")
+            }
+                .onSuccess {
+                    hideBackupProgress()
+                    backupOperationRunning = false
+                    runOnUiThread {
+                        Toast.makeText(this, tr("backup_exported"), Toast.LENGTH_LONG).show()
+                    }
+                }
+                .onFailure {
+                    hideBackupProgress()
+                    backupOperationRunning = false
+                    runOnUiThread { Toast.makeText(this, tr("backup_failed"), Toast.LENGTH_SHORT).show() }
+                }
+        }
+    }
+
+    private fun importEncryptedBackup(uri: Uri) {
+        if (backupOperationRunning) {
+            Toast.makeText(this, tr("backup_busy"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle(tr("import_backup"))
+            .setMessage(tr("backup_import_confirm"))
+            .setNegativeButton(tr("cancel"), null)
+            .setPositiveButton(tr("continue")) { _, _ ->
+                runImportEncryptedBackup(uri)
+            }
+            .show()
+    }
+
+    private fun runImportEncryptedBackup(uri: Uri) {
+        if (backupOperationRunning) return
+        backupOperationRunning = true
+        showBackupProgress("${tr("import_backup")}...")
+        thread(name = "import-backup") {
+            val sourceName = queryDisplayName(uri).lowercase(Locale.US)
+            if (!sourceName.endsWith(".tbk")) {
+                hideBackupProgress()
+                backupOperationRunning = false
+                runOnUiThread { Toast.makeText(this, tr("backup_invalid_file"), Toast.LENGTH_SHORT).show() }
+                return@thread
+            }
+            val encrypted = readUriBytesWithLimit(uri, MAX_BACKUP_BYTES) ?: run {
+                hideBackupProgress()
+                backupOperationRunning = false
+                runOnUiThread { Toast.makeText(this, tr("backup_invalid_file"), Toast.LENGTH_SHORT).show() }
+                return@thread
+            }
+            val decrypted = decryptBackup(encrypted) ?: run {
+                hideBackupProgress()
+                backupOperationRunning = false
+                runOnUiThread { Toast.makeText(this, tr("backup_failed"), Toast.LENGTH_SHORT).show() }
+                return@thread
+            }
+            val text = String(decrypted, StandardCharsets.UTF_8)
+            val restoredCount = restoreBackupPayload(text)
+            runOnUiThread {
+                hideBackupProgress()
+                backupOperationRunning = false
+                if (restoredCount >= 0) {
+                    Toast.makeText(this, "${tr("backup_imported")}: $restoredCount ${tr("restored_messages")}", Toast.LENGTH_LONG).show()
+                    showChatMessages(currentChatKey())
+                    showChatList()
+                } else {
+                    Toast.makeText(
+                        this,
+                        backupRestoreErrorMessage ?: tr("backup_failed"),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun buildBackupPayload(): String {
+        val bodyRows = mutableListOf<String>()
+        bodyRows += "TSK1\t${System.currentTimeMillis()}"
+        bodyRows += listOf("S", "theme_dark", if (darkThemeEnabled) "1" else "0").joinToString("\t")
+        bodyRows += listOf("S", "language", selectedLanguage.code).joinToString("\t")
+        bodyRows += listOf("S", "display_name", getDisplayName().encodeStoredText()).joinToString("\t")
+        chatStore.listChats().forEach { chat ->
+            bodyRows += listOf(
+                "C",
+                chat.chatKey.encodeStoredText(),
+                chat.title.encodeStoredText(),
+                chat.kind.encodeStoredText(),
+                (chat.peerId ?: "").encodeStoredText(),
+                if (chat.verified) "1" else "0",
+                chat.unreadCount.toString(),
+                if (chat.pinned) "1" else "0",
+                chat.lastTimestamp.toString()
+            ).joinToString("\t")
+        }
+        val chatKeys = chatStore.listChats().map { it.chatKey }.distinct()
+        chatKeys.forEach { chatKey ->
+            chatStore.loadMessages(chatKey).forEach { msg ->
+                bodyRows += listOf(
+                    "M",
+                    chatKey.encodeStoredText(),
+                    msg.author.encodeStoredText(),
+                    msg.body.encodeStoredText(),
+                    if (msg.mine) "1" else "0",
+                    (msg.imagePath ?: "").encodeStoredText(),
+                    (msg.audioPath ?: "").encodeStoredText(),
+                    msg.timestamp.toString(),
+                    (msg.meshMessageId ?: "").encodeStoredText(),
+                    (msg.status ?: "").encodeStoredText(),
+                    (msg.reaction ?: "").encodeStoredText()
+                ).joinToString("\t")
+            }
+        }
+        val body = bodyRows.joinToString("\n")
+        val checksum = crc32Hex(body.toByteArray(StandardCharsets.UTF_8))
+        return "$body\nCRC\t$checksum"
+    }
+
+    private fun restoreBackupPayload(text: String): Int {
+        backupRestoreErrorMessage = null
+        val lines = text.lineSequence().filter { it.isNotBlank() }.toList()
+        if (lines.isEmpty() || !lines.first().startsWith("TSK1")) {
+            backupRestoreErrorMessage = tr("backup_corrupted")
+            return -1
+        }
+        val checksumLine = lines.lastOrNull().orEmpty()
+        if (!checksumLine.startsWith("CRC\t")) {
+            backupRestoreErrorMessage = tr("backup_corrupted")
+            return -1
+        }
+        val expectedChecksum = checksumLine.substringAfter("CRC\t").trim().lowercase(Locale.US)
+        val bodyLines = lines.dropLast(1)
+        val actualChecksum = crc32Hex(
+            bodyLines.joinToString("\n").toByteArray(StandardCharsets.UTF_8)
+        )
+        if (expectedChecksum != actualChecksum) {
+            backupRestoreErrorMessage = tr("backup_corrupted")
+            return -1
+        }
+        val parsedRows = mutableListOf<Pair<String, ChatMessage>>()
+        val parsedChats = linkedMapOf<String, StoredChat>()
+        val peerAliases = mutableMapOf<String, String>()
+        var restoredTheme: Boolean? = null
+        var restoredLanguage: AppLanguage? = null
+        var restoredDisplayName: String? = null
+        var restoredCount = 0
+        bodyLines.drop(1).forEach { line ->
+            val parts = line.split("\t")
+            when (parts.firstOrNull()) {
+                "S" -> {
+                    if (parts.size < 3) return@forEach
+                    val key = parts[1]
+                    val value = parts[2].decodeStoredText()
+                    when (key) {
+                        "theme_dark" -> restoredTheme = value == "1"
+                        "language" -> restoredLanguage = AppLanguage.fromCode(value)
+                        "display_name" -> restoredDisplayName = value
+                    }
+                    return@forEach
+                }
+                "C" -> {
+                    if (parts.size < 9) return@forEach
+                    val chatKey = parts[1].decodeStoredText()
+                    val title = parts[2].decodeStoredText()
+                    val kind = parts[3].decodeStoredText().ifBlank { ChatKind.PEER.name }
+                    val peerId = parts[4].decodeStoredText().ifBlank { null }
+                    val verified = parts[5] == "1"
+                    val unread = parts[6].toIntOrNull()?.coerceAtLeast(0) ?: 0
+                    val pinned = parts[7] == "1"
+                    val updatedAt = parts[8].toLongOrNull() ?: System.currentTimeMillis()
+                    parsedChats[chatKey] = StoredChat(
+                        chatKey = chatKey,
+                        title = title.ifBlank { chatKey.toDisplayTitle() },
+                        kind = kind,
+                        peerId = peerId,
+                        verified = verified,
+                        unreadCount = unread,
+                        pinned = pinned,
+                        createdAt = updatedAt,
+                        updatedAt = updatedAt
+                    )
+                    return@forEach
+                }
+                "M" -> Unit
+                else -> return@forEach
+            }
+            if (parts.size < 11) return@forEach
+            val chatKey = parts[1].decodeStoredText()
+            val author = parts[2].decodeStoredText()
+            val body = parts[3].decodeStoredText()
+            val mine = parts[4] == "1"
+            val imagePath = parts[5].decodeStoredText().ifBlank { null }
+            val audioPath = parts[6].decodeStoredText().ifBlank { null }
+            val timestamp = parts[7].toLongOrNull() ?: System.currentTimeMillis()
+            val messageId = parts[8].decodeStoredText().ifBlank { null }
+            val status = parts[9].decodeStoredText().ifBlank { null }
+            val reaction = parts[10].decodeStoredText().ifBlank { null }
+            val restored = ChatMessage(
+                author = author,
+                body = body,
+                mine = mine,
+                imagePath = imagePath,
+                audioPath = audioPath,
+                reaction = reaction,
+                timestamp = timestamp,
+                messageId = messageId?.let { runCatching { UUID.fromString(it) }.getOrNull() },
+                status = status?.let { runCatching { MessageStatus.valueOf(it) }.getOrNull() }
+            )
+            parsedRows += chatKey to restored
+            restoredCount += 1
+            if (chatKey.startsWith("peer:")) {
+                val peerId = chatKey.removePrefix("peer:")
+                if (!mine && author.isNotBlank()) {
+                    peerAliases[peerId] = author
+                }
+            }
+        }
+        chatStore.clearAllData()
+        meshMessages.clear()
+        savedMessages.clear()
+        peerMessages.clear()
+        messages.clear()
+        parsedChats.values.forEach { chatStore.ensureChat(it) }
+        parsedRows.forEach { (chatKey, msg) ->
+            if (!parsedChats.containsKey(chatKey) && chatKey.startsWith("peer:")) {
+                val peerId = chatKey.removePrefix("peer:")
+                chatStore.ensureChat(
+                    StoredChat(
+                        chatKey = chatKey,
+                        title = msg.author.ifBlank { "@$peerId".take(12) },
+                        kind = ChatKind.PEER.name,
+                        peerId = peerId,
+                        updatedAt = msg.timestamp
+                    )
+                )
+            } else if (!parsedChats.containsKey(chatKey) && (chatKey == CHAT_EVERYONE || chatKey == CHAT_SAVED)) {
+                chatStore.ensureBaseChats()
+            }
+            messagesForChat(chatKey).add(msg)
+            persistChatMessage(chatKey, msg)
+        }
+        peerAliases.forEach { (nodeId, alias) ->
+            val uuid = runCatching { UUID.fromString(nodeId) }.getOrNull() ?: return@forEach
+            rememberPeer(uuid, alias)
+        }
+        restoredTheme?.let { darkThemeEnabled = it }
+        restoredLanguage?.let { selectedLanguage = it }
+        if (restoredTheme != null || restoredLanguage != null) {
+            saveUiSettings()
+        }
+        restoredDisplayName?.let { setDisplayName(it) }
+        return restoredCount
+    }
+
+    private fun crc32Hex(bytes: ByteArray): String {
+        val crc = CRC32()
+        crc.update(bytes)
+        return java.lang.Long.toHexString(crc.value).padStart(8, '0')
+    }
+
+    private fun readUriBytesWithLimit(uri: Uri, maxBytes: Int): ByteArray? {
+        return runCatching {
+            contentResolver.openInputStream(uri)?.use { input ->
+                val buffer = ByteArray(8192)
+                val output = ByteArrayOutputStream()
+                var total = 0
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    total += read
+                    if (total > maxBytes) return null
+                    output.write(buffer, 0, read)
+                }
+                output.toByteArray()
+            }
+        }.getOrNull()
+    }
+
+    private fun showBackupProgress(text: String) {
+        runOnUiThread {
+            if (backupProgressDialog == null) {
+                val dialog = Dialog(this).apply {
+                    requestWindowFeature(Window.FEATURE_NO_TITLE)
+                    setCancelable(false)
+                }
+                val content = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(18), dp(14), dp(18), dp(14))
+                    setBackgroundColor(SOFT_PINK_PANEL)
+                    addView(ProgressBar(this@MainActivity), LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        marginEnd = dp(10)
+                    })
+                    backupProgressText = terminalText(text).apply {
+                        textSize = 14f
+                        setTextColor(BERRY_TEXT)
+                    }
+                    addView(backupProgressText, LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ))
+                }
+                dialog.setContentView(content)
+                dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+                backupProgressDialog = dialog
+            }
+            backupProgressText?.text = text
+            if (backupProgressDialog?.isShowing != true) {
+                backupProgressDialog?.show()
+            }
+        }
+    }
+
+    private fun hideBackupProgress() {
+        runOnUiThread {
+            if (backupProgressDialog?.isShowing == true) {
+                backupProgressDialog?.dismiss()
+            }
+        }
+    }
+
+    private fun backupKey(): SecretKeySpec {
+        val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
+        val seed = "$packageName|$androidId|truskawka_backup_v1"
+        val digest = MessageDigest.getInstance("SHA-256").digest(seed.toByteArray(StandardCharsets.UTF_8))
+        return SecretKeySpec(digest.copyOf(16), "AES")
+    }
+
+    private fun encryptBackup(plain: ByteArray): ByteArray? {
+        return runCatching {
+            val iv = ByteArray(12).also { SecureRandom().nextBytes(it) }
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, backupKey(), GCMParameterSpec(128, iv))
+            val encrypted = cipher.doFinal(plain)
+            iv + encrypted
+        }.getOrNull()
+    }
+
+    private fun decryptBackup(payload: ByteArray): ByteArray? {
+        if (payload.size <= 12) return null
+        return runCatching {
+            val iv = payload.copyOfRange(0, 12)
+            val data = payload.copyOfRange(12, payload.size)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, backupKey(), GCMParameterSpec(128, iv))
+            cipher.doFinal(data)
+        }.getOrNull()
+    }
+
+    private fun cleanupMediaCache() {
+        val folders = listOf("sent_images", "incoming_images", "incoming_audio", "voice_notes")
+            .map { File(filesDir, it) }
+            .filter { it.exists() && it.isDirectory }
+        val files = folders.flatMap { dir -> dir.listFiles()?.toList().orEmpty() }
+            .filter { it.isFile }
+            .sortedBy { it.lastModified() }
+            .toMutableList()
+        var total = files.sumOf { it.length() }
+        while (total > MAX_MEDIA_CACHE_BYTES && files.isNotEmpty()) {
+            val first = files.removeAt(0)
+            val size = first.length()
+            if (first.delete()) total -= size
+        }
+    }
+
+    private fun showConnectionDiagnostics() {
+        val peers = meshService?.knownPeers().orEmpty()
+        val direct = peers.count { it.isDirect || it.hopCount <= 1 }
+        val hops = peers.count { !(it.isDirect || it.hopCount <= 1) }
+        val ratio = if (sentCounter <= 0) 0 else ((deliveredCounter * 100f) / sentCounter).toInt()
+        val avgHops = peers.map { it.hopCount.coerceAtLeast(1) }.average().takeIf { !it.isNaN() } ?: 0.0
+        val discoveryMode = if (meshAggressiveMode) tr("mesh_mode_aggressive") else tr("mesh_mode_balanced")
+        val msg = buildString {
+            append("${tr("diag_sent")}: $sentCounter\n")
+            append("${tr("diag_delivered")}: $deliveredCounter\n")
+            append("${tr("diag_read")}: $readCounter\n")
+            append("${tr("diag_failed")}: $failedCounter\n")
+            append("${tr("diag_delivery_ratio")}: $ratio%\n")
+            append("${tr("diag_direct_nodes")}: $direct\n")
+            append("${tr("diag_hop_nodes")}: $hops\n")
+            append("${tr("diag_avg_hops")}: ${"%.1f".format(avgHops)}\n")
+            append("${tr("settings_mesh_section")}: $discoveryMode, ${tr("settings_max_hops")}: $meshMaxHops\n")
+            append("${tr("diag_last_relay")}: $lastRelayInfo")
+        }
+        AlertDialog.Builder(this)
+            .setTitle(tr("connection_diagnostics"))
+            .setMessage(msg)
+            .setNeutralButton(tr("copy")) { _, _ ->
+                val manager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                manager.setPrimaryClip(ClipData.newPlainText("Truskawka diagnostics", msg))
+                Toast.makeText(this, tr("copied"), Toast.LENGTH_SHORT).show()
+            }
+            .setPositiveButton(tr("close"), null)
+            .show()
+    }
+
     private fun loadUiSettings() {
         val prefs = getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
         darkThemeEnabled = prefs.getBoolean(UI_SETTINGS_THEME_DARK, false)
         selectedLanguage = AppLanguage.fromCode(prefs.getString(UI_SETTINGS_LANGUAGE, AppLanguage.EN.code))
+        appLockEnabled = false
+        appLockPin = ""
+        appLockTimeoutMinutes = 5
+        // Do not restore unlock state across app launches.
+        // If user fully re-enters the app, PIN must be requested again.
+        lastUnlockAt = 0L
+        notificationEnabled = prefs.getBoolean(UI_SETTINGS_NOTIF_ENABLED, true)
+        notificationPreviewEnabled = prefs.getBoolean(UI_SETTINGS_NOTIF_PREVIEW, true)
+        notificationBroadcastEnabled = prefs.getBoolean(UI_SETTINGS_NOTIF_BROADCAST, true)
+        compactChatListEnabled = prefs.getBoolean(UI_SETTINGS_CHAT_COMPACT, false)
+        messageTextScale = prefs.getFloat(UI_SETTINGS_CHAT_TEXT_SCALE, 1.0f).coerceIn(0.9f, 1.3f)
+        use24HourFormat = prefs.getBoolean(UI_SETTINGS_TIME_24H, true)
+        shortDateFormatEnabled = prefs.getBoolean(UI_SETTINGS_DATE_SHORT, false)
+        meshAggressiveMode = prefs.getBoolean(UI_SETTINGS_MESH_AGGRESSIVE, true)
+        meshMaxHops = prefs.getInt(UI_SETTINGS_MESH_MAX_HOPS, 8).coerceIn(1, 8)
     }
 
     private fun saveUiSettings() {
@@ -2351,7 +3459,81 @@ class MainActivity : Activity() {
             .edit()
             .putBoolean(UI_SETTINGS_THEME_DARK, darkThemeEnabled)
             .putString(UI_SETTINGS_LANGUAGE, selectedLanguage.code)
+            .putBoolean(UI_SETTINGS_APP_LOCK_ENABLED, appLockEnabled)
+            .putString(UI_SETTINGS_APP_LOCK_PIN, appLockPin)
+            .putInt(UI_SETTINGS_APP_LOCK_TIMEOUT, appLockTimeoutMinutes)
+            .putBoolean(UI_SETTINGS_NOTIF_ENABLED, notificationEnabled)
+            .putBoolean(UI_SETTINGS_NOTIF_PREVIEW, notificationPreviewEnabled)
+            .putBoolean(UI_SETTINGS_NOTIF_BROADCAST, notificationBroadcastEnabled)
+            .putBoolean(UI_SETTINGS_CHAT_COMPACT, compactChatListEnabled)
+            .putFloat(UI_SETTINGS_CHAT_TEXT_SCALE, messageTextScale)
+            .putBoolean(UI_SETTINGS_TIME_24H, use24HourFormat)
+            .putBoolean(UI_SETTINGS_DATE_SHORT, shortDateFormatEnabled)
+            .putBoolean(UI_SETTINGS_MESH_AGGRESSIVE, meshAggressiveMode)
+            .putInt(UI_SETTINGS_MESH_MAX_HOPS, meshMaxHops)
             .apply()
+    }
+
+    private fun applyDateTimeFormat() {
+        val locale = Locale.getDefault()
+        messageTimeFormat = if (use24HourFormat) {
+            SimpleDateFormat("HH:mm", locale)
+        } else {
+            SimpleDateFormat("h:mm a", locale)
+        }
+        messageDateFormat = if (shortDateFormatEnabled) {
+            SimpleDateFormat("dd.MM.yyyy", locale)
+        } else {
+            DateFormat.getDateInstance(DateFormat.LONG, locale)
+        }
+    }
+
+    private fun ensureAppUnlocked() {
+        if (!appLockEnabled || appLockPin.isBlank()) return
+        if (appLockDialogVisible) return
+        val timeoutMs = appLockTimeoutMinutes * 60_000L
+        val now = System.currentTimeMillis()
+        val firstUnlockRequired = lastUnlockAt <= 0L
+        val backgroundElapsed = if (appWentBackgroundAt > 0L) now - appWentBackgroundAt else Long.MAX_VALUE
+        if (!firstUnlockRequired && backgroundElapsed < timeoutMs) return
+        showAppLockDialog()
+    }
+
+    private fun showAppLockDialog() {
+        if (appLockDialogVisible) return
+        appLockDialogVisible = true
+        val input = EditText(this).apply {
+            hint = tr("settings_lock_enter_pin")
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            filters = arrayOf(InputFilter.LengthFilter(8))
+            setSingleLine(true)
+            setTextColor(BERRY_TEXT)
+            setHintTextColor(BERRY_TEXT_DIM)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(tr("settings_lock_title"))
+            .setView(input)
+            .setCancelable(false)
+            .setPositiveButton(tr("unlock")) { _, _ ->
+                val value = input.text?.toString().orEmpty()
+                if (value == appLockPin) {
+                    lastUnlockAt = System.currentTimeMillis()
+                    appWentBackgroundAt = 0L
+                    saveUiSettings()
+                    appLockDialogVisible = false
+                } else {
+                    Toast.makeText(this, tr("settings_lock_invalid_pin"), Toast.LENGTH_SHORT).show()
+                    appLockDialogVisible = false
+                    mainHandler.post { showAppLockDialog() }
+                }
+            }
+            .setNegativeButton(tr("close")) { _, _ ->
+                appLockDialogVisible = false
+                finish()
+            }
+            .setOnCancelListener { appLockDialogVisible = false }
+            .setOnDismissListener { appLockDialogVisible = false }
+            .show()
     }
 
     private fun applyThemePalette() {
@@ -2405,13 +3587,78 @@ class MainActivity : Activity() {
             "contacts" to "Contacts",
             "profile" to "Profile",
             "settings" to "Settings",
+            "settings_subtitle" to "Manage app look, language, and local data",
+            "settings_appearance" to "Appearance",
+            "settings_appearance_desc" to "Choose how Truskawka looks",
+            "settings_language_desc" to "Choose interface language",
+            "settings_data_storage" to "Data & Storage",
+            "settings_data_storage_desc" to "Backup and maintenance tools",
+            "settings_export_backup" to "Export Chat Backup",
+            "settings_export_backup_desc" to "Save encrypted local chat history to a .tbk file",
+            "settings_import_backup" to "Import Chat Backup",
+            "settings_import_backup_desc" to "Restore messages and chat settings from a .tbk file",
+            "settings_cleanup_cache" to "Clear Media Cache",
+            "settings_cleanup_cache_desc" to "Remove old image and voice cache files",
+            "settings_connection_diag" to "Connection Diagnostics",
+            "settings_connection_diag_desc" to "View delivery stats and mesh route state",
+            "settings_security" to "Privacy & Security",
+            "settings_security_desc" to "Protect app access and lock behavior",
+            "settings_lock_enable" to "Enable App Lock",
+            "settings_lock_enable_desc" to "Require PIN when returning to the app",
+            "settings_lock_pin" to "Set PIN Code",
+            "settings_lock_pin_desc" to "PIN is used to unlock Truskawka",
+            "settings_lock_pin_hint" to "Enter 4-8 digit PIN",
+            "settings_lock_pin_short" to "PIN must be at least 4 digits",
+            "settings_lock_timeout" to "Auto-lock timeout",
+            "settings_lock_title" to "Truskawka is locked",
+            "settings_lock_enter_pin" to "Enter PIN",
+            "settings_lock_invalid_pin" to "Wrong PIN",
+            "unlock" to "Unlock",
+            "settings_mesh_section" to "Mesh Radio",
+            "settings_mesh_desc" to "Control mesh discovery behavior",
+            "settings_mesh_mode" to "Discovery mode",
+            "mesh_mode_balanced" to "Balanced",
+            "mesh_mode_aggressive" to "Aggressive",
+            "settings_max_hops" to "Max route hops",
+            "settings_restart_mesh" to "Restart Mesh Discovery",
+            "settings_restart_mesh_desc" to "Restart scan and advertising now",
+            "settings_notifications" to "Notifications",
+            "settings_notifications_desc" to "Control when and how alerts are shown",
+            "settings_notify_enable" to "Enable Notifications",
+            "settings_notify_enable_desc" to "Show message notifications outside the app",
+            "settings_notify_preview" to "Show Message Preview",
+            "settings_notify_preview_desc" to "Display message text in notification body",
+            "settings_notify_broadcast" to "Broadcast Alerts",
+            "settings_notify_broadcast_desc" to "Notify for messages from Everyone channel",
+            "settings_chat_behavior" to "Chat Behavior",
+            "settings_chat_behavior_desc" to "Tune message and chat list appearance",
+            "settings_chat_compact" to "Compact Chat List",
+            "settings_chat_compact_desc" to "Use tighter rows in Contacts list",
+            "settings_chat_font" to "Message text size",
+            "small" to "Small",
+            "normal" to "Normal",
+            "large" to "Large",
+            "settings_region" to "Region & Time",
+            "settings_region_desc" to "Date and time formatting",
+            "settings_time_format" to "Time format",
+            "settings_date_format" to "Date format",
+            "short" to "Short",
+            "long" to "Long",
+            "copy" to "Copy",
+            "copied" to "Copied",
             "no_chats_yet" to "No chats yet",
+            "quick_start_title" to "Quick start",
+            "quick_start_step_1" to "Open New contacts and wait until people appear.",
+            "quick_start_step_2" to "Tap a person to open a private chat.",
+            "quick_start_step_3" to "Send a message and wait for Delivered/Read marks.",
+            "got_it" to "Got it",
             "theme" to "Theme",
             "theme_light" to "Light",
             "theme_dark" to "Black pink",
             "language" to "Language",
             "save" to "Save",
             "profile_updated" to "Profile updated",
+            "original_name_editable" to "Original name (editable)",
             "original_name_fixed" to "Original name (fixed)",
             "display_name_editable" to "Display name (editable)",
             "display_name" to "Display name",
@@ -2506,6 +3753,8 @@ class MainActivity : Activity() {
             "incoming_audio_unavailable" to "incoming voice message not available on device",
             "status_sprouting" to "Sprouting",
             "status_ripe" to "Ripe",
+            "status_failed" to "Failed",
+            "mesh_hop_limit_reached" to "Peer is beyond your max hops setting",
             "broadcast" to "Broadcast",
             "enable_nearby_chat" to "Enable nearby chat",
             "permissions_intro_desc" to "Truskawka needs Bluetooth, Nearby devices, Location, and Microphone access so mesh radio can discover phones and send voice notes. Internet and router Wi-Fi are not required.",
@@ -2537,7 +3786,35 @@ class MainActivity : Activity() {
             "voice_record_failed" to "Could not start recording",
             "mic" to "MIC",
             "mic_icon" to "\uD83C\uDFA4",
-            "recording_short" to "REC"
+            "recording_short" to "REC",
+            "voice_canceled" to "voice canceled",
+            "replying_to" to "Replying to",
+            "react" to "React",
+            "forward_saved" to "Forward to Saved",
+            "forwarded_to_saved" to "Forwarded to Saved messages",
+            "tools" to "Tools",
+            "export_backup" to "Export backup",
+            "import_backup" to "Import backup",
+            "cleanup_cache" to "Cleanup media cache",
+            "cleanup_done" to "Cache cleanup completed",
+            "backup_exported" to "Backup exported",
+            "backup_imported" to "Backup imported",
+            "restored_messages" to "messages restored",
+            "backup_busy" to "Backup operation already running",
+            "backup_import_confirm" to "Import will replace current local history. Continue?",
+            "backup_invalid_file" to "Select a valid .tbk backup file",
+            "backup_corrupted" to "Backup file is corrupted or incomplete",
+            "backup_failed" to "Backup operation failed",
+            "connection_diagnostics" to "Connection diagnostics",
+            "diag_sent" to "Sent",
+            "diag_delivered" to "Delivered",
+            "diag_read" to "Read",
+            "diag_failed" to "Failed",
+            "diag_delivery_ratio" to "Delivery ratio",
+            "diag_direct_nodes" to "Direct nodes",
+            "diag_hop_nodes" to "Hop nodes",
+            "diag_avg_hops" to "Average hops",
+            "diag_last_relay" to "Last relay status"
         )
         val ru = mapOf(
             "chats" to "Чаты",
@@ -2646,6 +3923,8 @@ class MainActivity : Activity() {
             "incoming_audio_unavailable" to "полученное голосовое недоступно на устройстве",
             "status_sprouting" to "В пути",
             "status_ripe" to "Доставлено",
+            "status_failed" to "Не отправлено",
+            "mesh_hop_limit_reached" to "Собеседник вне выбранного лимита hop",
             "broadcast" to "Эфир",
             "enable_nearby_chat" to "Включить nearby чат",
             "permissions_intro_desc" to "Truskawka требует полный доступ к Bluetooth, Nearby devices и Location, чтобы mesh radio мог рекламироваться и сканировать телефоны рядом. Интернет и роутерный Wi-Fi не нужны.",
@@ -2677,7 +3956,35 @@ class MainActivity : Activity() {
             "voice_record_failed" to "Не удалось начать запись",
             "mic" to "МИК",
             "mic_icon" to "\uD83C\uDFA4",
-            "recording_short" to "ЗАП"
+            "recording_short" to "ЗАП",
+            "voice_canceled" to "голосовое отменено",
+            "replying_to" to "Ответ на",
+            "react" to "Реакция",
+            "forward_saved" to "Переслать в Избранное",
+            "forwarded_to_saved" to "Переслано в Избранное",
+            "tools" to "Инструменты",
+            "export_backup" to "Экспорт backup",
+            "import_backup" to "Импорт backup",
+            "cleanup_cache" to "Очистить кэш медиа",
+            "cleanup_done" to "Кэш очищен",
+            "backup_exported" to "Backup экспортирован",
+            "backup_imported" to "Backup импортирован",
+            "restored_messages" to "сообщений восстановлено",
+            "backup_busy" to "Операция backup уже выполняется",
+            "backup_import_confirm" to "Импорт заменит текущую локальную историю. Продолжить?",
+            "backup_invalid_file" to "Выберите корректный файл backup .tbk",
+            "backup_corrupted" to "Файл backup поврежден или неполный",
+            "backup_failed" to "Ошибка backup",
+            "connection_diagnostics" to "Диагностика соединения",
+            "diag_sent" to "Отправлено",
+            "diag_delivered" to "Доставлено",
+            "diag_read" to "Прочитано",
+            "diag_failed" to "Ошибки",
+            "diag_delivery_ratio" to "Доля доставки",
+            "diag_direct_nodes" to "Прямые узлы",
+            "diag_hop_nodes" to "Hop узлы",
+            "diag_avg_hops" to "Средние hop",
+            "diag_last_relay" to "Последний relay статус"
         )
         val pl = mapOf(
             "chats" to "Czaty",
@@ -2786,6 +4093,8 @@ class MainActivity : Activity() {
             "incoming_audio_unavailable" to "odebrana wiadomosc glosowa niedostepna",
             "status_sprouting" to "W drodze",
             "status_ripe" to "Dostarczono",
+            "status_failed" to "Nie wysłano",
+            "mesh_hop_limit_reached" to "Kontakt jest poza ustawionym limitem hop",
             "broadcast" to "Broadcast",
             "enable_nearby_chat" to "Wlacz nearby chat",
             "permissions_intro_desc" to "Truskawka wymaga pelnego dostepu do Bluetooth, Nearby devices i Location, aby mesh radio moglo reklamowac i skanowac telefony obok. Internet i Wi-Fi routera nie sa wymagane.",
@@ -2817,7 +4126,35 @@ class MainActivity : Activity() {
             "voice_record_failed" to "Nie mozna rozpoczac nagrywania",
             "mic" to "MIK",
             "mic_icon" to "\uD83C\uDFA4",
-            "recording_short" to "REC"
+            "recording_short" to "REC",
+            "voice_canceled" to "wiadomosc glosowa anulowana",
+            "replying_to" to "Odpowiedz do",
+            "react" to "Reakcja",
+            "forward_saved" to "Przekaz do Zapisanych",
+            "forwarded_to_saved" to "Przekazano do Zapisanych",
+            "tools" to "Narzędzia",
+            "export_backup" to "Eksport backup",
+            "import_backup" to "Import backup",
+            "cleanup_cache" to "Wyczysc cache mediow",
+            "cleanup_done" to "Cache wyczyszczony",
+            "backup_exported" to "Backup wyeksportowany",
+            "backup_imported" to "Backup zaimportowany",
+            "restored_messages" to "wiadomosci przywrocono",
+            "backup_busy" to "Operacja backup jest juz uruchomiona",
+            "backup_import_confirm" to "Import zastapi biezaca lokalna historie. Kontynuowac?",
+            "backup_invalid_file" to "Wybierz poprawny plik backup .tbk",
+            "backup_corrupted" to "Plik backup jest uszkodzony lub niepelny",
+            "backup_failed" to "Blad backup",
+            "connection_diagnostics" to "Diagnostyka polaczenia",
+            "diag_sent" to "Wyslane",
+            "diag_delivered" to "Dostarczone",
+            "diag_read" to "Przeczytane",
+            "diag_failed" to "Bledy",
+            "diag_delivery_ratio" to "Wskaznik dostarczenia",
+            "diag_direct_nodes" to "Direct wezly",
+            "diag_hop_nodes" to "Hop wezly",
+            "diag_avg_hops" to "Srednie hop",
+            "diag_last_relay" to "Ostatni relay status"
         )
         val es = mapOf(
             "chats" to "Chats",
@@ -2926,6 +4263,8 @@ class MainActivity : Activity() {
             "incoming_audio_unavailable" to "el audio recibido no esta disponible en el dispositivo",
             "status_sprouting" to "En ruta",
             "status_ripe" to "Entregado",
+            "status_failed" to "No enviado",
+            "mesh_hop_limit_reached" to "El contacto está fuera del límite de hops configurado",
             "broadcast" to "Broadcast",
             "enable_nearby_chat" to "Activar chat nearby",
             "permissions_intro_desc" to "Truskawka necesita acceso completo a Bluetooth, Nearby devices y Location para que mesh radio pueda anunciarse y escanear telefonos cercanos. Internet y Wi-Fi de router no son necesarios.",
@@ -2957,7 +4296,35 @@ class MainActivity : Activity() {
             "voice_record_failed" to "No se pudo iniciar la grabacion",
             "mic" to "MIC",
             "mic_icon" to "\uD83C\uDFA4",
-            "recording_short" to "REC"
+            "recording_short" to "REC",
+            "voice_canceled" to "voz cancelada",
+            "replying_to" to "Respondiendo a",
+            "react" to "Reaccion",
+            "forward_saved" to "Enviar a Guardados",
+            "forwarded_to_saved" to "Enviado a Guardados",
+            "tools" to "Herramientas",
+            "export_backup" to "Exportar backup",
+            "import_backup" to "Importar backup",
+            "cleanup_cache" to "Limpiar cache de medios",
+            "cleanup_done" to "Cache limpiado",
+            "backup_exported" to "Backup exportado",
+            "backup_imported" to "Backup importado",
+            "restored_messages" to "mensajes restaurados",
+            "backup_busy" to "La operacion de backup ya esta en curso",
+            "backup_import_confirm" to "La importacion reemplazara el historial local actual. Continuar?",
+            "backup_invalid_file" to "Selecciona un archivo backup .tbk valido",
+            "backup_corrupted" to "El archivo de backup esta dañado o incompleto",
+            "backup_failed" to "Error de backup",
+            "connection_diagnostics" to "Diagnostico de conexion",
+            "diag_sent" to "Enviados",
+            "diag_delivered" to "Entregados",
+            "diag_read" to "Leidos",
+            "diag_failed" to "Fallidos",
+            "diag_delivery_ratio" to "Ratio de entrega",
+            "diag_direct_nodes" to "Nodos directos",
+            "diag_hop_nodes" to "Nodos hop",
+            "diag_avg_hops" to "Hop promedio",
+            "diag_last_relay" to "Estado relay ultimo"
         )
         val source = when (selectedLanguage) {
             AppLanguage.EN -> en
@@ -2965,7 +4332,193 @@ class MainActivity : Activity() {
             AppLanguage.ES -> es
             AppLanguage.RU -> ru
         }
-        return source[key] ?: en[key] ?: key
+        val settingsOverrides = when (selectedLanguage) {
+            AppLanguage.EN -> emptyMap<String, String>()
+            AppLanguage.RU -> mapOf(
+                "settings_subtitle" to "Внешний вид, язык и локальные данные",
+                "settings_appearance" to "Внешний вид",
+                "settings_appearance_desc" to "Настройка темы и вида",
+                "settings_language_desc" to "Язык интерфейса",
+                "settings_security" to "Приватность и защита",
+                "settings_security_desc" to "PIN и блокировка приложения",
+                "settings_lock_enable" to "Включить блокировку",
+                "settings_lock_enable_desc" to "Запрашивать PIN при возврате",
+                "settings_lock_pin" to "Задать PIN",
+                "settings_lock_pin_desc" to "PIN для разблокировки Truskawka",
+                "settings_lock_pin_hint" to "Введите PIN 4-8 цифр",
+                "settings_lock_pin_short" to "PIN должен быть минимум 4 цифры",
+                "settings_lock_timeout" to "Таймаут автоблокировки",
+                "settings_lock_title" to "Truskawka заблокирована",
+                "settings_lock_enter_pin" to "Введите PIN",
+                "settings_lock_invalid_pin" to "Неверный PIN",
+                "unlock" to "Разблокировать",
+                "settings_mesh_section" to "Mesh радио",
+                "settings_mesh_desc" to "Параметры поиска сети",
+                "settings_mesh_mode" to "Режим поиска",
+                "mesh_mode_balanced" to "Сбалансированный",
+                "mesh_mode_aggressive" to "Агрессивный",
+                "settings_max_hops" to "Макс. hop",
+                "settings_restart_mesh" to "Перезапустить Mesh поиск",
+                "settings_restart_mesh_desc" to "Запустить скан и advertise заново",
+                "settings_notifications" to "Уведомления",
+                "settings_notifications_desc" to "Когда и как показывать уведомления",
+                "settings_notify_enable" to "Включить уведомления",
+                "settings_notify_enable_desc" to "Показывать уведомления вне приложения",
+                "settings_notify_preview" to "Превью сообщений",
+                "settings_notify_preview_desc" to "Показывать текст в уведомлении",
+                "settings_notify_broadcast" to "Уведомления Everyone",
+                "settings_notify_broadcast_desc" to "Уведомлять о сообщениях в Everyone",
+                "settings_chat_behavior" to "Поведение чата",
+                "settings_chat_behavior_desc" to "Вид списка чатов и сообщений",
+                "settings_chat_compact" to "Компактный список чатов",
+                "settings_chat_compact_desc" to "Плотные строки в Contacts",
+                "settings_chat_font" to "Размер текста",
+                "settings_region" to "Регион и время",
+                "settings_region_desc" to "Форматы даты и времени",
+                "settings_time_format" to "Формат времени",
+                "settings_date_format" to "Формат даты",
+                "settings_data_storage" to "Данные и хранилище",
+                "settings_data_storage_desc" to "Backup и обслуживание",
+                "settings_export_backup" to "Экспорт backup чата",
+                "settings_export_backup_desc" to "Сохранить историю в файл .tbk",
+                "settings_import_backup" to "Импорт backup чата",
+                "settings_import_backup_desc" to "Восстановить чат из .tbk",
+                "settings_cleanup_cache" to "Очистить кэш медиа",
+                "settings_cleanup_cache_desc" to "Удалить старые медиа файлы",
+                "settings_connection_diag" to "Диагностика сети",
+                "settings_connection_diag_desc" to "Статистика доставки и маршрутов",
+                "small" to "Маленький",
+                "normal" to "Обычный",
+                "large" to "Большой",
+                "short" to "Короткий",
+                "long" to "Длинный",
+                "copy" to "Копировать",
+                "copied" to "Скопировано"
+            )
+            AppLanguage.PL -> mapOf(
+                "settings_subtitle" to "Wyglad, jezyk i dane lokalne",
+                "settings_appearance" to "Wyglad",
+                "settings_appearance_desc" to "Ustawienia motywu i wygladu",
+                "settings_language_desc" to "Jezyk interfejsu",
+                "settings_security" to "Prywatnosc i ochrona",
+                "settings_security_desc" to "PIN i blokada aplikacji",
+                "settings_lock_enable" to "Wlacz blokade",
+                "settings_lock_enable_desc" to "Wymagaj PIN po powrocie",
+                "settings_lock_pin" to "Ustaw PIN",
+                "settings_lock_pin_desc" to "PIN do odblokowania Truskawka",
+                "settings_lock_pin_hint" to "Wpisz PIN 4-8 cyfr",
+                "settings_lock_pin_short" to "PIN musi miec co najmniej 4 cyfry",
+                "settings_lock_timeout" to "Timeout auto blokady",
+                "settings_lock_title" to "Truskawka jest zablokowana",
+                "settings_lock_enter_pin" to "Wpisz PIN",
+                "settings_lock_invalid_pin" to "Nieprawidlowy PIN",
+                "unlock" to "Odblokuj",
+                "settings_mesh_section" to "Mesh radio",
+                "settings_mesh_desc" to "Parametry wykrywania sieci",
+                "settings_mesh_mode" to "Tryb wykrywania",
+                "mesh_mode_balanced" to "Zrownowazony",
+                "mesh_mode_aggressive" to "Agresywny",
+                "settings_max_hops" to "Maks. hop",
+                "settings_restart_mesh" to "Restart wykrywania Mesh",
+                "settings_restart_mesh_desc" to "Uruchom skan i advertise ponownie",
+                "settings_notifications" to "Powiadomienia",
+                "settings_notifications_desc" to "Kiedy i jak pokazywac alerty",
+                "settings_notify_enable" to "Wlacz powiadomienia",
+                "settings_notify_enable_desc" to "Pokazuj powiadomienia poza aplikacja",
+                "settings_notify_preview" to "Podglad wiadomosci",
+                "settings_notify_preview_desc" to "Pokaz tekst wiadomosci w powiadomieniu",
+                "settings_notify_broadcast" to "Alerty Everyone",
+                "settings_notify_broadcast_desc" to "Powiadamiaj o wiadomosciach Everyone",
+                "settings_chat_behavior" to "Zachowanie chatu",
+                "settings_chat_behavior_desc" to "Wyglad listy chatow i wiadomosci",
+                "settings_chat_compact" to "Kompaktowa lista chatow",
+                "settings_chat_compact_desc" to "Gestsze wiersze w Contacts",
+                "settings_chat_font" to "Rozmiar tekstu",
+                "settings_region" to "Region i czas",
+                "settings_region_desc" to "Format daty i godziny",
+                "settings_time_format" to "Format godziny",
+                "settings_date_format" to "Format daty",
+                "settings_data_storage" to "Dane i pamiec",
+                "settings_data_storage_desc" to "Backup i narzedzia serwisowe",
+                "settings_export_backup" to "Eksport backupu chatu",
+                "settings_export_backup_desc" to "Zapisz historie do pliku .tbk",
+                "settings_import_backup" to "Import backupu chatu",
+                "settings_import_backup_desc" to "Przywroc chat z pliku .tbk",
+                "settings_cleanup_cache" to "Wyczysc cache mediow",
+                "settings_cleanup_cache_desc" to "Usun stare pliki mediow",
+                "settings_connection_diag" to "Diagnostyka sieci",
+                "settings_connection_diag_desc" to "Statystyki dostarczenia i tras",
+                "small" to "Maly",
+                "normal" to "Normalny",
+                "large" to "Duzy",
+                "short" to "Krotki",
+                "long" to "Dlugi",
+                "copy" to "Kopiuj",
+                "copied" to "Skopiowano"
+            )
+            AppLanguage.ES -> mapOf(
+                "settings_subtitle" to "Apariencia, idioma y datos locales",
+                "settings_appearance" to "Apariencia",
+                "settings_appearance_desc" to "Configura tema y aspecto",
+                "settings_language_desc" to "Idioma de la interfaz",
+                "settings_security" to "Privacidad y seguridad",
+                "settings_security_desc" to "PIN y bloqueo de la app",
+                "settings_lock_enable" to "Activar bloqueo",
+                "settings_lock_enable_desc" to "Pedir PIN al volver a la app",
+                "settings_lock_pin" to "Configurar PIN",
+                "settings_lock_pin_desc" to "PIN para desbloquear Truskawka",
+                "settings_lock_pin_hint" to "Ingresa PIN de 4-8 digitos",
+                "settings_lock_pin_short" to "El PIN debe tener al menos 4 digitos",
+                "settings_lock_timeout" to "Tiempo de autobloqueo",
+                "settings_lock_title" to "Truskawka esta bloqueada",
+                "settings_lock_enter_pin" to "Ingresa PIN",
+                "settings_lock_invalid_pin" to "PIN incorrecto",
+                "unlock" to "Desbloquear",
+                "settings_mesh_section" to "Radio Mesh",
+                "settings_mesh_desc" to "Parametros de descubrimiento de red",
+                "settings_mesh_mode" to "Modo de descubrimiento",
+                "mesh_mode_balanced" to "Equilibrado",
+                "mesh_mode_aggressive" to "Agresivo",
+                "settings_max_hops" to "Max. hops",
+                "settings_restart_mesh" to "Reiniciar descubrimiento Mesh",
+                "settings_restart_mesh_desc" to "Iniciar escaneo y advertise de nuevo",
+                "settings_notifications" to "Notificaciones",
+                "settings_notifications_desc" to "Cuando y como mostrar alertas",
+                "settings_notify_enable" to "Activar notificaciones",
+                "settings_notify_enable_desc" to "Mostrar notificaciones fuera de la app",
+                "settings_notify_preview" to "Vista previa del mensaje",
+                "settings_notify_preview_desc" to "Mostrar texto en la notificacion",
+                "settings_notify_broadcast" to "Alertas de Everyone",
+                "settings_notify_broadcast_desc" to "Notificar mensajes del canal Everyone",
+                "settings_chat_behavior" to "Comportamiento del chat",
+                "settings_chat_behavior_desc" to "Aspecto de lista y mensajes",
+                "settings_chat_compact" to "Lista compacta de chats",
+                "settings_chat_compact_desc" to "Filas mas compactas en Contacts",
+                "settings_chat_font" to "Tamano del texto",
+                "settings_region" to "Region y hora",
+                "settings_region_desc" to "Formato de fecha y hora",
+                "settings_time_format" to "Formato de hora",
+                "settings_date_format" to "Formato de fecha",
+                "settings_data_storage" to "Datos y almacenamiento",
+                "settings_data_storage_desc" to "Backup y mantenimiento",
+                "settings_export_backup" to "Exportar backup del chat",
+                "settings_export_backup_desc" to "Guardar historial en archivo .tbk",
+                "settings_import_backup" to "Importar backup del chat",
+                "settings_import_backup_desc" to "Restaurar chat desde archivo .tbk",
+                "settings_cleanup_cache" to "Limpiar cache de medios",
+                "settings_cleanup_cache_desc" to "Eliminar archivos antiguos de medios",
+                "settings_connection_diag" to "Diagnostico de red",
+                "settings_connection_diag_desc" to "Estadisticas de entrega y rutas",
+                "small" to "Pequeno",
+                "normal" to "Normal",
+                "large" to "Grande",
+                "short" to "Corto",
+                "long" to "Largo",
+                "copy" to "Copiar",
+                "copied" to "Copiado"
+            )
+        }
+        return source[key] ?: settingsOverrides[key] ?: en[key] ?: key
     }
 
     private fun getDisplayName(): String =
@@ -3153,25 +4706,19 @@ class MainActivity : Activity() {
 
     private fun showChatRowActions(summary: ChatSummary, onChanged: () -> Unit) {
         val pinLabel = if (summary.pinned) tr("unpin") else tr("pin")
-        val options = if (summary.kind == ChatKind.PEER.name) {
-            arrayOf(pinLabel, tr("delete"))
-        } else {
-            arrayOf(pinLabel)
-        }
-        AlertDialog.Builder(this)
-            .setItems(options) { _, which ->
-                when (options[which]) {
-                    tr("delete") -> {
-                        deleteChatSummary(summary, deleteForEveryone = true)
-                        onChanged()
-                    }
-                    else -> {
-                        chatStore.setChatPinned(summary.chatKey, !summary.pinned)
-                        onChanged()
-                    }
-                }
+        val actions = mutableListOf(
+            StyledActionItem(pinLabel) {
+                chatStore.setChatPinned(summary.chatKey, !summary.pinned)
+                onChanged()
             }
-            .show()
+        )
+        if (summary.kind == ChatKind.PEER.name) {
+            actions += StyledActionItem(tr("delete"), destructive = true) {
+                deleteChatSummary(summary, deleteForEveryone = true)
+                onChanged()
+            }
+        }
+        showStyledActionDialog(actions = actions)
     }
 
     private fun deleteChatSummary(summary: ChatSummary, deleteForEveryone: Boolean) {
@@ -3190,52 +4737,130 @@ class MainActivity : Activity() {
 
     private fun showMessageActions(message: ChatMessage) {
         if (message.author == "system" || message.author == "mesh") return
-        val options = if (message.imagePath == null && message.audioPath == null) {
-            arrayOf(tr("delete"), tr("edit"))
-        } else {
-            arrayOf(tr("delete"))
+        val actions = mutableListOf(
+            StyledActionItem(tr("react")) { showReactionPicker(message) },
+            StyledActionItem(tr("forward_saved")) { forwardMessageToSaved(message) },
+            StyledActionItem(tr("delete"), destructive = true) { confirmDeleteMessage(message) }
+        )
+        if (message.imagePath == null && message.audioPath == null) {
+            actions += StyledActionItem(tr("edit")) { editMessage(message) }
         }
-        AlertDialog.Builder(this)
-            .setItems(options) { _, which ->
-                when (options[which]) {
-                    tr("delete") -> confirmDeleteMessage(message)
-                    tr("edit") -> editMessage(message)
+        showStyledActionDialog(actions = actions)
+    }
+
+    private fun showReactionPicker(message: ChatMessage) {
+        val values = arrayOf("\u2764\uFE0F", "\uD83D\uDC4D", "\uD83D\uDE02", "\uD83D\uDD25", "\uD83D\uDE2E", "\u274C")
+        val actions = values.map { value ->
+            StyledActionItem(value) {
+                val next = value.takeIf { it != "\u274C" }
+                message.reaction = next
+                if (message.localId > 0L) {
+                    chatStore.updateMessageReaction(message.localId, next)
+                } else {
+                    rebuildStoredChat(currentChatKey(), messagesForChat(currentChatKey()))
                 }
+                chatAdapter.notifyDataSetChanged()
             }
-            .show()
+        }
+        showStyledActionDialog(actions = actions)
+    }
+
+    private fun forwardMessageToSaved(message: ChatMessage) {
+        val author = usernameField.text.toString().prefixAt()
+        when {
+            message.imagePath != null -> {
+                addImageMessage(
+                    author = author,
+                    imagePath = message.imagePath,
+                    mine = true,
+                    chatKey = CHAT_SAVED,
+                    status = MessageStatus.READ
+                )
+            }
+            message.audioPath != null -> {
+                addAudioMessage(
+                    author = author,
+                    audioPath = message.audioPath,
+                    mine = true,
+                    chatKey = CHAT_SAVED,
+                    status = MessageStatus.READ
+                )
+            }
+            else -> saveLocalMessage(ChatMessage(author, message.body, true, status = MessageStatus.READ))
+        }
+        Toast.makeText(this, tr("forwarded_to_saved"), Toast.LENGTH_SHORT).show()
     }
 
     private fun confirmDeleteMessage(target: ChatMessage) {
+        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
         val checkbox = CheckBox(this).apply {
             text = tr("delete_for_everyone_q")
             setTextColor(BERRY_TEXT)
             isChecked = false
         }
-        val panel = LinearLayout(this).apply {
+        val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(10), dp(20), dp(4))
+            setPadding(dp(20), dp(20), dp(20), dp(18))
+            background = roundedDrawable(INPUT_SURFACE, dp(20), SOFT_PINK_STROKE)
             addView(terminalText(tr("delete_for_myself_q")).apply {
                 textSize = 16f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
-                setPadding(0, 0, 0, dp(10))
+                setPadding(0, 0, 0, dp(12))
             })
             addView(checkbox)
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.END
+                setPadding(0, dp(16), 0, 0)
+                addView(terminalAction(tr("cancel")).apply {
+                    textSize = 14f
+                    setTextColor(BERRY_TEXT_DIM)
+                    background = roundedDrawable(Color.TRANSPARENT, dp(16), SOFT_PINK_STROKE)
+                    setPadding(dp(16), dp(8), dp(16), dp(8))
+                    setOnClickListener { dialog.dismiss() }
+                })
+                addView(terminalAction(tr("delete")).apply {
+                    textSize = 14f
+                    setTextColor(Color.WHITE)
+                    background = roundedDrawable(STRAWBERRY_RED, dp(16))
+                    setPadding(dp(16), dp(8), dp(16), dp(8))
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { marginStart = dp(8) }
+                    setOnClickListener {
+                        dialog.dismiss()
+                        deleteMessage(target, deleteForEveryone = checkbox.isChecked)
+                    }
+                })
+            })
         }
-
-        AlertDialog.Builder(this)
-            .setView(panel)
-            .setPositiveButton(tr("delete")) { _, _ ->
-                deleteMessage(target, deleteForEveryone = checkbox.isChecked)
-            }
-            .setNegativeButton(tr("cancel"), null)
-            .show()
+        val root = FrameLayout(this).apply {
+            setBackgroundColor(0x66000000)
+            setOnClickListener { dialog.dismiss() }
+            addView(content, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+            ).apply {
+                marginStart = dp(16)
+                marginEnd = dp(16)
+            })
+        }
+        content.setOnClickListener { }
+        dialog.setContentView(root)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+        dialog.show()
     }
 
     private fun deleteMessage(target: ChatMessage, deleteForEveryone: Boolean) {
         if (deleteForEveryone) {
             sendDeleteMessageControl(target)
         }
+        clearSendTimeout(target.localId)
+        clearTextRetry(target.localId)
         val chatKey = currentChatKey()
         val removed = removeMessageEverywhere(target)
         if (!removed) {
@@ -3270,13 +4895,29 @@ class MainActivity : Activity() {
         }
         val token = messageDeleteToken(message.body, kind)
         val ownerMineOnSender = if (message.mine) "1" else "0"
+        val mediaName = when (kind) {
+            "i" -> message.imagePath?.let { File(it).name }.orEmpty()
+            "a" -> message.audioPath?.let { File(it).name }.orEmpty()
+            else -> ""
+        }
+        val mediaNameEncoded = java.util.Base64.getUrlEncoder()
+            .withoutPadding()
+            .encodeToString(mediaName.toByteArray(Charsets.UTF_8))
         val payload =
-            "$CONTROL_PREFIX$CONTROL_DELETE_MESSAGE|${message.timestamp}|$kind|$bodyEncoded|$token|$ownerMineOnSender"
+            "$CONTROL_PREFIX$CONTROL_DELETE_MESSAGE|${message.timestamp}|$kind|$bodyEncoded|$token|$ownerMineOnSender|$mediaNameEncoded"
         if (currentChatKey() == CHAT_EVERYONE) {
             meshService?.broadcastMessage(payload)
         } else {
-            val peer = selectedRecipientId ?: return
-            meshService?.sendMessage(peer.toString(), payload)
+            val peer = selectedRecipientId ?: currentChatKey()
+                .removePrefix("peer:")
+                .let { runCatching { UUID.fromString(it) }.getOrNull() }
+                ?: return
+            meshService?.prepareChatWith(peer.toString())
+            val first = meshService?.sendMessage(peer.toString(), payload)
+            if (first is SendResult.Failed) {
+                meshService?.prepareChatWith(peer.toString())
+                meshService?.sendMessage(peer.toString(), payload)
+            }
         }
     }
 
@@ -3313,6 +4954,9 @@ class MainActivity : Activity() {
         val token = parts.getOrNull(4).orEmpty()
         val ownerMineOnSender = parts.getOrNull(5)?.let { it == "1" }
         val expectedMine = ownerMineOnSender?.let { !it }
+        val mediaNameHint = runCatching {
+            String(java.util.Base64.getUrlDecoder().decode(parts.getOrNull(6).orEmpty()), Charsets.UTF_8)
+        }.getOrDefault("").trim()
 
         val chatKey = incomingChatKey(sender)
         val buffer = messagesForChat(chatKey)
@@ -3331,6 +4975,21 @@ class MainActivity : Activity() {
         if (match == null && token.isNotBlank()) {
             match = incomingCandidates.lastOrNull {
                 messageDeleteToken(it.body, kindForDelete(it)) == token
+            }
+        }
+        if (match == null && mediaNameHint.isNotBlank()) {
+            val normalizedHint = normalizeMediaName(mediaNameHint)
+            match = incomingCandidates.lastOrNull { candidate ->
+                val path = when (kind) {
+                    "i" -> candidate.imagePath
+                    "a" -> candidate.audioPath
+                    else -> null
+                } ?: return@lastOrNull false
+                val candidateName = File(path).name
+                val normalizedCandidate = normalizeMediaName(candidateName)
+                normalizedCandidate == normalizedHint ||
+                    normalizedCandidate.endsWith(normalizedHint) ||
+                    normalizedHint.endsWith(normalizedCandidate)
             }
         }
         if (match == null && bodyValue.isNotBlank()) {
@@ -3359,6 +5018,7 @@ class MainActivity : Activity() {
 
     private fun editMessage(target: ChatMessage) {
         if (target.imagePath != null || target.audioPath != null) return
+        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
         val input = EditText(this).apply {
             setText(target.body)
             setSingleLine(false)
@@ -3368,22 +5028,137 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(10), dp(12), dp(10))
             background = roundedDrawable(INPUT_SURFACE, dp(16), SOFT_PINK_STROKE)
         }
-        AlertDialog.Builder(this)
-            .setTitle(tr("edit"))
-            .setView(input)
-            .setPositiveButton(tr("save")) { _, _ ->
-                val next = input.text?.toString()?.trim().orEmpty()
-                if (next.isBlank()) return@setPositiveButton
-                target.body = next
-                if (target.localId > 0L) {
-                    chatStore.updateMessageBody(target.localId, next)
-                } else {
-                    rebuildStoredChat(currentChatKey(), messagesForChat(currentChatKey()))
-                }
-                chatAdapter.notifyDataSetChanged()
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(18), dp(20), dp(18))
+            background = roundedDrawable(INPUT_SURFACE, dp(20), SOFT_PINK_STROKE)
+            addView(terminalText(tr("edit")).apply {
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+                setPadding(0, 0, 0, dp(10))
+            })
+            addView(input, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.END
+                setPadding(0, dp(12), 0, 0)
+                addView(terminalAction(tr("cancel")).apply {
+                    textSize = 14f
+                    setTextColor(BERRY_TEXT_DIM)
+                    background = roundedDrawable(Color.TRANSPARENT, dp(16), SOFT_PINK_STROKE)
+                    setPadding(dp(16), dp(8), dp(16), dp(8))
+                    setOnClickListener { dialog.dismiss() }
+                })
+                addView(terminalAction(tr("save")).apply {
+                    textSize = 14f
+                    setTextColor(Color.WHITE)
+                    background = roundedDrawable(STRAWBERRY_RED, dp(16))
+                    setPadding(dp(16), dp(8), dp(16), dp(8))
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { marginStart = dp(8) }
+                    setOnClickListener {
+                        val next = input.text?.toString()?.trim().orEmpty()
+                        if (next.isBlank()) return@setOnClickListener
+                        dialog.dismiss()
+                        target.body = next
+                        if (target.localId > 0L) {
+                            chatStore.updateMessageBody(target.localId, next)
+                        } else {
+                            rebuildStoredChat(currentChatKey(), messagesForChat(currentChatKey()))
+                        }
+                        chatAdapter.notifyDataSetChanged()
+                    }
+                })
+            })
+        }
+        val root = FrameLayout(this).apply {
+            setBackgroundColor(0x66000000)
+            setOnClickListener { dialog.dismiss() }
+            addView(content, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+            ).apply {
+                marginStart = dp(16)
+                marginEnd = dp(16)
+            })
+        }
+        content.setOnClickListener { }
+        dialog.setContentView(root)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+        dialog.show()
+    }
+
+    private data class StyledActionItem(
+        val label: String,
+        val destructive: Boolean = false,
+        val action: () -> Unit
+    )
+
+    private fun showStyledActionDialog(actions: List<StyledActionItem>) {
+        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(14))
+            background = roundedDrawable(INPUT_SURFACE, dp(22), SOFT_PINK_STROKE)
+            actions.forEachIndexed { index, item ->
+                addView(terminalAction(item.label).apply {
+                    textSize = 16f
+                    setTextColor(if (item.destructive) STRAWBERRY_RED else BERRY_TEXT)
+                    background = roundedDrawable(
+                        if (item.destructive) 0x14FF4359 else 0x0AFF4359,
+                        dp(14),
+                        if (item.destructive) 0x55FF4359 else SOFT_PINK_STROKE
+                    )
+                    setPadding(dp(14), dp(12), dp(14), dp(12))
+                    setOnClickListener {
+                        dialog.dismiss()
+                        item.action()
+                    }
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    if (index > 0) topMargin = dp(8)
+                })
             }
-            .setNegativeButton(tr("cancel"), null)
-            .show()
+            addView(terminalAction(tr("cancel")).apply {
+                textSize = 15f
+                setTextColor(BERRY_TEXT_DIM)
+                background = roundedDrawable(Color.TRANSPARENT, dp(14), SOFT_PINK_STROKE)
+                setPadding(dp(14), dp(11), dp(14), dp(11))
+                setOnClickListener { dialog.dismiss() }
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(10)
+            })
+        }
+        val root = FrameLayout(this).apply {
+            setBackgroundColor(0x66000000)
+            setOnClickListener { dialog.dismiss() }
+            addView(content, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+            ).apply {
+                marginStart = dp(16)
+                marginEnd = dp(16)
+            })
+        }
+        content.setOnClickListener { }
+        dialog.setContentView(root)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+        dialog.show()
     }
 
     private fun removeMessageEverywhere(target: ChatMessage): Boolean {
@@ -3426,6 +5201,11 @@ class MainActivity : Activity() {
         message.audioPath != null -> "a"
         else -> "t"
     }
+
+    private fun normalizeMediaName(name: String): String =
+        name.substringAfter('_', name)
+            .lowercase(Locale.getDefault())
+            .trim()
 
     private fun matchesDeleteKind(message: ChatMessage, kind: String): Boolean = when (kind) {
         "i" -> message.imagePath != null
@@ -3516,6 +5296,15 @@ class MainActivity : Activity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == RECORD_AUDIO_REQUEST_CODE) {
+            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                startVoiceRecording()
+            } else {
+                Toast.makeText(this, tr("mic_permission_needed"), Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
         if (requestCode != 42) return
 
         if (hasRequiredPermissions()) {
@@ -3571,7 +5360,6 @@ class MainActivity : Activity() {
     private fun requiredPermissions(): List<String> = buildList {
         add(Manifest.permission.ACCESS_COARSE_LOCATION)
         add(Manifest.permission.ACCESS_FINE_LOCATION)
-        add(Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             add(Manifest.permission.BLUETOOTH_SCAN)
             add(Manifest.permission.BLUETOOTH_ADVERTISE)
@@ -3621,6 +5409,27 @@ class MainActivity : Activity() {
     private fun hideKeyboard() {
         (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
             .hideSoftInputFromWindow(usernameField.windowToken, 0)
+    }
+
+    private fun attachReplySwipe(view: View, message: ChatMessage) {
+        var downX = 0f
+        var downY = 0f
+        view.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.x
+                    downY = event.y
+                }
+                MotionEvent.ACTION_UP -> {
+                    val dx = event.x - downX
+                    val dy = kotlin.math.abs(event.y - downY)
+                    if (dx > dp(72) && dy < dp(42)) {
+                        setReplyTarget(message)
+                    }
+                }
+            }
+            false
+        }
     }
 
     private fun terminalText(value: String): TextView =
@@ -3827,6 +5636,21 @@ class MainActivity : Activity() {
         transferStatusView.visibility = View.GONE
     }
 
+    private fun formatDuration(ms: Long): String {
+        val s = (ms / 1000L).coerceAtLeast(0L)
+        return "%02d:%02d".format(s / 60L, s % 60L)
+    }
+
+    private fun recordingWave(ms: Long): String {
+        val phase = ((ms / 220L) % 4L).toInt()
+        return when (phase) {
+            0 -> "▁▂▁"
+            1 -> "▂▃▂"
+            2 -> "▃▄▃"
+            else -> "▂▁▂"
+        }
+    }
+
     private fun toggleAudioPlayback(path: String?, button: TextView) {
         val audioPath = path?.takeIf { it.isNotBlank() } ?: return
         if (!File(audioPath).exists()) return
@@ -3974,6 +5798,15 @@ class MainActivity : Activity() {
                         bottomMargin = dp(8)
                     })
                 }
+                if (shouldShowSenderLabel(position, item, isServiceLog)) {
+                    addView(senderLabel(item), LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        gravity = Gravity.LEFT
+                        bottomMargin = dp(4)
+                    })
+                }
                 if (item.imagePath != null) {
                     val bitmap = BitmapFactory.decodeFile(item.imagePath)
                     val imageSize = calculateChatImageSize(bitmap)
@@ -3998,13 +5831,25 @@ class MainActivity : Activity() {
                         imageSize.first,
                         ViewGroup.LayoutParams.WRAP_CONTENT
                     ))
+                    reactionBadge(item)?.let { badge ->
+                        addView(badge, LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT
+                        ).apply {
+                            gravity = if (item.mine) Gravity.RIGHT else Gravity.LEFT
+                            topMargin = dp(3)
+                        })
+                    }
+                    attachReplySwipe(image, item)
                     return@apply
                 }
                 if (item.audioPath != null) {
-                    addView(voiceBubble(item), LinearLayout.LayoutParams(
+                    val bubble = voiceBubble(item)
+                    addView(bubble, LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT
                     ))
+                    attachReplySwipe(bubble, item)
                     return@apply
                 }
 
@@ -4017,14 +5862,41 @@ class MainActivity : Activity() {
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ))
+                reactionBadge(item)?.let { badge ->
+                    addView(badge, LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        gravity = if (item.mine) Gravity.RIGHT else Gravity.LEFT
+                        topMargin = dp(3)
+                    })
+                }
                 if (!isServiceLog) {
                     bubble.setOnLongClickListener {
                         showMessageActions(item)
                         true
                     }
+                    attachReplySwipe(bubble, item)
                 }
             }
         }
+
+        private fun shouldShowSenderLabel(position: Int, item: ChatMessage, isServiceLog: Boolean): Boolean {
+            if (isServiceLog || item.mine) return false
+            if (position == 0) return true
+            val previous = getItem(position - 1)
+            if (previous.author == "system" || previous.author == "mesh") return true
+            if (previous.mine) return true
+            return previous.author != item.author
+        }
+
+        private fun senderLabel(item: ChatMessage): TextView =
+            terminalText(item.displayAuthor()).apply {
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(dp(6), 0, dp(6), 0)
+            }
 
         private fun shouldShowDateHeader(position: Int): Boolean {
             if (position == 0) return true
@@ -4061,6 +5933,8 @@ class MainActivity : Activity() {
 
         private fun messageBubble(item: ChatMessage): LinearLayout =
             LinearLayout(this@MainActivity).apply {
+                val scaledText = 15f * messageTextScale
+                val scaledTime = 11f * messageTextScale
                 orientation = LinearLayout.VERTICAL
                 minimumWidth = dp(74)
                 minimumHeight = dp(46)
@@ -4074,7 +5948,7 @@ class MainActivity : Activity() {
                 addView(TextView(this@MainActivity).apply {
                     text = item.body.wrapForChatBubble()
                     typeface = Typeface.DEFAULT
-                    textSize = 15f
+                    textSize = scaledText
                     setLineSpacing(dp(2).toFloat(), 1f)
                     setTextColor(if (item.mine) Color.WHITE else INCOMING_TEXT)
                     maxWidth = (resources.displayMetrics.widthPixels * 0.70f).toInt()
@@ -4083,7 +5957,7 @@ class MainActivity : Activity() {
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ))
 
-                addView(messageTimeView(item, overOutgoing = item.mine), LinearLayout.LayoutParams(
+                addView(messageTimeView(item, overOutgoing = item.mine, textSize = scaledTime), LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply {
@@ -4127,6 +6001,7 @@ class MainActivity : Activity() {
                     })
                 })
                 addView(messageTimeView(item, overOutgoing = item.mine), LinearLayout.LayoutParams(
+                    // keep shared time style with message scaling
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply {
@@ -4139,12 +6014,22 @@ class MainActivity : Activity() {
                 }
             }
 
-        private fun messageTimeView(item: ChatMessage, overOutgoing: Boolean): View {
+        private fun reactionBadge(item: ChatMessage): TextView? {
+            val reaction = item.reaction ?: return null
+            return terminalText(reaction).apply {
+                textSize = 14f
+                background = roundedDrawable(INPUT_SURFACE, dp(12), SOFT_PINK_STROKE)
+                setPadding(dp(8), dp(3), dp(8), dp(3))
+            }
+        }
+
+        private fun messageTimeView(item: ChatMessage, overOutgoing: Boolean, textSize: Float = 11f * messageTextScale): View {
             val tint = if (overOutgoing) 0xE6FFFFFF.toInt() else BERRY_TEXT_DIM
             val statusLabel = when (item.status) {
                 MessageStatus.SENDING -> tr("status_sprouting")
                 MessageStatus.DELIVERED -> tr("status_ripe")
                 MessageStatus.READ -> tr("status_ripe")
+                MessageStatus.FAILED -> tr("status_failed")
                 null -> if (selectedRecipientId == null) tr("broadcast") else ""
             }
             if (!item.mine || item.status == null) {
@@ -4152,7 +6037,7 @@ class MainActivity : Activity() {
                     text = listOf(statusLabel, item.displayTime())
                         .filter { it.isNotBlank() }
                         .joinToString("  ")
-                    textSize = 11f
+                    this.textSize = textSize
                     typeface = Typeface.DEFAULT
                     gravity = Gravity.RIGHT
                     setTextColor(tint)
@@ -4166,7 +6051,7 @@ class MainActivity : Activity() {
                     text = listOf(statusLabel, item.displayTime())
                         .filter { it.isNotBlank() }
                         .joinToString("  ")
-                    textSize = 11f
+                    this.textSize = textSize
                     typeface = Typeface.DEFAULT
                     gravity = Gravity.RIGHT
                     setTextColor(tint)
@@ -4203,6 +6088,7 @@ class MainActivity : Activity() {
                     drawMark(canvas, px(1f))
                     drawMark(canvas, px(7f))
                 }
+                MessageStatus.FAILED -> drawFail(canvas)
             }
         }
 
@@ -4219,6 +6105,11 @@ class MainActivity : Activity() {
                 lineTo(startX + px(10f), px(2f))
             }
             canvas.drawPath(path, markPaint)
+        }
+
+        private fun drawFail(canvas: Canvas) {
+            canvas.drawLine(px(5f), px(3f), px(13f), px(11f), markPaint)
+            canvas.drawLine(px(13f), px(3f), px(5f), px(11f), markPaint)
         }
 
         private fun px(value: Float): Float =
@@ -4432,6 +6323,7 @@ class MainActivity : Activity() {
         val mine: Boolean,
         val imagePath: String? = null,
         val audioPath: String? = null,
+        var reaction: String? = null,
         val timestamp: Long = System.currentTimeMillis(),
         var messageId: UUID? = null,
         var status: MessageStatus? = null,
@@ -4440,6 +6332,7 @@ class MainActivity : Activity() {
 
     private enum class MessageStatus {
         SENDING,
+        FAILED,
         DELIVERED,
         READ
     }
@@ -4454,6 +6347,12 @@ class MainActivity : Activity() {
         val label: String,
         val nodeId: UUID?,
         val isBroadcast: Boolean
+    )
+
+    private data class IncomingMeta(
+        val senderRaw: String,
+        val timestamp: Long,
+        val payload: String
     )
 
     companion object {
@@ -4524,13 +6423,34 @@ class MainActivity : Activity() {
         private const val UI_SETTINGS_PREFS = "truskawka_ui_settings"
         private const val UI_SETTINGS_THEME_DARK = "theme_dark"
         private const val UI_SETTINGS_LANGUAGE = "language"
+        private const val UI_SETTINGS_APP_LOCK_ENABLED = "app_lock_enabled"
+        private const val UI_SETTINGS_APP_LOCK_PIN = "app_lock_pin"
+        private const val UI_SETTINGS_APP_LOCK_TIMEOUT = "app_lock_timeout_min"
+        private const val UI_SETTINGS_NOTIF_ENABLED = "notif_enabled"
+        private const val UI_SETTINGS_NOTIF_PREVIEW = "notif_preview"
+        private const val UI_SETTINGS_NOTIF_BROADCAST = "notif_broadcast"
+        private const val UI_SETTINGS_CHAT_COMPACT = "chat_compact"
+        private const val UI_SETTINGS_CHAT_TEXT_SCALE = "chat_text_scale"
+        private const val UI_SETTINGS_TIME_24H = "time_24h"
+        private const val UI_SETTINGS_DATE_SHORT = "date_short"
+        private const val UI_SETTINGS_MESH_AGGRESSIVE = "mesh_aggressive"
+        private const val UI_SETTINGS_MESH_MAX_HOPS = "mesh_max_hops"
+        private const val UI_SETTINGS_QUICK_START_HIDDEN = "quick_start_hidden"
+        private const val RECORD_AUDIO_REQUEST_CODE = 43
         private const val IMAGE_PICK_REQUEST = 93
+        private const val BACKUP_IMPORT_REQUEST = 94
+        private const val BACKUP_EXPORT_REQUEST = 95
+        private const val MAX_BACKUP_BYTES = 32 * 1024 * 1024
         private const val MAX_IMAGE_BYTES = 2 * 1024 * 1024
         private const val TARGET_IMAGE_BYTES = 512 * 1024
         private const val MAX_IMAGE_DIMENSION = 1280
         private const val VOICE_MIN_DURATION_MS = 400L
         private const val VOICE_MAX_DURATION_MS = 60_000L
         private const val MAX_VOICE_BYTES = 1_200_000L
+private const val MESSAGE_SEND_TIMEOUT_MS = 60_000L
+        private const val MESSAGE_RETRY_INTERVAL_MS = 2_500L
+        private const val MESSAGE_RETRY_ATTEMPTS = 8
+        private const val MAX_MEDIA_CACHE_BYTES = 120L * 1024L * 1024L
         private const val BUBBLE_WRAP_CHARS = 24
         private const val CONTROL_PREFIX = "__truskawka_ctl__:"
         private const val CONTROL_DELETE_MESSAGE = "dm"

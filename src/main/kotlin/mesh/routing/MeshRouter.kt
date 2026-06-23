@@ -2,6 +2,7 @@ package mesh.routing
 
 import mesh.protocol.MeshPacket
 import mesh.protocol.PacketType
+import java.nio.ByteBuffer
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
@@ -24,6 +25,7 @@ class MeshRouter(
     private val messageHandler: MessageHandler,
     private val transmitter: PacketTransmitter
 ) {
+    private var maxRelayHops: Byte = MeshPacket.DEFAULT_TTL
     // Deduplication: seen message IDs with timestamp (auto-expire after 1 hour)
     private val seenMessages = ConcurrentHashMap<UUID, Long>()
     private val seenMessagesMaxAge = 3600_000L // 1 hour
@@ -165,6 +167,7 @@ class MeshRouter(
                 requiresAck = requiresAck,
                 isEncrypted = true
             ),
+            ttl = maxRelayHops,
             messageId = UUID.randomUUID(),
             senderId = localNodeId,
             recipientId = recipientId,
@@ -187,6 +190,10 @@ class MeshRouter(
             storePendingMessage(packet)
         }
         return packet.messageId
+    }
+
+    fun setMaxRelayHops(maxHops: Int) {
+        maxRelayHops = maxHops.coerceIn(1, MeshPacket.DEFAULT_TTL.toInt()).toByte()
     }
 
     /**
@@ -256,11 +263,15 @@ class MeshRouter(
     }
 
     private fun handleAck(packet: MeshPacket) {
-        // Remove from pending queue
-        val ackedMessageId = UUID(
-            java.nio.ByteBuffer.wrap(packet.payload).long,
-            java.nio.ByteBuffer.wrap(packet.payload, 8, 8).long
-        )
+        if (packet.recipientId != localNodeId) {
+            if (shouldRelay(packet)) {
+                relayPacket(packet)
+            }
+            return
+        }
+        if (packet.payload.size < 16) return
+        val buffer = ByteBuffer.wrap(packet.payload)
+        val ackedMessageId = UUID(buffer.long, buffer.long)
         pendingMessages.removeIf { it.packet.messageId == ackedMessageId }
         messageHandler.onAckReceived(ackedMessageId)
     }
@@ -330,7 +341,7 @@ class MeshRouter(
     }
 
     private fun sendAcknowledgment(originalPacket: MeshPacket) {
-        val payload = java.nio.ByteBuffer.allocate(16)
+        val payload = ByteBuffer.allocate(16)
             .putLong(originalPacket.messageId.mostSignificantBits)
             .putLong(originalPacket.messageId.leastSignificantBits)
             .array()
@@ -345,7 +356,11 @@ class MeshRouter(
             payload = payload,
             signature = ByteArray(0)
         )
-        transmitter.sendTo(originalPacket.senderId, ackPacket)
+        if (neighbors.containsKey(originalPacket.senderId)) {
+            transmitter.sendTo(originalPacket.senderId, ackPacket)
+        } else {
+            transmitter.broadcast(ackPacket)
+        }
     }
 
     // --- Helper methods ---

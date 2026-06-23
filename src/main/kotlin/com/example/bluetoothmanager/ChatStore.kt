@@ -31,6 +31,9 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         if (oldVersion < 5) {
             addColumnIfMissing(db, "messages", "audio_path", "TEXT")
         }
+        if (oldVersion < 6) {
+            addColumnIfMissing(db, "messages", "reaction", "TEXT")
+        }
     }
 
     fun ensureChat(chat: StoredChat) {
@@ -198,6 +201,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             val mineIndex = cursor.getColumnIndexOrThrow("mine")
             val imageIndex = cursor.getColumnIndexOrThrow("image_path")
             val audioIndex = cursor.getColumnIndexOrThrow("audio_path")
+            val reactionIndex = cursor.getColumnIndexOrThrow("reaction")
             val timestampIndex = cursor.getColumnIndexOrThrow("timestamp")
             val meshIdIndex = cursor.getColumnIndexOrThrow("mesh_message_id")
             val statusIndex = cursor.getColumnIndexOrThrow("status")
@@ -209,6 +213,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                     mine = cursor.getInt(mineIndex) == 1,
                     imagePath = cursor.getString(imageIndex),
                     audioPath = cursor.getString(audioIndex),
+                    reaction = cursor.getString(reactionIndex),
                     timestamp = cursor.getLong(timestampIndex),
                     meshMessageId = cursor.getString(meshIdIndex),
                     status = cursor.getString(statusIndex)
@@ -238,6 +243,11 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
 
     fun updateMessageBody(localId: Long, body: String) {
         val values = ContentValues().apply { put("body", body) }
+        writableDatabase.update("messages", values, "id = ?", arrayOf(localId.toString()))
+    }
+
+    fun updateMessageReaction(localId: Long, reaction: String?) {
+        val values = ContentValues().apply { put("reaction", reaction) }
         writableDatabase.update("messages", values, "id = ?", arrayOf(localId.toString()))
     }
 
@@ -292,6 +302,13 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         }
     }
 
+    fun clearAllData() {
+        writableDatabase.delete("messages", null, null)
+        writableDatabase.delete("chats", null, null)
+        writableDatabase.delete("peers", null, null)
+        seedBaseChats(writableDatabase)
+    }
+
     private fun createMessages(db: SQLiteDatabase) {
         db.execSQL(
             """
@@ -303,6 +320,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 mine INTEGER NOT NULL,
                 image_path TEXT,
                 audio_path TEXT,
+                reaction TEXT,
                 timestamp INTEGER NOT NULL,
                 mesh_message_id TEXT,
                 status TEXT
@@ -409,6 +427,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             put("mine", if (mine) 1 else 0)
             put("image_path", imagePath)
             put("audio_path", audioPath)
+            put("reaction", reaction)
             put("timestamp", timestamp)
             put("mesh_message_id", meshMessageId)
             put("status", status)
@@ -447,7 +466,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
 
     companion object {
         private const val DB_NAME = "truskawka_chats.db"
-        private const val DB_VERSION = 5
+        private const val DB_VERSION = 6
         const val CHAT_EVERYONE = "everyone"
         const val CHAT_SAVED = "saved"
         private const val LEGACY_CHAT_MESH = "mesh"
@@ -544,6 +563,7 @@ data class StoredMessage(
     val mine: Boolean,
     val imagePath: String?,
     val audioPath: String?,
+    val reaction: String?,
     val timestamp: Long,
     val meshMessageId: String?,
     val status: String?

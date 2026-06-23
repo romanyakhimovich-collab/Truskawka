@@ -16,6 +16,7 @@ import mesh.transport.BleServiceCallback
 import mesh.transport.BleTransportService
 import java.nio.ByteBuffer
 import java.util.*
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -74,6 +75,7 @@ class MeshManager(
     private val aliases = ConcurrentHashMap<UUID, String>()
     private val incomingFiles = ConcurrentHashMap<UUID, IncomingFileTransfer>()
     private var localAlias: String = "@${localNodeId.toString().take(8)}"
+    private var maxRelayHops: Int = MeshPacket.DEFAULT_TTL.toInt()
 
     // Pending messages awaiting session establishment
     private val pendingOutbox = ConcurrentHashMap<UUID, MutableList<PendingOutboxMessage>>()
@@ -97,6 +99,7 @@ class MeshManager(
 
         // Initialize router
         router = MeshRouter(localNodeId, this, combinedTransmitter)
+        router.setMaxRelayHops(maxRelayHops)
 
         // Configure transports
         bleTransport.setRouter(router)
@@ -154,9 +157,13 @@ class MeshManager(
         // Check if we have an established session
         if (!crypto.hasSessionWith(recipientId)) {
             // Queue message and initiate handshake
-            queuePendingMessage(recipientId, messageBytes)
+            val added = queuePendingMessage(recipientId, messageBytes)
             initiateHandshake(recipientId)
-            return SendResult.Queued("No session, handshake initiated")
+            return if (added) {
+                SendResult.Queued("No session, handshake initiated")
+            } else {
+                SendResult.Queued("No session, already queued")
+            }
         }
 
         return sendEncryptedMessage(recipientId, messageBytes)
@@ -174,6 +181,7 @@ class MeshManager(
         val packet = MeshPacket(
             type = PacketType.MESSAGE,
             flags = PacketFlags(isEncrypted = false),
+            ttl = maxRelayHops.toByte(),
             messageId = UUID.randomUUID(),
             senderId = localNodeId,
             recipientId = MeshPacket.BROADCAST_ID,
@@ -240,6 +248,7 @@ class MeshManager(
         val packet = MeshPacket(
             type = type,
             flags = PacketFlags(isEncrypted = false),
+            ttl = maxRelayHops.toByte(),
             messageId = UUID.randomUUID(),
             senderId = localNodeId,
             recipientId = recipientId,
@@ -272,9 +281,20 @@ class MeshManager(
         return SendResult.Sent(messageId)
     }
 
-    private fun queuePendingMessage(recipientId: UUID, message: ByteArray) {
-        pendingOutbox.computeIfAbsent(recipientId) { mutableListOf() }
-            .add(PendingOutboxMessage(message, System.currentTimeMillis()))
+    private fun queuePendingMessage(recipientId: UUID, message: ByteArray): Boolean {
+        val queue = pendingOutbox.computeIfAbsent(recipientId) {
+            Collections.synchronizedList(mutableListOf())
+        }
+        synchronized(queue) {
+            if (queue.any { it.payload.contentEquals(message) }) {
+                return false
+            }
+            if (queue.size >= MAX_PENDING_OUTBOX_PER_PEER) {
+                queue.removeAt(0)
+            }
+            queue.add(PendingOutboxMessage(message, System.currentTimeMillis()))
+        }
+        return true
     }
 
     private fun retryPendingMessages() {
@@ -283,16 +303,20 @@ class MeshManager(
         pendingOutbox.forEach { (recipientId, messages) ->
             if (crypto.hasSessionWith(recipientId)) {
                 // Session established, send pending messages
-                messages.forEach { pending ->
+                val snapshot = synchronized(messages) { messages.toList() }
+                snapshot.forEach { pending ->
                     sendEncryptedMessage(recipientId, pending.payload)
                 }
                 pendingOutbox.remove(recipientId)
             } else {
                 // Remove expired messages (older than 24 hours)
-                messages.removeIf { now - it.queuedAt > 24 * 3600 * 1000 }
+                val hasPending = synchronized(messages) {
+                    messages.removeIf { now - it.queuedAt > 24 * 3600 * 1000 }
+                    messages.isNotEmpty()
+                }
 
                 // Retry handshake
-                if (messages.isNotEmpty()) {
+                if (hasPending) {
                     initiateHandshake(recipientId)
                 }
             }
@@ -306,6 +330,7 @@ class MeshManager(
         val packet = MeshPacket(
             type = PacketType.DISCOVERY,
             flags = PacketFlags(isEncrypted = false, useBleOnly = true),
+            ttl = maxRelayHops.toByte(),
             messageId = UUID.randomUUID(),
             senderId = localNodeId,
             recipientId = MeshPacket.BROADCAST_ID,
@@ -325,6 +350,7 @@ class MeshManager(
         val packet = MeshPacket(
             type = PacketType.HANDSHAKE,
             flags = PacketFlags(),
+            ttl = maxRelayHops.toByte(),
             messageId = UUID.randomUUID(),
             senderId = localNodeId,
             recipientId = targetNodeId,
@@ -540,9 +566,9 @@ class MeshManager(
                 peerListener?.invoke(nodeId, PeerEvent.SESSION_ESTABLISHED)
 
                 // Send any pending messages
-                pendingOutbox[nodeId]?.forEach { pending ->
-                    sendEncryptedMessage(nodeId, pending.payload)
-                }
+                val queued = pendingOutbox[nodeId]
+                val snapshot = if (queued != null) synchronized(queued) { queued.toList() } else emptyList()
+                snapshot.forEach { pending -> sendEncryptedMessage(nodeId, pending.payload) }
                 pendingOutbox.remove(nodeId)
             }
             is HandshakeResult.Failed -> {
@@ -620,6 +646,13 @@ class MeshManager(
         return knownPeers.values
             .sortedByDescending { it.lastSeen }
             .toList()
+    }
+
+    fun setMaxRelayHops(maxHops: Int) {
+        maxRelayHops = maxHops.coerceIn(1, MeshPacket.DEFAULT_TTL.toInt())
+        if (::router.isInitialized) {
+            router.setMaxRelayHops(maxRelayHops)
+        }
     }
 
     fun getAlias(nodeId: UUID): String = aliases[nodeId]
@@ -709,6 +742,7 @@ private const val FILE_CHUNK_SIZE = 384
 private const val MAX_IMAGE_BYTES = 2 * 1024 * 1024
 private const val MAX_IMAGE_CHUNKS = 6000
 private const val KNOWN_PEER_MAX_AGE_MS = 60_000L
+private const val MAX_PENDING_OUTBOX_PER_PEER = 96
 
 private fun ByteArray.asIterableChunks(size: Int): List<ByteArray> =
     indices.step(size).map { start ->

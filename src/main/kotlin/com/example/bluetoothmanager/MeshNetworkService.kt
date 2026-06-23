@@ -36,11 +36,16 @@ class MeshNetworkService : Service() {
     private lateinit var localNodeId: UUID
     private var wifiDirectPeers: List<WifiP2pDevice> = emptyList()
     private var automaticDiscoveryStarted = false
+    private var discoveryPulseMs = DISCOVERY_PULSE_MS
+    private var maxRelayHops = 8
+    private var notificationsEnabled = true
+    private var notificationPreviewEnabled = true
+    private var notificationBroadcastEnabled = true
 
     private val discoveryPulse = object : Runnable {
         override fun run() {
             startNearbyDiscovery(silent = true)
-            mainHandler.postDelayed(this, DISCOVERY_PULSE_MS)
+            mainHandler.postDelayed(this, discoveryPulseMs)
         }
     }
 
@@ -53,6 +58,7 @@ class MeshNetworkService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        loadRuntimeSettings()
         createNotificationChannel()
         startMeshForeground()
 
@@ -88,16 +94,21 @@ class MeshNetworkService : Service() {
             wifiDirectTransport = CompositeOpportunisticTransport(opportunisticTransports),
             localNodeId = localNodeId
         )
+        meshManager.setMaxRelayHops(maxRelayHops)
         meshManager.setMessageListener { senderId, message, timestamp, isBroadcast ->
             if (senderId == localNodeId) {
                 return@setMessageListener
             }
             val scope = if (isBroadcast) "broadcast" else "private"
-            showIncomingNotification(
-                title = if (isBroadcast) "Broadcast from ${meshManager.getAlias(senderId)}" else meshManager.getAlias(senderId),
-                body = message,
-                notificationId = senderId.hashCode() xor timestamp.toInt()
-            )
+            val isControl = message.startsWith(CONTROL_PREFIX)
+            if (!isControl) {
+                showIncomingNotification(
+                    isBroadcast = isBroadcast,
+                    title = if (isBroadcast) "Broadcast from ${meshManager.getAlias(senderId)}" else meshManager.getAlias(senderId),
+                    body = message,
+                    notificationId = senderId.hashCode() xor timestamp.toInt()
+                )
+            }
             publish("message from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: $message")
         }
         meshManager.setFileListener { senderId, fileName, mimeType, bytes, timestamp, isBroadcast ->
@@ -108,6 +119,7 @@ class MeshNetworkService : Service() {
             val scope = if (isBroadcast) "broadcast" else "private"
             val isAudio = mimeType.startsWith("audio/", ignoreCase = true)
             showIncomingNotification(
+                isBroadcast = isBroadcast,
                 title = if (isBroadcast) "Broadcast from ${meshManager.getAlias(senderId)}" else meshManager.getAlias(senderId),
                 body = if (isAudio) "sent a voice message" else "sent an image",
                 notificationId = senderId.hashCode() xor timestamp.toInt()
@@ -209,6 +221,36 @@ class MeshNetworkService : Service() {
         wifiDirectSocketManager.startDiscovery()
         publish("peer counter: ${peerCount()}")
         return peerCount()
+    }
+
+    fun configureDiscovery(aggressive: Boolean) {
+        discoveryPulseMs = if (aggressive) 7_000L else DISCOVERY_PULSE_MS
+        saveRuntimeSetting(KEY_MESH_AGGRESSIVE, aggressive)
+        if (automaticDiscoveryStarted) {
+            mainHandler.removeCallbacks(discoveryPulse)
+            mainHandler.postDelayed(discoveryPulse, discoveryPulseMs)
+        }
+    }
+
+    fun configureNotificationSettings(enabled: Boolean, showPreview: Boolean, includeBroadcast: Boolean) {
+        notificationsEnabled = enabled
+        notificationPreviewEnabled = showPreview
+        notificationBroadcastEnabled = includeBroadcast
+        val prefs = getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+        prefs.edit()
+            .putBoolean(KEY_NOTIF_ENABLED, enabled)
+            .putBoolean(KEY_NOTIF_PREVIEW, showPreview)
+            .putBoolean(KEY_NOTIF_BROADCAST, includeBroadcast)
+            .apply()
+    }
+
+    fun configureMaxRelayHops(maxHops: Int) {
+        maxRelayHops = maxHops.coerceIn(1, 8)
+        meshManager.setMaxRelayHops(maxRelayHops)
+        getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(KEY_MESH_MAX_HOPS, maxRelayHops)
+            .apply()
     }
 
     private fun startAutomaticDiscovery() {
@@ -418,7 +460,9 @@ class MeshNetworkService : Service() {
         }
     }
 
-    private fun showIncomingNotification(title: String, body: String, notificationId: Int) {
+    private fun showIncomingNotification(isBroadcast: Boolean, title: String, body: String, notificationId: Int) {
+        if (!notificationsEnabled) return
+        if (isBroadcast && !notificationBroadcastEnabled) return
         val manager = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
@@ -438,7 +482,7 @@ class MeshNetworkService : Service() {
 
         val notification = Notification.Builder(this, MESSAGES_CHANNEL_ID)
             .setContentTitle(title)
-            .setContentText(body)
+            .setContentText(if (notificationPreviewEnabled) body else "New message")
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
@@ -446,6 +490,23 @@ class MeshNetworkService : Service() {
             .setVisibility(Notification.VISIBILITY_PRIVATE)
             .build()
         manager.notify(notificationId, notification)
+    }
+
+    private fun loadRuntimeSettings() {
+        val prefs = getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+        val aggressive = prefs.getBoolean(KEY_MESH_AGGRESSIVE, true)
+        discoveryPulseMs = if (aggressive) 7_000L else DISCOVERY_PULSE_MS
+        maxRelayHops = prefs.getInt(KEY_MESH_MAX_HOPS, 8).coerceIn(1, 8)
+        notificationsEnabled = prefs.getBoolean(KEY_NOTIF_ENABLED, true)
+        notificationPreviewEnabled = prefs.getBoolean(KEY_NOTIF_PREVIEW, true)
+        notificationBroadcastEnabled = prefs.getBoolean(KEY_NOTIF_BROADCAST, true)
+    }
+
+    private fun saveRuntimeSetting(key: String, value: Boolean) {
+        getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(key, value)
+            .apply()
     }
 
     private fun UUID.shortId(): String = toString().take(8)
@@ -482,9 +543,16 @@ class MeshNetworkService : Service() {
         private const val CHANNEL_ID = "mesh_network"
         private const val MESSAGES_CHANNEL_ID = "mesh_messages"
         private const val NOTIFICATION_ID = 1001
+        private const val UI_SETTINGS_PREFS = "truskawka_ui_settings"
+        private const val KEY_MESH_AGGRESSIVE = "mesh_aggressive"
+        private const val KEY_MESH_MAX_HOPS = "mesh_max_hops"
+        private const val KEY_NOTIF_ENABLED = "notif_enabled"
+        private const val KEY_NOTIF_PREVIEW = "notif_preview"
+        private const val KEY_NOTIF_BROADCAST = "notif_broadcast"
         private const val MAX_NICKNAME_LENGTH = 12
         private const val KEY_NICKNAME_CHANGED_AT = "nickname_changed_at"
         private const val NICKNAME_CHANGE_INTERVAL_MS = 7L * 24L * 60L * 60L * 1000L
         private const val DISCOVERY_PULSE_MS = 15_000L
+        private const val CONTROL_PREFIX = "__truskawka_ctl__:"
     }
 }
