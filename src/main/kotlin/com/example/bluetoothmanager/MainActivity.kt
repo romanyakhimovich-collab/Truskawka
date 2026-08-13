@@ -15,15 +15,18 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.ColorFilter
 import android.graphics.Color
 import android.graphics.ImageDecoder
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.PixelFormat
 import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.location.LocationManager
 import android.media.MediaPlayer
@@ -103,6 +106,7 @@ class MainActivity : Activity() {
     private var notificationBroadcastEnabled = true
     private var compactChatListEnabled = false
     private var messageTextScale = 1.0f
+    private var cropChatImagesEnabled = true
     private var use24HourFormat = true
     private var shortDateFormatEnabled = false
     private var meshAggressiveMode = true
@@ -139,6 +143,8 @@ class MainActivity : Activity() {
             get() = this@MainActivity.selectedRecipientId
         override val activePlayingPath: String?
             get() = this@MainActivity.activePlayingPath
+        override val cropChatImages: Boolean
+            get() = this@MainActivity.cropChatImagesEnabled
 
         override fun dp(value: Int): Int = this@MainActivity.dp(value)
         override fun tr(key: String): String = this@MainActivity.tr(key)
@@ -187,7 +193,7 @@ class MainActivity : Activity() {
         override fun run() {
             if (!isRecordingVoice) return
             val elapsed = (System.currentTimeMillis() - recordingStartedAt).coerceAtLeast(0L)
-            showImageProgress("${tr("recording_voice")} ${formatDuration(elapsed)} ${recordingWave(elapsed)}")
+            showImageProgress("${tr("recording_voice")} ${formatDuration(elapsed)}")
             mainHandler.postDelayed(this, 220L)
         }
     }
@@ -744,6 +750,19 @@ class MainActivity : Activity() {
         startActivityForResult(intent, IMAGE_PICK_REQUEST)
     }
 
+    private fun openProfileAvatarPicker() {
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Intent(MediaStore.ACTION_PICK_IMAGES).apply {
+                type = "image/*"
+            }
+        } else {
+            Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI).apply {
+                type = "image/*"
+            }
+        }
+        startActivityForResult(intent, PROFILE_AVATAR_PICK_REQUEST)
+    }
+
     @Deprecated("Deprecated Android callback is enough for this minimal Activity.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
@@ -752,8 +771,78 @@ class MainActivity : Activity() {
         takePersistableUriPermissionIfPossible(uri, data.flags)
         when (requestCode) {
             IMAGE_PICK_REQUEST -> showSelectedImageComposer(uri)
+            PROFILE_AVATAR_PICK_REQUEST -> showAvatarCropper(uri)
             BACKUP_EXPORT_REQUEST -> exportEncryptedBackupTo(uri)
             BACKUP_IMPORT_REQUEST -> importEncryptedBackup(uri)
+        }
+    }
+
+    private fun showAvatarCropper(uri: Uri) {
+        val bitmap = decodeBitmapForAvatar(uri) ?: run {
+            Toast.makeText(this, tr("could_not_read_image"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
+        lateinit var cropView: AvatarCropView
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(44), dp(16), dp(18))
+            setBackgroundColor(CREAM_BACKGROUND)
+            addView(terminalText(tr("adjust_profile_photo")).apply {
+                textSize = 22f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+            })
+            addView(terminalText(tr("adjust_profile_photo_desc")).apply {
+                textSize = 13f
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(0, dp(6), 0, dp(12))
+            })
+            cropView = AvatarCropView(this@MainActivity, bitmap)
+            addView(cropView, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            ))
+            addView(terminalAction(tr("save")).apply {
+                textSize = 16f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                background = roundedDrawable(STRAWBERRY_RED, dp(18))
+                setPadding(dp(14), dp(11), dp(14), dp(11))
+                setOnClickListener {
+                    val cropped = cropView.crop(512)
+                    AppProfileStore.setAvatarBitmap(this@MainActivity, cropped)
+                    cropped.recycle()
+                    runCatching { chatAdapter.notifyDataSetChanged() }
+                    dialog.dismiss()
+                    showOwnProfilePage()
+                }
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(14)
+            })
+        }
+        dialog.setContentView(root)
+        dialog.setOnDismissListener {
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        dialog.show()
+        dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+    }
+
+    private fun decodeBitmapForAvatar(uri: Uri): Bitmap? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            runCatching {
+                ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { decoder, _, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                }
+            }.getOrNull()
+        } else {
+            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
         }
     }
 
@@ -774,22 +863,14 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(CREAM_BACKGROUND)
             setPadding(dp(12), dp(18), dp(12), dp(12))
-            addView(LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                addView(terminalText(tr("preview_image")).apply {
-                    textSize = 16f
-                    typeface = Typeface.DEFAULT_BOLD
-                    setTextColor(BERRY_TEXT)
-                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                addView(terminalAction("X").apply {
-                    textSize = 18f
-                    setOnClickListener { dialog.dismiss() }
-                })
+            addView(terminalText(tr("preview_image")).apply {
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
             })
             addView(ImageView(this@MainActivity).apply {
                 adjustViewBounds = true
-                scaleType = ImageView.ScaleType.FIT_CENTER
+                scaleType = ImageView.ScaleType.CENTER_CROP
                 setImageURI(uri)
                 background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
                 setPadding(dp(6), dp(6), dp(6), dp(6))
@@ -1064,10 +1145,6 @@ class MainActivity : Activity() {
             addMessage("mesh", tr("mesh_hop_limit_reached"), false)
             return
         }
-        if (targetId != null && !isPeerOnline(targetId)) {
-            addMessage("mesh", "${tr("voice_send_failed")}: ${tr("offline")}", false)
-            return
-        }
         val bytes = runCatching { file.readBytes() }.getOrNull()
         if (bytes == null || bytes.isEmpty()) {
             addMessage("mesh", tr("voice_read_failed"), false)
@@ -1096,21 +1173,25 @@ class MainActivity : Activity() {
         showImageProgress(tr("sending_voice"))
         sentCounter += 1
         thread(name = "voice-send") {
-            var result = meshService?.sendImage(
-                targetId?.toString(),
-                file.name,
-                "audio/mp4",
-                bytes
-            ) ?: SendResult.Failed("service offline")
-            if (result is SendResult.Failed && targetId != null) {
-                meshService?.prepareChatWith(targetId.toString())
-                Thread.sleep(220L)
+            var result: SendResult = SendResult.Failed("send not attempted")
+            val attempts = if (targetId == null) 1 else VOICE_SEND_ATTEMPTS
+            for (attempt in 0 until attempts) {
+                if (targetId != null) {
+                    meshService?.prepareChatWith(targetId.toString())
+                }
                 result = meshService?.sendImage(
-                    targetId.toString(),
+                    targetId?.toString(),
                     file.name,
                     "audio/mp4",
                     bytes
                 ) ?: SendResult.Failed("service offline")
+                if (result !is SendResult.Failed) {
+                    break
+                }
+                if (targetId == null || !result.error.contains("session", ignoreCase = true)) {
+                    break
+                }
+                Thread.sleep(VOICE_SEND_RETRY_DELAY_MS * (attempt + 1L))
             }
             runOnUiThread {
                 if (result is SendResult.Failed) {
@@ -1129,10 +1210,20 @@ class MainActivity : Activity() {
     }
 
     private fun updateActionButton() {
-        actionButton.text = when {
-            isRecordingVoice -> tr("recording_short")
-            messageInput.text.toString().isBlank() -> tr("mic_icon")
-            else -> ">"
+        actionButton.setCompoundDrawables(null, null, null, null)
+        when {
+            isRecordingVoice -> {
+                actionButton.text = tr("recording_short")
+                actionButton.background = circleDrawable(STRAWBERRY_RED)
+            }
+            messageInput.text.toString().isBlank() -> {
+                actionButton.text = ""
+                actionButton.background = microphoneButtonDrawable()
+            }
+            else -> {
+                actionButton.text = ">"
+                actionButton.background = circleDrawable(STRAWBERRY_RED)
+            }
         }
         actionButton.textSize = if (messageInput.text.toString().isBlank() || isRecordingVoice) 16f else 22f
     }
@@ -1202,6 +1293,9 @@ class MainActivity : Activity() {
 
         val summaries = chatStore.listChats()
             .filter { it.kind != ChatKind.PEER.name || it.peerId != null }
+        val hasPrivateChats = summaries.any {
+            it.kind == ChatKind.PEER.name && it.messageCount > 0
+        }
         val uiPrefs = getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
         val quickStartHidden = uiPrefs.getBoolean(UI_SETTINGS_QUICK_START_HIDDEN, false)
         if (!quickStartHidden) {
@@ -1231,9 +1325,9 @@ class MainActivity : Activity() {
                 })
                 addView(terminalAction(tr("got_it")).apply {
                     textSize = 13f
-                    setTextColor(Color.WHITE)
+                    setTextColor(BERRY_TEXT_DIM)
                     gravity = Gravity.CENTER
-                    background = roundedDrawable(STRAWBERRY_RED, dp(10))
+                    background = roundedDrawable(Color.TRANSPARENT, dp(10), SOFT_PINK_STROKE)
                     setPadding(dp(12), dp(7), dp(12), dp(7))
                     setOnClickListener {
                         uiPrefs.edit().putBoolean(UI_SETTINGS_QUICK_START_HIDDEN, true).apply()
@@ -1247,6 +1341,46 @@ class MainActivity : Activity() {
                     topMargin = dp(10)
                     gravity = Gravity.END
                 })
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(10)
+            })
+        }
+        if (!hasPrivateChats) {
+            listContent.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                background = roundedDrawable(INPUT_SURFACE, dp(14), SOFT_PINK_STROKE)
+                setPadding(dp(18), dp(18), dp(18), dp(18))
+                addView(terminalText(tr("empty_chats_title")).apply {
+                    textSize = 17f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(BERRY_TEXT)
+                    gravity = Gravity.CENTER
+                })
+                addView(terminalText(tr("empty_chats_desc")).apply {
+                    textSize = 13f
+                    setTextColor(BERRY_TEXT_DIM)
+                    gravity = Gravity.CENTER
+                    setPadding(0, dp(8), 0, dp(14))
+                })
+                addView(terminalAction(tr("find_people_nearby")).apply {
+                    textSize = 14f
+                    typeface = Typeface.DEFAULT_BOLD
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.WHITE)
+                    background = roundedDrawable(STRAWBERRY_RED, dp(18))
+                    setPadding(dp(16), dp(10), dp(16), dp(10))
+                    setOnClickListener {
+                        dialog.dismiss()
+                        showMeshPanel(scanFirst = true)
+                    }
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
             }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -1313,10 +1447,10 @@ class MainActivity : Activity() {
             setPadding(dp(6), dp(8), dp(6), dp(8))
             background = roundedDrawable(INPUT_SURFACE, dp(14), SOFT_PINK_STROKE)
 
-            addView(chatListBottomItem(tr("new_contacts"), selected == PageTab.NEW_CONTACTS, onNewContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+            addView(chatListBottomItem(tr("nav_nearby"), selected == PageTab.NEW_CONTACTS, onNewContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
                 marginEnd = dp(4)
             })
-            addView(chatListBottomItem(tr("contacts"), selected == PageTab.CONTACTS, onContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+            addView(chatListBottomItem(tr("chats"), selected == PageTab.CONTACTS, onContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
                 marginStart = dp(4)
                 marginEnd = dp(4)
             })
@@ -1356,18 +1490,18 @@ class MainActivity : Activity() {
                 dp(14),
                 if (selected) OUTGOING_BUBBLE_STROKE else SOFT_PINK_STROKE
             )
-            addView(TextView(this@MainActivity).apply {
-                text = when (summary.kind) {
-                    ChatKind.SAVED.name -> "*"
-                    ChatKind.EVERYONE.name -> "#"
-                    else -> if (summary.verified) "ok" else "@"
-                }
-                typeface = Typeface.DEFAULT_BOLD
-                textSize = if (compact) 12f else 13f
-                gravity = Gravity.CENTER
-                setTextColor(if (summary.verified) LEAF_GREEN else STRAWBERRY_RED)
-                background = circleDrawable(if (summary.verified) 0x2214947A else 0x22E94F64)
-            }, LinearLayout.LayoutParams(if (compact) dp(34) else dp(38), if (compact) dp(34) else dp(38)).apply {
+            val avatarView = if (summary.kind == ChatKind.SAVED.name) {
+                SavedNotesAvatarView(this@MainActivity)
+            } else {
+                AvatarView(
+                    context = this@MainActivity,
+                    label = displayTitle,
+                    imagePath = null,
+                    accentColor = avatarAccent(displayTitle),
+                    verified = summary.verified
+                )
+            }
+            addView(avatarView, LinearLayout.LayoutParams(if (compact) dp(34) else dp(40), if (compact) dp(34) else dp(40)).apply {
                 marginEnd = dp(12)
             })
             addView(LinearLayout(this@MainActivity).apply {
@@ -1418,6 +1552,30 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun nearbyCountCell(label: String, count: String, accent: Int): TextView =
+        terminalText("$label\n$count").apply {
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setTextColor(accent)
+            minHeight = dp(58)
+            background = roundedDrawable(SERVICE_BUBBLE, dp(14), SERVICE_BUBBLE_STROKE)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+        }
+
+    private fun avatarAccent(label: String): Int {
+        val palette = intArrayOf(
+            STRAWBERRY_RED,
+            LEAF_GREEN,
+            0xFF5B7CFA.toInt(),
+            0xFFB85CC9.toInt(),
+            0xFF2F9DA6.toInt(),
+            0xFFE07A3F.toInt()
+        )
+        val index = kotlin.math.abs(label.hashCode()) % palette.size
+        return palette[index]
+    }
+
     private fun showMeshPanel(scanFirst: Boolean) {
         val count = if (scanFirst) {
             meshService?.searchPeople() ?: 0
@@ -1437,8 +1595,9 @@ class MainActivity : Activity() {
             setBackgroundColor(SOFT_PINK_PANEL)
         }
 
-        val nearbyTitle = terminalText(tr("new_contacts")).apply {
+        val nearbyTitle = terminalText(tr("nearby_people")).apply {
             textSize = 20f
+            typeface = Typeface.DEFAULT_BOLD
             setTextColor(BERRY_TEXT)
         }
         val transportStatus = terminalText(meshService?.meshTransportStatus() ?: tr("mesh_starting")).apply {
@@ -1446,13 +1605,29 @@ class MainActivity : Activity() {
             setTextColor(BERRY_TEXT_DIM)
             setPadding(0, 0, 0, dp(10))
         }
-        val radarView = PatchRadarView(this, ::tr).apply {
-            minimumHeight = dp(180)
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(180)
-            ).apply { bottomMargin = dp(12) }
+        lateinit var directCountView: TextView
+        lateinit var relayCountView: TextView
+        val nearbyStatusPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                directCountView = nearbyCountCell(tr("nearby_direct_count"), "0", LEAF_GREEN)
+                relayCountView = nearbyCountCell(tr("nearby_relay_count"), "0", STRAWBERRY_RED)
+                addView(directCountView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginEnd = dp(6)
+                })
+                addView(relayCountView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginStart = dp(6)
+                })
+            })
+            addView(terminalText(tr("nearby_status_desc")).apply {
+                textSize = 12f
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(0, dp(10), 0, 0)
+            })
         }
         val peopleContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1486,7 +1661,8 @@ class MainActivity : Activity() {
             val directPeers = peers.filter { it.isDirect || it.hopCount <= 1 }
             val meshPeers = peers.filterNot { it.isDirect || it.hopCount <= 1 }
                 .filter { it.hopCount <= meshMaxHops }
-            radarView.setPeerCounts(directPeers.size, meshPeers.size)
+            directCountView.text = "${tr("nearby_direct_count")}\n${directPeers.size}"
+            relayCountView.text = "${tr("nearby_relay_count")}\n${meshPeers.size}"
 
             peopleContainer.addView(terminalText("${tr("direct_in_range")} (${directPeers.size})").apply {
                 textSize = 13f
@@ -1555,7 +1731,12 @@ class MainActivity : Activity() {
         }
         root.addView(header)
         root.addView(transportStatus)
-        root.addView(radarView)
+        root.addView(nearbyStatusPanel, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            bottomMargin = dp(12)
+        })
 
         val contentScroll = ScrollView(this).apply {
             isFillViewport = true
@@ -1677,11 +1858,6 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(8) })
-            addView(terminalAction(tr("close")).apply {
-                textSize = 15f
-                setPadding(0, dp(14), 0, 0)
-                setOnClickListener { dialog.dismiss() }
-            })
         }
         dialog.setContentView(root)
         dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
@@ -1738,15 +1914,6 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(18), dp(12), dp(18))
             setBackgroundColor(CREAM_BACKGROUND)
         }
-        root.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(View(this@MainActivity), LinearLayout.LayoutParams(0, 1, 1f))
-            addView(terminalAction("X").apply {
-                textSize = 18f
-                setOnClickListener { dialog.dismiss() }
-            })
-        })
         root.addView(ZoomableImageView(this) { dialog.dismiss() }.apply {
             setImageBitmap(BitmapFactory.decodeFile(imagePath))
             setBackgroundColor(Color.TRANSPARENT)
@@ -2457,12 +2624,6 @@ class MainActivity : Activity() {
                     bottomMargin = dp(10)
                 })
             }
-            addView(terminalAction(tr("close")).apply {
-                textSize = 16f
-                gravity = Gravity.CENTER
-                background = roundedDrawable(ACCENT_PINK, dp(18), SOFT_PINK_STROKE)
-                setOnClickListener { dialog.dismiss() }
-            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
         dialog.setContentView(FrameLayout(this).apply {
             setPadding(dp(22), dp(44), dp(22), dp(28))
@@ -2481,6 +2642,7 @@ class MainActivity : Activity() {
     private fun showOwnProfilePage() {
         val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
         val originalName = meshService?.getNickname()?.take(MAX_NICKNAME_LENGTH) ?: currentNickname
+        val avatarPath = AppProfileStore.avatarPath(this)
         val originalInput = EditText(this).apply {
             setText(originalName)
             setSingleLine(true)
@@ -2525,6 +2687,36 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(44), dp(20), dp(20))
             setBackgroundColor(CREAM_BACKGROUND)
+
+            addView(AvatarView(
+                context = this@MainActivity,
+                label = contactDisplayName(),
+                imagePath = avatarPath,
+                accentColor = avatarAccent(contactDisplayName()),
+                verified = false
+            ).apply {
+                setOnClickListener {
+                    dialog.dismiss()
+                    openProfileAvatarPicker()
+                }
+            }, LinearLayout.LayoutParams(dp(86), dp(86)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                bottomMargin = dp(12)
+            })
+
+            addView(terminalAction(tr("change_photo")).apply {
+                textSize = 14f
+                gravity = Gravity.CENTER
+                setTextColor(STRAWBERRY_RED)
+                background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                setPadding(dp(14), dp(9), dp(14), dp(9))
+                setOnClickListener {
+                    dialog.dismiss()
+                    openProfileAvatarPicker()
+                }
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(16)
+            })
 
             addView(terminalText(tr("profile")).apply {
                 textSize = 24f
@@ -2642,8 +2834,8 @@ class MainActivity : Activity() {
             refreshHeader()
             if (recreateUi) {
                 applyThemePalette()
-                dialog.dismiss()
-                recreate()
+                window.statusBarColor = CREAM_BACKGROUND
+                window.navigationBarColor = CREAM_BACKGROUND
             }
         }
 
@@ -2876,6 +3068,21 @@ class MainActivity : Activity() {
             SettingsGroup.entries.forEach(::addSettingsGroupRow)
         }
 
+        if (group == SettingsGroup.ACCOUNT) {
+            addSection("settings_account", "settings_account_desc")
+            addToolAction("settings_edit_profile", "settings_edit_profile_desc") {
+                dialog.dismiss()
+                showOwnProfilePage()
+            }
+            addToolAction("settings_change_photo", "settings_change_photo_desc") {
+                dialog.dismiss()
+                openProfileAvatarPicker()
+            }
+            addToolAction("settings_identity_code", "settings_identity_code_desc") {
+                Toast.makeText(this, meshService?.getLocalFingerprint().orEmpty().chunked(4).joinToString(" "), Toast.LENGTH_LONG).show()
+            }
+        }
+
         if (group == SettingsGroup.APPEARANCE) {
             addSection("settings_appearance", "settings_appearance_desc")
 
@@ -2936,6 +3143,27 @@ class MainActivity : Activity() {
             sectionHost().addView(langRow)
         }
 
+        if (group == SettingsGroup.PRIVACY) {
+            addSection("settings_security", "settings_security_desc")
+            addToggle("settings_lock_enable", "settings_lock_enable_desc", appLockEnabled) {
+                appLockEnabled = it
+                applySettingsNow()
+            }
+            addToolAction("settings_lock_pin", "settings_lock_pin_desc") {
+                showSetAppLockPinDialog {
+                    applySettingsNow()
+                }
+            }
+            addChoiceChips(
+                "settings_lock_timeout",
+                listOf("1" to "1 min", "5" to "5 min", "15" to "15 min", "60" to "1 h"),
+                appLockTimeoutMinutes.toString()
+            ) { selected ->
+                appLockTimeoutMinutes = selected.toIntOrNull()?.coerceIn(1, 60) ?: 5
+                applySettingsNow()
+            }
+        }
+
         if (group == SettingsGroup.MESH) {
             addSection("settings_mesh_section", "settings_mesh_desc")
             addChoiceChips(
@@ -2976,6 +3204,18 @@ class MainActivity : Activity() {
             }
         }
 
+        if (group == SettingsGroup.MEDIA) {
+            addSection("settings_media", "settings_media_desc")
+            addToggle("settings_crop_images", "settings_crop_images_desc", cropChatImagesEnabled) {
+                cropChatImagesEnabled = it
+                applySettingsNow(refreshMessages = true)
+            }
+            addToolAction("settings_cleanup_cache", "settings_cleanup_cache_desc") {
+                cleanupMediaCache()
+                Toast.makeText(this@MainActivity, tr("cleanup_done"), Toast.LENGTH_SHORT).show()
+            }
+        }
+
         if (group == SettingsGroup.CHAT) {
             addSection("settings_chat_behavior", "settings_chat_behavior_desc")
             addToggle("settings_chat_compact", "settings_chat_compact_desc", compactChatListEnabled) {
@@ -2989,6 +3229,13 @@ class MainActivity : Activity() {
             ) { selected ->
                 messageTextScale = selected.toFloatOrNull()?.coerceIn(0.9f, 1.3f) ?: 1.0f
                 applySettingsNow(refreshMessages = true)
+            }
+            addToolAction("settings_show_onboarding", "settings_show_onboarding_desc") {
+                getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(UI_SETTINGS_QUICK_START_HIDDEN, false)
+                    .apply()
+                Toast.makeText(this@MainActivity, tr("quick_start_title"), Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -3029,21 +3276,6 @@ class MainActivity : Activity() {
             }
         }
 
-        settingsContent.addView(terminalAction(tr("close")).apply {
-            textSize = 16f
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            background = roundedDrawable(STRAWBERRY_RED, dp(18))
-            setPadding(dp(14), dp(10), dp(14), dp(10))
-            setOnClickListener {
-                dialog.dismiss()
-            }
-        }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply {
-            topMargin = dp(18)
-        })
         root.addView(settingsScroll, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             0,
@@ -3522,7 +3754,6 @@ class MainActivity : Activity() {
                 manager.setPrimaryClip(ClipData.newPlainText("Truskawka diagnostics", msg))
                 Toast.makeText(this, tr("copied"), Toast.LENGTH_SHORT).show()
             }
-            .setPositiveButton(tr("close"), null)
             .show()
     }
 
@@ -3530,9 +3761,9 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
         darkThemeEnabled = prefs.getBoolean(UI_SETTINGS_THEME_DARK, false)
         selectedLanguage = AppLanguage.fromCode(prefs.getString(UI_SETTINGS_LANGUAGE, AppLanguage.EN.code))
-        appLockEnabled = false
-        appLockPin = ""
-        appLockTimeoutMinutes = 5
+        appLockEnabled = prefs.getBoolean(UI_SETTINGS_APP_LOCK_ENABLED, false)
+        appLockPin = prefs.getString(UI_SETTINGS_APP_LOCK_PIN, "").orEmpty()
+        appLockTimeoutMinutes = prefs.getInt(UI_SETTINGS_APP_LOCK_TIMEOUT, 5).coerceIn(1, 60)
         // Do not restore unlock state across app launches.
         // If user fully re-enters the app, PIN must be requested again.
         lastUnlockAt = 0L
@@ -3541,6 +3772,7 @@ class MainActivity : Activity() {
         notificationBroadcastEnabled = prefs.getBoolean(UI_SETTINGS_NOTIF_BROADCAST, true)
         compactChatListEnabled = prefs.getBoolean(UI_SETTINGS_CHAT_COMPACT, false)
         messageTextScale = prefs.getFloat(UI_SETTINGS_CHAT_TEXT_SCALE, 1.0f).coerceIn(0.9f, 1.3f)
+        cropChatImagesEnabled = prefs.getBoolean(UI_SETTINGS_CHAT_IMAGE_CROP, true)
         use24HourFormat = prefs.getBoolean(UI_SETTINGS_TIME_24H, true)
         shortDateFormatEnabled = prefs.getBoolean(UI_SETTINGS_DATE_SHORT, false)
         meshAggressiveMode = prefs.getBoolean(UI_SETTINGS_MESH_AGGRESSIVE, true)
@@ -3560,6 +3792,7 @@ class MainActivity : Activity() {
             .putBoolean(UI_SETTINGS_NOTIF_BROADCAST, notificationBroadcastEnabled)
             .putBoolean(UI_SETTINGS_CHAT_COMPACT, compactChatListEnabled)
             .putFloat(UI_SETTINGS_CHAT_TEXT_SCALE, messageTextScale)
+            .putBoolean(UI_SETTINGS_CHAT_IMAGE_CROP, cropChatImagesEnabled)
             .putBoolean(UI_SETTINGS_TIME_24H, use24HourFormat)
             .putBoolean(UI_SETTINGS_DATE_SHORT, shortDateFormatEnabled)
             .putBoolean(UI_SETTINGS_MESH_AGGRESSIVE, meshAggressiveMode)
@@ -3620,12 +3853,39 @@ class MainActivity : Activity() {
                     mainHandler.post { showAppLockDialog() }
                 }
             }
-            .setNegativeButton(tr("close")) { _, _ ->
+            .setNegativeButton(tr("cancel")) { _, _ ->
                 appLockDialogVisible = false
                 finish()
             }
             .setOnCancelListener { appLockDialogVisible = false }
             .setOnDismissListener { appLockDialogVisible = false }
+            .show()
+    }
+
+    private fun showSetAppLockPinDialog(onSaved: () -> Unit) {
+        val input = EditText(this).apply {
+            hint = tr("settings_lock_pin_hint")
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            filters = arrayOf(InputFilter.LengthFilter(8))
+            setSingleLine(true)
+            setTextColor(BERRY_TEXT)
+            setHintTextColor(BERRY_TEXT_DIM)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(tr("settings_lock_pin"))
+            .setView(input)
+            .setNegativeButton(tr("cancel"), null)
+            .setPositiveButton(tr("save")) { _, _ ->
+                val value = input.text?.toString().orEmpty()
+                if (value.length < 4) {
+                    Toast.makeText(this, tr("settings_lock_pin_short"), Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                appLockPin = value
+                appLockEnabled = true
+                lastUnlockAt = System.currentTimeMillis()
+                onSaved()
+            }
             .show()
     }
 
@@ -3745,17 +4005,9 @@ class MainActivity : Activity() {
             }
         }
 
-        root.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(terminalText(tr("search")).apply {
-                textSize = 22f
-                typeface = Typeface.DEFAULT_BOLD
-            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(terminalAction("X").apply {
-                textSize = 18f
-                setOnClickListener { dialog.dismiss() }
-            })
+        root.addView(terminalText(tr("search")).apply {
+            textSize = 22f
+            typeface = Typeface.DEFAULT_BOLD
         })
         root.addView(input, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -4580,6 +4832,55 @@ class MainActivity : Activity() {
             setColor(color)
         }
 
+    private fun microphoneButtonDrawable(): Drawable =
+        object : Drawable() {
+            private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = STRAWBERRY_RED
+                style = Paint.Style.FILL
+            }
+            private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.STROKE
+                strokeWidth = dp(2).toFloat()
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+            }
+            private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.STROKE
+                strokeWidth = dp(2).toFloat()
+            }
+
+            override fun draw(canvas: Canvas) {
+                val b = bounds
+                val cx = b.exactCenterX()
+                val cy = b.exactCenterY()
+                val r = minOf(b.width(), b.height()) / 2f
+                canvas.drawCircle(cx, cy, r, fillPaint)
+
+                val body = RectF(cx - dp(5), cy - dp(12), cx + dp(5), cy + dp(3))
+                canvas.drawRoundRect(body, dp(5).toFloat(), dp(5).toFloat(), bodyPaint)
+                val arc = RectF(cx - dp(10), cy - dp(5), cx + dp(10), cy + dp(11))
+                canvas.drawArc(arc, 20f, 140f, false, iconPaint)
+                canvas.drawLine(cx, cy + dp(12), cx, cy + dp(17), iconPaint)
+                canvas.drawLine(cx - dp(7), cy + dp(17), cx + dp(7), cy + dp(17), iconPaint)
+            }
+
+            override fun setAlpha(alpha: Int) {
+                fillPaint.alpha = alpha
+                iconPaint.alpha = alpha
+                bodyPaint.alpha = alpha
+            }
+
+            override fun setColorFilter(colorFilter: ColorFilter?) {
+                fillPaint.colorFilter = colorFilter
+                iconPaint.colorFilter = colorFilter
+                bodyPaint.colorFilter = colorFilter
+            }
+
+            override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+        }
+
     private fun roundedDrawable(color: Int, cornerRadius: Int, strokeColor: Int? = null): GradientDrawable =
         GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
@@ -4744,7 +5045,7 @@ class MainActivity : Activity() {
 
         return if (aspect < 0.72f) {
             val height = maxPortraitHeight
-            val width = (height * aspect).toInt().coerceIn(dp(150), maxWideWidth)
+            val width = (height * aspect).toInt().coerceIn(dp(96), maxWideWidth)
             width to height
         } else {
             val width = maxWideWidth
