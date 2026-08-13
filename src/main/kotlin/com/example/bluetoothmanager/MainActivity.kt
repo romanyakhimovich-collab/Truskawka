@@ -131,7 +131,34 @@ class MainActivity : Activity() {
     private val meshMessages = messages.toMutableList()
     private val savedMessages = mutableListOf<ChatMessage>()
     private val peerMessages = mutableMapOf<String, MutableList<ChatMessage>>()
-    private lateinit var chatAdapter: ChatAdapter
+    private lateinit var chatAdapter: ChatMessageAdapter
+    private val chatAdapterDelegate = object : ChatMessageAdapterDelegate {
+        override val messageTextScale: Float
+            get() = this@MainActivity.messageTextScale
+        override val selectedRecipientId: UUID?
+            get() = this@MainActivity.selectedRecipientId
+        override val activePlayingPath: String?
+            get() = this@MainActivity.activePlayingPath
+
+        override fun dp(value: Int): Int = this@MainActivity.dp(value)
+        override fun tr(key: String): String = this@MainActivity.tr(key)
+        override fun terminalText(value: String): TextView = this@MainActivity.terminalText(value)
+        override fun terminalAction(value: String): TextView = this@MainActivity.terminalAction(value)
+        override fun roundedDrawable(color: Int, cornerRadius: Int, strokeColor: Int?): GradientDrawable =
+            this@MainActivity.roundedDrawable(color, cornerRadius, strokeColor)
+        override fun calculateChatImageSize(bitmap: Bitmap?): Pair<Int, Int> =
+            this@MainActivity.calculateChatImageSize(bitmap)
+        override fun displayAuthor(message: ChatMessage): String = message.displayAuthor()
+        override fun displayTime(message: ChatMessage): String = message.displayTime()
+        override fun displayDate(message: ChatMessage): String = message.displayDate()
+        override fun showImagePreview(imagePath: String) = this@MainActivity.showImagePreview(imagePath)
+        override fun showMessageActions(message: ChatMessage) = this@MainActivity.showMessageActions(message)
+        override fun attachReplySwipe(view: View, message: ChatMessage) =
+            this@MainActivity.attachReplySwipe(view, message)
+        override fun toggleAudioPlayback(path: String?, button: TextView) =
+            this@MainActivity.toggleAudioPlayback(path, button)
+        override fun audioDurationLabel(path: String?): String = this@MainActivity.audioDurationLabel(path)
+    }
 
     private lateinit var usernameField: EditText
     private lateinit var statusGroup: LinearLayout
@@ -182,6 +209,9 @@ class MainActivity : Activity() {
             } else if (line.startsWith("message read:")) {
                 readCounter += 1
                 updateMessageStatus(line.substringAfter(":").trim(), MessageStatus.READ)
+            } else if (line.startsWith("message failed:")) {
+                failedCounter += 1
+                updateMessageStatus(line.substringAfter(":").trim(), MessageStatus.FAILED)
             } else if (!line.isScanNoise()) {
                 if (line.contains("relay", ignoreCase = true) || line.contains("wifi-direct", ignoreCase = true)) {
                     lastRelayInfo = line
@@ -283,7 +313,7 @@ class MainActivity : Activity() {
 
         root.addView(buildHeader())
 
-        chatAdapter = ChatAdapter(messages)
+        chatAdapter = ChatMessageAdapter(this, messages, chatAdapterDelegate)
         chatList = ListView(this).apply {
             divider = null
             cacheColorHint = Color.TRANSPARENT
@@ -316,7 +346,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(12), dp(8), dp(12), dp(8))
-            background = roundedDrawable(SERVICE_BUBBLE, dp(14), SERVICE_BUBBLE_STROKE)
+            background = roundedDrawable(SERVICE_BUBBLE, dp(12), SERVICE_BUBBLE_STROKE)
             visibility = View.GONE
             replyTextView = terminalText("").apply {
                 textSize = 12f
@@ -330,6 +360,7 @@ class MainActivity : Activity() {
             ))
             addView(terminalAction("X").apply {
                 textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
                 setOnClickListener { clearReplyTarget() }
             })
         }
@@ -347,7 +378,7 @@ class MainActivity : Activity() {
                 addView(terminalAction("< ${tr("back_to_chats")}").apply {
                     textSize = 12f
                     setTextColor(BERRY_TEXT)
-                    background = roundedDrawable(INPUT_SURFACE, dp(14), SOFT_PINK_STROKE)
+                    background = roundedDrawable(INPUT_SURFACE, dp(10), SOFT_PINK_STROKE)
                     setPadding(dp(10), dp(6), dp(10), dp(6))
                     setOnClickListener { showChatList() }
                 }, LinearLayout.LayoutParams(
@@ -360,7 +391,7 @@ class MainActivity : Activity() {
             topRow.addView(leftGroup, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.LEFT or Gravity.CENTER_VERTICAL
+                Gravity.START or Gravity.CENTER_VERTICAL
             ))
 
             statusGroup = LinearLayout(this@MainActivity).apply { visibility = View.GONE }
@@ -439,7 +470,7 @@ class MainActivity : Activity() {
                 textSize = 15f
                 setTextColor(BERRY_TEXT)
                 setHintTextColor(BERRY_TEXT_DIM)
-                background = roundedDrawable(INPUT_SURFACE, dp(24), PINK_SHADOW_STROKE)
+                background = roundedDrawable(INPUT_SURFACE, dp(18), PINK_SHADOW_STROKE)
                 elevation = dp(2).toFloat()
                 inputType = InputType.TYPE_CLASS_TEXT or
                     InputType.TYPE_TEXT_FLAG_CAP_SENTENCES or
@@ -463,7 +494,7 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER
                 minWidth = dp(44)
                 minHeight = dp(44)
-                background = roundedDrawable(0x26FF4359, dp(22), 0x55FF4359)
+                background = roundedDrawable(ACCENT_PINK, dp(16), OUTGOING_BUBBLE_STROKE)
                 setPadding(dp(10), dp(8), dp(10), dp(10))
                 setOnClickListener { openImagePicker() }
             }, LinearLayout.LayoutParams(
@@ -808,11 +839,11 @@ class MainActivity : Activity() {
             addMessage("mesh", tr("mesh_hop_limit_reached"), false)
             return
         }
-        val fileName = queryDisplayName(uri)
+        val fileName = ImageTransferPreparer.queryDisplayName(contentResolver, uri)
         showImageProgress(tr("preparing_image"))
 
         thread(name = "image-compress-send") {
-            val prepared = prepareImageForTransfer(uri, fileName)
+            val prepared = ImageTransferPreparer.prepareForTransfer(contentResolver, uri, fileName)
             if (prepared == null) {
                 runOnUiThread {
                     hideImageProgress()
@@ -829,7 +860,7 @@ class MainActivity : Activity() {
                 return@thread
             }
 
-            val localPath = copyImageToLocalFile(prepared.fileName, prepared.bytes).absolutePath
+            val localPath = ImageTransferPreparer.copyImageToLocalFile(filesDir, prepared.fileName, prepared.bytes).absolutePath
             val author = usernameField.text.toString().prefixAt()
             val localImageHolder = arrayOfNulls<ChatMessage>(1)
 
@@ -1176,8 +1207,8 @@ class MainActivity : Activity() {
         if (!quickStartHidden) {
             listContent.addView(LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
-                setPadding(dp(12), dp(12), dp(12), dp(12))
+                background = roundedDrawable(SERVICE_BUBBLE, dp(12), SERVICE_BUBBLE_STROKE)
+                setPadding(dp(14), dp(14), dp(14), dp(14))
                 addView(terminalText(tr("quick_start_title")).apply {
                     textSize = 15f
                     typeface = Typeface.DEFAULT_BOLD
@@ -1202,7 +1233,7 @@ class MainActivity : Activity() {
                     textSize = 13f
                     setTextColor(Color.WHITE)
                     gravity = Gravity.CENTER
-                    background = roundedDrawable(STRAWBERRY_RED, dp(14))
+                    background = roundedDrawable(STRAWBERRY_RED, dp(10))
                     setPadding(dp(12), dp(7), dp(12), dp(7))
                     setOnClickListener {
                         uiPrefs.edit().putBoolean(UI_SETTINGS_QUICK_START_HIDDEN, true).apply()
@@ -1265,23 +1296,9 @@ class MainActivity : Activity() {
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(if (selected) Color.WHITE else BERRY_TEXT_DIM)
-            background = roundedDrawable(if (selected) STRAWBERRY_RED else Color.TRANSPARENT, dp(20))
+            background = roundedDrawable(if (selected) STRAWBERRY_RED else Color.TRANSPARENT, dp(12))
             setOnClickListener { onClick() }
         }
-
-    private enum class PageTab { NEW_CONTACTS, CONTACTS, PROFILE, SETTINGS }
-
-    private enum class AppLanguage(val code: String, val label: String) {
-        EN("en", "EN"),
-        PL("pl", "PL"),
-        ES("es", "ES"),
-        RU("ru", "RU");
-
-        companion object {
-            fun fromCode(code: String?): AppLanguage =
-                entries.firstOrNull { it.code == code } ?: EN
-        }
-    }
 
     private fun buildPageBottomNav(
         selected: PageTab,
@@ -1294,7 +1311,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             setPadding(dp(6), dp(8), dp(6), dp(8))
-            background = roundedDrawable(INPUT_SURFACE, dp(24), SOFT_PINK_STROKE)
+            background = roundedDrawable(INPUT_SURFACE, dp(14), SOFT_PINK_STROKE)
 
             addView(chatListBottomItem(tr("new_contacts"), selected == PageTab.NEW_CONTACTS, onNewContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
                 marginEnd = dp(4)
@@ -1336,8 +1353,8 @@ class MainActivity : Activity() {
             setPadding(dp(14), if (compact) dp(9) else dp(12), dp(14), if (compact) dp(9) else dp(12))
             background = roundedDrawable(
                 if (selected) ACCENT_PINK else INPUT_SURFACE,
-                dp(20),
-                if (selected) STRAWBERRY_RED else SOFT_PINK_STROKE
+                dp(14),
+                if (selected) OUTGOING_BUBBLE_STROKE else SOFT_PINK_STROKE
             )
             addView(TextView(this@MainActivity).apply {
                 text = when (summary.kind) {
@@ -1348,8 +1365,8 @@ class MainActivity : Activity() {
                 typeface = Typeface.DEFAULT_BOLD
                 textSize = if (compact) 12f else 13f
                 gravity = Gravity.CENTER
-                setTextColor(STRAWBERRY_RED)
-                background = circleDrawable(0x33FFB7C5)
+                setTextColor(if (summary.verified) LEAF_GREEN else STRAWBERRY_RED)
+                background = circleDrawable(if (summary.verified) 0x2214947A else 0x22E94F64)
             }, LinearLayout.LayoutParams(if (compact) dp(34) else dp(38), if (compact) dp(34) else dp(38)).apply {
                 marginEnd = dp(12)
             })
@@ -1380,7 +1397,7 @@ class MainActivity : Activity() {
                 textSize = if (compact) 10f else 11f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(if (presence.second) LEAF_GREEN else BERRY_TEXT_DIM)
-                background = roundedDrawable(0x14FF4359, dp(12), SOFT_PINK_STROKE)
+                background = roundedDrawable(if (presence.second) 0x1F14947A else SERVICE_BUBBLE, dp(10), SERVICE_BUBBLE_STROKE)
                 setPadding(dp(8), dp(3), dp(8), dp(3))
             }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1429,7 +1446,7 @@ class MainActivity : Activity() {
             setTextColor(BERRY_TEXT_DIM)
             setPadding(0, 0, 0, dp(10))
         }
-        val radarView = PatchRadarView(this).apply {
+        val radarView = PatchRadarView(this, ::tr).apply {
             minimumHeight = dp(180)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1598,7 +1615,7 @@ class MainActivity : Activity() {
             attributes = attributes.apply {
                 width = WindowManager.LayoutParams.MATCH_PARENT
                 height = WindowManager.LayoutParams.MATCH_PARENT
-                gravity = Gravity.RIGHT
+                gravity = Gravity.END
             }
         }
         dialog.show()
@@ -1907,7 +1924,7 @@ class MainActivity : Activity() {
             return
         }
         val percent = ((sent * 100f) / total).toInt().coerceIn(0, 100)
-            showImageProgress("${tr("sending_image")} $percent% ($sent/$total)")
+        showImageProgress("${tr("sending_image")} $percent% ($sent/$total)")
     }
 
     private fun updateMessageStatus(messageIdText: String, status: MessageStatus) {
@@ -1917,7 +1934,7 @@ class MainActivity : Activity() {
             .forEach { buffer ->
                 buffer.filter { it.mine && it.messageId == messageId }
                     .forEach { message ->
-                        if (message.status != MessageStatus.READ) {
+                        if (shouldApplyMessageStatus(message.status, status)) {
                             message.status = status
                             clearSendTimeout(message.localId)
                             clearTextRetry(message.localId)
@@ -1929,6 +1946,12 @@ class MainActivity : Activity() {
             chatStore.updateStatusByMeshMessageId(messageId.toString(), status.name)
             chatAdapter.notifyDataSetChanged()
         }
+    }
+
+    private fun shouldApplyMessageStatus(current: MessageStatus?, next: MessageStatus): Boolean {
+        if (current == MessageStatus.READ) return false
+        if (next == MessageStatus.FAILED && current == MessageStatus.DELIVERED) return false
+        return current != next
     }
 
     private fun attemptTextSend(targetId: UUID?, payload: String): SendResult {
@@ -2443,7 +2466,7 @@ class MainActivity : Activity() {
         }
         dialog.setContentView(FrameLayout(this).apply {
             setPadding(dp(22), dp(44), dp(22), dp(28))
-            setBackgroundColor(0x33FFB7C5)
+            setBackgroundColor(0x22E94F64)
             addView(panel, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -2486,7 +2509,7 @@ class MainActivity : Activity() {
             }
         })
         val displayInput = EditText(this).apply {
-            setText(getDisplayName())
+            setText(AppProfileStore.displayName(this@MainActivity))
             setSingleLine(true)
             typeface = Typeface.DEFAULT
             textSize = 16f
@@ -2552,7 +2575,7 @@ class MainActivity : Activity() {
                         currentNickname = appliedNickname
                         renameLocalMessages(previousNickname, appliedNickname)
                     }
-                    setDisplayName(displayInput.text?.toString().orEmpty())
+                    AppProfileStore.setDisplayName(this@MainActivity, displayInput.text?.toString().orEmpty())
                     usernameField.setText(contactDisplayName())
                     Toast.makeText(this@MainActivity, tr("profile_updated"), Toast.LENGTH_SHORT).show()
                     dialog.dismiss()
@@ -2601,7 +2624,7 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun showSettingsPage() {
+    private fun showSettingsPage(group: SettingsGroup? = null) {
         val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
         fun applySettingsNow(refreshMessages: Boolean = false, recreateUi: Boolean = false) {
             applyDateTimeFormat()
@@ -2629,12 +2652,29 @@ class MainActivity : Activity() {
             setPadding(dp(20), dp(44), dp(20), dp(20))
             setBackgroundColor(CREAM_BACKGROUND)
 
-            addView(terminalText(tr("settings")).apply {
+            if (group != null) {
+                addView(terminalAction("< ${tr("settings")}").apply {
+                    textSize = 13f
+                    setTextColor(BERRY_TEXT)
+                    background = roundedDrawable(INPUT_SURFACE, dp(10), SOFT_PINK_STROKE)
+                    setPadding(dp(10), dp(7), dp(10), dp(7))
+                    setOnClickListener {
+                        dialog.dismiss()
+                        showSettingsPage()
+                    }
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    bottomMargin = dp(14)
+                })
+            }
+            addView(terminalText(tr(group?.titleKey ?: "settings")).apply {
                 textSize = 24f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
             })
-            addView(terminalText(tr("settings_subtitle")).apply {
+            addView(terminalText(tr(group?.descriptionKey ?: "settings_subtitle")).apply {
                 textSize = 13f
                 setTextColor(BERRY_TEXT_DIM)
                 setPadding(0, dp(4), 0, dp(10))
@@ -2796,145 +2836,197 @@ class MainActivity : Activity() {
             host.addView(row)
         }
 
-        addSection("settings_appearance", "settings_appearance_desc")
-
-        val themeRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val lightButton = chatListBottomItem(tr("theme_light"), !darkThemeEnabled) { }
-        val darkButton = chatListBottomItem(tr("theme_dark"), darkThemeEnabled) { }
-        lightButton.setOnClickListener {
-            darkThemeEnabled = false
-            lightButton.background = roundedDrawable(STRAWBERRY_RED, dp(20))
-            lightButton.setTextColor(Color.WHITE)
-            darkButton.background = roundedDrawable(Color.TRANSPARENT, dp(20))
-            darkButton.setTextColor(BERRY_TEXT_DIM)
-            applySettingsNow(recreateUi = true)
-        }
-        darkButton.setOnClickListener {
-            darkThemeEnabled = true
-            darkButton.background = roundedDrawable(STRAWBERRY_RED, dp(20))
-            darkButton.setTextColor(Color.WHITE)
-            lightButton.background = roundedDrawable(Color.TRANSPARENT, dp(20))
-            lightButton.setTextColor(BERRY_TEXT_DIM)
-            applySettingsNow(recreateUi = true)
-        }
-        themeRow.addView(lightButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(6) })
-        themeRow.addView(darkButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(6) })
-        sectionHost().addView(themeRow)
-
-        addSection("language", "settings_language_desc")
-
-        val langButtons = linkedMapOf<AppLanguage, TextView>()
-        val langRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        AppLanguage.entries.forEachIndexed { index, lang ->
-            val button = chatListBottomItem(lang.label, selectedLanguage == lang) { }
-            button.setOnClickListener {
-                selectedLanguage = lang
-                langButtons.forEach { (candidate, view) ->
-                    if (candidate == lang) {
-                        view.background = roundedDrawable(STRAWBERRY_RED, dp(20))
-                        view.setTextColor(Color.WHITE)
-                    } else {
-                        view.background = roundedDrawable(Color.TRANSPARENT, dp(20))
-                        view.setTextColor(BERRY_TEXT_DIM)
-                    }
+        fun addSettingsGroupRow(settingsGroup: SettingsGroup) {
+            addCardSpacing(settingsContent)
+            settingsContent.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = roundedDrawable(INPUT_SURFACE, dp(14), SOFT_PINK_STROKE)
+                setPadding(dp(14), dp(13), dp(14), dp(13))
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(terminalText(tr(settingsGroup.titleKey)).apply {
+                        textSize = 16f
+                        typeface = Typeface.DEFAULT_BOLD
+                        setTextColor(BERRY_TEXT)
+                    })
+                    addView(terminalText(tr(settingsGroup.descriptionKey)).apply {
+                        textSize = 12f
+                        setTextColor(BERRY_TEXT_DIM)
+                        setPadding(0, dp(4), 0, 0)
+                    })
+                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(terminalText(">").apply {
+                    textSize = 20f
+                    typeface = Typeface.DEFAULT_BOLD
+                    gravity = Gravity.CENTER
+                    setTextColor(BERRY_TEXT_DIM)
+                }, LinearLayout.LayoutParams(dp(28), ViewGroup.LayoutParams.WRAP_CONTENT))
+                setOnClickListener {
+                    dialog.dismiss()
+                    showSettingsPage(settingsGroup)
                 }
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
+
+        if (group == null) {
+            SettingsGroup.entries.forEach(::addSettingsGroupRow)
+        }
+
+        if (group == SettingsGroup.APPEARANCE) {
+            addSection("settings_appearance", "settings_appearance_desc")
+
+            val themeRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val lightButton = chatListBottomItem(tr("theme_light"), !darkThemeEnabled) { }
+            val darkButton = chatListBottomItem(tr("theme_dark"), darkThemeEnabled) { }
+            lightButton.setOnClickListener {
+                darkThemeEnabled = false
+                lightButton.background = roundedDrawable(STRAWBERRY_RED, dp(20))
+                lightButton.setTextColor(Color.WHITE)
+                darkButton.background = roundedDrawable(Color.TRANSPARENT, dp(20))
+                darkButton.setTextColor(BERRY_TEXT_DIM)
                 applySettingsNow(recreateUi = true)
             }
-            langButtons[lang] = button
-            langRow.addView(button, LinearLayout.LayoutParams(0, dp(44), 1f).apply {
-                if (index > 0) marginStart = dp(4)
-                if (index < AppLanguage.entries.lastIndex) marginEnd = dp(4)
-            })
-        }
-        sectionHost().addView(langRow)
+            darkButton.setOnClickListener {
+                darkThemeEnabled = true
+                darkButton.background = roundedDrawable(STRAWBERRY_RED, dp(20))
+                darkButton.setTextColor(Color.WHITE)
+                lightButton.background = roundedDrawable(Color.TRANSPARENT, dp(20))
+                lightButton.setTextColor(BERRY_TEXT_DIM)
+                applySettingsNow(recreateUi = true)
+            }
+            themeRow.addView(lightButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(6) })
+            themeRow.addView(darkButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(6) })
+            sectionHost().addView(themeRow)
 
-        addSection("settings_mesh_section", "settings_mesh_desc")
-        addChoiceChips(
-            "settings_mesh_mode",
-            listOf("balanced" to tr("mesh_mode_balanced"), "aggressive" to tr("mesh_mode_aggressive")),
-            if (meshAggressiveMode) "aggressive" else "balanced"
-        ) { selected ->
-            meshAggressiveMode = selected == "aggressive"
-            applySettingsNow()
-        }
-        addChoiceChips(
-            "settings_max_hops",
-            listOf("2" to "2", "4" to "4", "6" to "6", "8" to "8"),
-            meshMaxHops.toString()
-        ) { selected ->
-            meshMaxHops = selected.toIntOrNull()?.coerceIn(1, 8) ?: 8
-            applySettingsNow()
-        }
-        addToolAction("settings_restart_mesh", "settings_restart_mesh_desc") {
-            meshService?.startNearbyDiscovery(silent = false)
-            Toast.makeText(this, tr("status_searching_nearby"), Toast.LENGTH_SHORT).show()
-        }
+            addSection("language", "settings_language_desc")
 
-        addSection("settings_notifications", "settings_notifications_desc")
-        addToggle("settings_notify_enable", "settings_notify_enable_desc", notificationEnabled) {
-            notificationEnabled = it
-            applySettingsNow()
-        }
-        addToggle("settings_notify_preview", "settings_notify_preview_desc", notificationPreviewEnabled) {
-            notificationPreviewEnabled = it
-            applySettingsNow()
-        }
-        addToggle("settings_notify_broadcast", "settings_notify_broadcast_desc", notificationBroadcastEnabled) {
-            notificationBroadcastEnabled = it
-            applySettingsNow()
-        }
-
-        addSection("settings_chat_behavior", "settings_chat_behavior_desc")
-        addToggle("settings_chat_compact", "settings_chat_compact_desc", compactChatListEnabled) {
-            compactChatListEnabled = it
-            applySettingsNow(refreshMessages = true)
-        }
-        addChoiceChips(
-            "settings_chat_font",
-            listOf("0.9" to tr("small"), "1.0" to tr("normal"), "1.15" to tr("large")),
-            "%.1f".format(Locale.US, messageTextScale)
-        ) { selected ->
-            messageTextScale = selected.toFloatOrNull()?.coerceIn(0.9f, 1.3f) ?: 1.0f
-            applySettingsNow(refreshMessages = true)
+            val langButtons = linkedMapOf<AppLanguage, TextView>()
+            val langRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            AppLanguage.entries.forEachIndexed { index, lang ->
+                val button = chatListBottomItem(lang.label, selectedLanguage == lang) { }
+                button.setOnClickListener {
+                    selectedLanguage = lang
+                    langButtons.forEach { (candidate, view) ->
+                        if (candidate == lang) {
+                            view.background = roundedDrawable(STRAWBERRY_RED, dp(20))
+                            view.setTextColor(Color.WHITE)
+                        } else {
+                            view.background = roundedDrawable(Color.TRANSPARENT, dp(20))
+                            view.setTextColor(BERRY_TEXT_DIM)
+                        }
+                    }
+                    applySettingsNow(recreateUi = true)
+                }
+                langButtons[lang] = button
+                langRow.addView(button, LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                    if (index > 0) marginStart = dp(4)
+                    if (index < AppLanguage.entries.lastIndex) marginEnd = dp(4)
+                })
+            }
+            sectionHost().addView(langRow)
         }
 
-        addSection("settings_region", "settings_region_desc")
-        addChoiceChips(
-            "settings_time_format",
-            listOf("24" to "24h", "12" to "12h"),
-            if (use24HourFormat) "24" else "12"
-        ) { selected ->
-            use24HourFormat = selected == "24"
-            applySettingsNow(refreshMessages = true)
-        }
-        addChoiceChips(
-            "settings_date_format",
-            listOf("short" to tr("short"), "long" to tr("long")),
-            if (shortDateFormatEnabled) "short" else "long"
-        ) { selected ->
-            shortDateFormatEnabled = selected == "short"
-            applySettingsNow(refreshMessages = true)
+        if (group == SettingsGroup.MESH) {
+            addSection("settings_mesh_section", "settings_mesh_desc")
+            addChoiceChips(
+                "settings_mesh_mode",
+                listOf("balanced" to tr("mesh_mode_balanced"), "aggressive" to tr("mesh_mode_aggressive")),
+                if (meshAggressiveMode) "aggressive" else "balanced"
+            ) { selected ->
+                meshAggressiveMode = selected == "aggressive"
+                applySettingsNow()
+            }
+            addChoiceChips(
+                "settings_max_hops",
+                listOf("2" to "2", "4" to "4", "6" to "6", "8" to "8"),
+                meshMaxHops.toString()
+            ) { selected ->
+                meshMaxHops = selected.toIntOrNull()?.coerceIn(1, 8) ?: 8
+                applySettingsNow()
+            }
+            addToolAction("settings_restart_mesh", "settings_restart_mesh_desc") {
+                meshService?.startNearbyDiscovery(silent = false)
+                Toast.makeText(this, tr("status_searching_nearby"), Toast.LENGTH_SHORT).show()
+            }
         }
 
-        addSection("settings_data_storage", "settings_data_storage_desc")
-        addToolAction("settings_export_backup", "settings_export_backup_desc") {
-            openBackupCreateDocument()
+        if (group == SettingsGroup.NOTIFICATIONS) {
+            addSection("settings_notifications", "settings_notifications_desc")
+            addToggle("settings_notify_enable", "settings_notify_enable_desc", notificationEnabled) {
+                notificationEnabled = it
+                applySettingsNow()
+            }
+            addToggle("settings_notify_preview", "settings_notify_preview_desc", notificationPreviewEnabled) {
+                notificationPreviewEnabled = it
+                applySettingsNow()
+            }
+            addToggle("settings_notify_broadcast", "settings_notify_broadcast_desc", notificationBroadcastEnabled) {
+                notificationBroadcastEnabled = it
+                applySettingsNow()
+            }
         }
-        addToolAction("settings_import_backup", "settings_import_backup_desc") {
-            openBackupPicker()
+
+        if (group == SettingsGroup.CHAT) {
+            addSection("settings_chat_behavior", "settings_chat_behavior_desc")
+            addToggle("settings_chat_compact", "settings_chat_compact_desc", compactChatListEnabled) {
+                compactChatListEnabled = it
+                applySettingsNow(refreshMessages = true)
+            }
+            addChoiceChips(
+                "settings_chat_font",
+                listOf("0.9" to tr("small"), "1.0" to tr("normal"), "1.15" to tr("large")),
+                "%.1f".format(Locale.US, messageTextScale)
+            ) { selected ->
+                messageTextScale = selected.toFloatOrNull()?.coerceIn(0.9f, 1.3f) ?: 1.0f
+                applySettingsNow(refreshMessages = true)
+            }
         }
-        addToolAction("settings_cleanup_cache", "settings_cleanup_cache_desc") {
+
+        if (group == SettingsGroup.REGION) {
+            addSection("settings_region", "settings_region_desc")
+            addChoiceChips(
+                "settings_time_format",
+                listOf("24" to "24h", "12" to "12h"),
+                if (use24HourFormat) "24" else "12"
+            ) { selected ->
+                use24HourFormat = selected == "24"
+                applySettingsNow(refreshMessages = true)
+            }
+            addChoiceChips(
+                "settings_date_format",
+                listOf("short" to tr("short"), "long" to tr("long")),
+                if (shortDateFormatEnabled) "short" else "long"
+            ) { selected ->
+                shortDateFormatEnabled = selected == "short"
+                applySettingsNow(refreshMessages = true)
+            }
+        }
+
+        if (group == SettingsGroup.DATA) {
+            addSection("settings_data_storage", "settings_data_storage_desc")
+            addToolAction("settings_export_backup", "settings_export_backup_desc") {
+                openBackupCreateDocument()
+            }
+            addToolAction("settings_import_backup", "settings_import_backup_desc") {
+                openBackupPicker()
+            }
+            addToolAction("settings_cleanup_cache", "settings_cleanup_cache_desc") {
                 cleanupMediaCache()
                 Toast.makeText(this@MainActivity, tr("cleanup_done"), Toast.LENGTH_SHORT).show()
-        }
-        addToolAction("settings_connection_diag", "settings_connection_diag_desc") {
-            showConnectionDiagnostics()
+            }
+            addToolAction("settings_connection_diag", "settings_connection_diag_desc") {
+                showConnectionDiagnostics()
+            }
         }
 
         settingsContent.addView(terminalAction(tr("close")).apply {
@@ -3020,34 +3112,79 @@ class MainActivity : Activity() {
             Toast.makeText(this, tr("backup_busy"), Toast.LENGTH_SHORT).show()
             return
         }
+        promptBackupPassword(
+            title = tr("backup_password_export_title"),
+            message = tr("backup_password_export_desc"),
+            requireStrongPassword = true
+        ) { password ->
+            runExportEncryptedBackupTo(uri, password)
+        }
+    }
+
+    private fun runExportEncryptedBackupTo(uri: Uri, password: CharArray) {
+        if (backupOperationRunning) return
         backupOperationRunning = true
         showBackupProgress("${tr("export_backup")}...")
         thread(name = "export-backup") {
-            val payload = buildBackupPayload().toByteArray(StandardCharsets.UTF_8)
-            val encrypted = encryptBackup(payload) ?: run {
-                hideBackupProgress()
-                backupOperationRunning = false
-                runOnUiThread { Toast.makeText(this, tr("backup_failed"), Toast.LENGTH_SHORT).show() }
-                return@thread
-            }
-            runCatching {
-                contentResolver.openOutputStream(uri)?.use { out ->
-                    out.write(encrypted)
-                    out.flush()
-                } ?: error("output stream is null")
-            }
-                .onSuccess {
-                    hideBackupProgress()
-                    backupOperationRunning = false
-                    runOnUiThread {
-                        Toast.makeText(this, tr("backup_exported"), Toast.LENGTH_LONG).show()
-                    }
-                }
-                .onFailure {
+            try {
+                val payload = buildBackupPayload().toByteArray(StandardCharsets.UTF_8)
+                val encrypted = BackupSupport.encrypt(payload, password) ?: run {
                     hideBackupProgress()
                     backupOperationRunning = false
                     runOnUiThread { Toast.makeText(this, tr("backup_failed"), Toast.LENGTH_SHORT).show() }
+                    return@thread
                 }
+                runCatching {
+                    contentResolver.openOutputStream(uri)?.use { out ->
+                        out.write(encrypted)
+                        out.flush()
+                    } ?: error("output stream is null")
+                }
+                    .onSuccess {
+                        hideBackupProgress()
+                        backupOperationRunning = false
+                        runOnUiThread {
+                            Toast.makeText(this, tr("backup_exported"), Toast.LENGTH_LONG).show()
+                        }
+                    }
+                    .onFailure {
+                        hideBackupProgress()
+                        backupOperationRunning = false
+                        runOnUiThread { Toast.makeText(this, tr("backup_failed"), Toast.LENGTH_SHORT).show() }
+                    }
+            } finally {
+                password.fill('\u0000')
+            }
+        }
+    }
+
+    private fun promptBackupPassword(
+        title: String,
+        message: String,
+        requireStrongPassword: Boolean,
+        onPassword: (CharArray) -> Unit
+    ) {
+        val input = EditText(this).apply {
+            hint = tr("backup_password_hint")
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setSingleLine()
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setView(input)
+            .setNegativeButton(tr("cancel"), null)
+            .setPositiveButton(tr("continue"), null)
+            .show()
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val password = input.text?.toString().orEmpty()
+            if (requireStrongPassword && password.length < BACKUP_PASSWORD_MIN_LENGTH) {
+                Toast.makeText(this, tr("backup_password_short"), Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            dialog.dismiss()
+            onPassword(password.toCharArray())
         }
     }
 
@@ -3061,51 +3198,61 @@ class MainActivity : Activity() {
             .setMessage(tr("backup_import_confirm"))
             .setNegativeButton(tr("cancel"), null)
             .setPositiveButton(tr("continue")) { _, _ ->
-                runImportEncryptedBackup(uri)
+                promptBackupPassword(
+                    title = tr("backup_password_import_title"),
+                    message = tr("backup_password_import_desc"),
+                    requireStrongPassword = false
+                ) { password ->
+                    runImportEncryptedBackup(uri, password)
+                }
             }
             .show()
     }
 
-    private fun runImportEncryptedBackup(uri: Uri) {
+    private fun runImportEncryptedBackup(uri: Uri, password: CharArray) {
         if (backupOperationRunning) return
         backupOperationRunning = true
         showBackupProgress("${tr("import_backup")}...")
         thread(name = "import-backup") {
-            val sourceName = queryDisplayName(uri).lowercase(Locale.US)
-            if (!sourceName.endsWith(".tbk")) {
-                hideBackupProgress()
-                backupOperationRunning = false
-                runOnUiThread { Toast.makeText(this, tr("backup_invalid_file"), Toast.LENGTH_SHORT).show() }
-                return@thread
-            }
-            val encrypted = readUriBytesWithLimit(uri, MAX_BACKUP_BYTES) ?: run {
-                hideBackupProgress()
-                backupOperationRunning = false
-                runOnUiThread { Toast.makeText(this, tr("backup_invalid_file"), Toast.LENGTH_SHORT).show() }
-                return@thread
-            }
-            val decrypted = decryptBackup(encrypted) ?: run {
-                hideBackupProgress()
-                backupOperationRunning = false
-                runOnUiThread { Toast.makeText(this, tr("backup_failed"), Toast.LENGTH_SHORT).show() }
-                return@thread
-            }
-            val text = String(decrypted, StandardCharsets.UTF_8)
-            val restoredCount = restoreBackupPayload(text)
-            runOnUiThread {
-                hideBackupProgress()
-                backupOperationRunning = false
-                if (restoredCount >= 0) {
-                    Toast.makeText(this, "${tr("backup_imported")}: $restoredCount ${tr("restored_messages")}", Toast.LENGTH_LONG).show()
-                    showChatMessages(currentChatKey())
-                    showChatList()
-                } else {
-                    Toast.makeText(
-                        this,
-                        backupRestoreErrorMessage ?: tr("backup_failed"),
-                        Toast.LENGTH_SHORT
-                    ).show()
+            try {
+                val sourceName = ImageTransferPreparer.queryDisplayName(contentResolver, uri).lowercase(Locale.US)
+                if (!sourceName.endsWith(".tbk")) {
+                    hideBackupProgress()
+                    backupOperationRunning = false
+                    runOnUiThread { Toast.makeText(this, tr("backup_invalid_file"), Toast.LENGTH_SHORT).show() }
+                    return@thread
                 }
+                val encrypted = BackupSupport.readUriBytesWithLimit(contentResolver, uri, MAX_BACKUP_BYTES) ?: run {
+                    hideBackupProgress()
+                    backupOperationRunning = false
+                    runOnUiThread { Toast.makeText(this, tr("backup_invalid_file"), Toast.LENGTH_SHORT).show() }
+                    return@thread
+                }
+                val decrypted = BackupSupport.decrypt(this, encrypted, password) ?: run {
+                    hideBackupProgress()
+                    backupOperationRunning = false
+                    runOnUiThread { Toast.makeText(this, tr("backup_failed"), Toast.LENGTH_SHORT).show() }
+                    return@thread
+                }
+                val text = String(decrypted, StandardCharsets.UTF_8)
+                val restoredCount = restoreBackupPayload(text)
+                runOnUiThread {
+                    hideBackupProgress()
+                    backupOperationRunning = false
+                    if (restoredCount >= 0) {
+                        Toast.makeText(this, "${tr("backup_imported")}: $restoredCount ${tr("restored_messages")}", Toast.LENGTH_LONG).show()
+                        showChatMessages(currentChatKey())
+                        showChatList()
+                    } else {
+                        Toast.makeText(
+                            this,
+                            backupRestoreErrorMessage ?: tr("backup_failed"),
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            } finally {
+                password.fill('\u0000')
             }
         }
     }
@@ -3115,7 +3262,7 @@ class MainActivity : Activity() {
         bodyRows += "TSK1\t${System.currentTimeMillis()}"
         bodyRows += listOf("S", "theme_dark", if (darkThemeEnabled) "1" else "0").joinToString("\t")
         bodyRows += listOf("S", "language", selectedLanguage.code).joinToString("\t")
-        bodyRows += listOf("S", "display_name", getDisplayName().encodeStoredText()).joinToString("\t")
+        bodyRows += listOf("S", "display_name", AppProfileStore.displayName(this).encodeStoredText()).joinToString("\t")
         chatStore.listChats().forEach { chat ->
             bodyRows += listOf(
                 "C",
@@ -3148,7 +3295,7 @@ class MainActivity : Activity() {
             }
         }
         val body = bodyRows.joinToString("\n")
-        val checksum = crc32Hex(body.toByteArray(StandardCharsets.UTF_8))
+        val checksum = BackupSupport.crc32Hex(body.toByteArray(StandardCharsets.UTF_8))
         return "$body\nCRC\t$checksum"
     }
 
@@ -3166,7 +3313,7 @@ class MainActivity : Activity() {
         }
         val expectedChecksum = checksumLine.substringAfter("CRC\t").trim().lowercase(Locale.US)
         val bodyLines = lines.dropLast(1)
-        val actualChecksum = crc32Hex(
+        val actualChecksum = BackupSupport.crc32Hex(
             bodyLines.joinToString("\n").toByteArray(StandardCharsets.UTF_8)
         )
         if (expectedChecksum != actualChecksum) {
@@ -3284,32 +3431,8 @@ class MainActivity : Activity() {
         if (restoredTheme != null || restoredLanguage != null) {
             saveUiSettings()
         }
-        restoredDisplayName?.let { setDisplayName(it) }
+        restoredDisplayName?.let { AppProfileStore.setDisplayName(this, it) }
         return restoredCount
-    }
-
-    private fun crc32Hex(bytes: ByteArray): String {
-        val crc = CRC32()
-        crc.update(bytes)
-        return java.lang.Long.toHexString(crc.value).padStart(8, '0')
-    }
-
-    private fun readUriBytesWithLimit(uri: Uri, maxBytes: Int): ByteArray? {
-        return runCatching {
-            contentResolver.openInputStream(uri)?.use { input ->
-                val buffer = ByteArray(8192)
-                val output = ByteArrayOutputStream()
-                var total = 0
-                while (true) {
-                    val read = input.read(buffer)
-                    if (read <= 0) break
-                    total += read
-                    if (total > maxBytes) return null
-                    output.write(buffer, 0, read)
-                }
-                output.toByteArray()
-            }
-        }.getOrNull()
     }
 
     private fun showBackupProgress(text: String) {
@@ -3358,52 +3481,13 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun backupKey(): SecretKeySpec {
-        val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
-        val seed = "$packageName|$androidId|truskawka_backup_v1"
-        val digest = MessageDigest.getInstance("SHA-256").digest(seed.toByteArray(StandardCharsets.UTF_8))
-        return SecretKeySpec(digest.copyOf(16), "AES")
-    }
-
-    private fun encryptBackup(plain: ByteArray): ByteArray? {
-        return runCatching {
-            val iv = ByteArray(12).also { SecureRandom().nextBytes(it) }
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, backupKey(), GCMParameterSpec(128, iv))
-            val encrypted = cipher.doFinal(plain)
-            iv + encrypted
-        }.getOrNull()
-    }
-
-    private fun decryptBackup(payload: ByteArray): ByteArray? {
-        if (payload.size <= 12) return null
-        return runCatching {
-            val iv = payload.copyOfRange(0, 12)
-            val data = payload.copyOfRange(12, payload.size)
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, backupKey(), GCMParameterSpec(128, iv))
-            cipher.doFinal(data)
-        }.getOrNull()
-    }
-
     private fun cleanupMediaCache() {
-        val folders = listOf("sent_images", "incoming_images", "incoming_audio", "voice_notes")
-            .map { File(filesDir, it) }
-            .filter { it.exists() && it.isDirectory }
-        val files = folders.flatMap { dir -> dir.listFiles()?.toList().orEmpty() }
-            .filter { it.isFile }
-            .sortedBy { it.lastModified() }
-            .toMutableList()
-        var total = files.sumOf { it.length() }
-        while (total > MAX_MEDIA_CACHE_BYTES && files.isNotEmpty()) {
-            val first = files.removeAt(0)
-            val size = first.length()
-            if (first.delete()) total -= size
-        }
+        MediaCacheCleaner.cleanup(filesDir, MAX_MEDIA_CACHE_BYTES)
     }
 
     private fun showConnectionDiagnostics() {
         val peers = meshService?.knownPeers().orEmpty()
+        val diagnostics = meshService?.meshDiagnostics()
         val direct = peers.count { it.isDirect || it.hopCount <= 1 }
         val hops = peers.count { !(it.isDirect || it.hopCount <= 1) }
         val ratio = if (sentCounter <= 0) 0 else ((deliveredCounter * 100f) / sentCounter).toInt()
@@ -3419,6 +3503,15 @@ class MainActivity : Activity() {
             append("${tr("diag_hop_nodes")}: $hops\n")
             append("${tr("diag_avg_hops")}: ${"%.1f".format(avgHops)}\n")
             append("${tr("settings_mesh_section")}: $discoveryMode, ${tr("settings_max_hops")}: $meshMaxHops\n")
+            diagnostics?.let { snapshot ->
+                append("${tr("diag_router_neighbors")}: ${snapshot.router.neighborCount}\n")
+                append("${tr("diag_pending_delivery")}: ${snapshot.router.pendingMessageCount}\n")
+                append("${tr("diag_retry_ready")}: ${snapshot.router.retryReadyCount}\n")
+                append("${tr("diag_seen_cache")}: ${snapshot.router.seenMessageCount}\n")
+                append("${tr("diag_routes")}: ${snapshot.router.routeCount}\n")
+                append("${tr("diag_pending_handshake")}: ${snapshot.pendingHandshakeMessages}\n")
+                append("${tr("diag_incoming_files")}: ${snapshot.incomingFileTransfers}\n")
+            }
             append("${tr("diag_last_relay")}: $lastRelayInfo")
         }
         AlertDialog.Builder(this)
@@ -3580,961 +3673,10 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun tr(key: String): String {
-        val en = mapOf(
-            "chats" to "Chats",
-            "new_contacts" to "New contacts",
-            "contacts" to "Contacts",
-            "profile" to "Profile",
-            "settings" to "Settings",
-            "settings_subtitle" to "Manage app look, language, and local data",
-            "settings_appearance" to "Appearance",
-            "settings_appearance_desc" to "Choose how Truskawka looks",
-            "settings_language_desc" to "Choose interface language",
-            "settings_data_storage" to "Data & Storage",
-            "settings_data_storage_desc" to "Backup and maintenance tools",
-            "settings_export_backup" to "Export Chat Backup",
-            "settings_export_backup_desc" to "Save encrypted local chat history to a .tbk file",
-            "settings_import_backup" to "Import Chat Backup",
-            "settings_import_backup_desc" to "Restore messages and chat settings from a .tbk file",
-            "settings_cleanup_cache" to "Clear Media Cache",
-            "settings_cleanup_cache_desc" to "Remove old image and voice cache files",
-            "settings_connection_diag" to "Connection Diagnostics",
-            "settings_connection_diag_desc" to "View delivery stats and mesh route state",
-            "settings_security" to "Privacy & Security",
-            "settings_security_desc" to "Protect app access and lock behavior",
-            "settings_lock_enable" to "Enable App Lock",
-            "settings_lock_enable_desc" to "Require PIN when returning to the app",
-            "settings_lock_pin" to "Set PIN Code",
-            "settings_lock_pin_desc" to "PIN is used to unlock Truskawka",
-            "settings_lock_pin_hint" to "Enter 4-8 digit PIN",
-            "settings_lock_pin_short" to "PIN must be at least 4 digits",
-            "settings_lock_timeout" to "Auto-lock timeout",
-            "settings_lock_title" to "Truskawka is locked",
-            "settings_lock_enter_pin" to "Enter PIN",
-            "settings_lock_invalid_pin" to "Wrong PIN",
-            "unlock" to "Unlock",
-            "settings_mesh_section" to "Mesh Radio",
-            "settings_mesh_desc" to "Control mesh discovery behavior",
-            "settings_mesh_mode" to "Discovery mode",
-            "mesh_mode_balanced" to "Balanced",
-            "mesh_mode_aggressive" to "Aggressive",
-            "settings_max_hops" to "Max route hops",
-            "settings_restart_mesh" to "Restart Mesh Discovery",
-            "settings_restart_mesh_desc" to "Restart scan and advertising now",
-            "settings_notifications" to "Notifications",
-            "settings_notifications_desc" to "Control when and how alerts are shown",
-            "settings_notify_enable" to "Enable Notifications",
-            "settings_notify_enable_desc" to "Show message notifications outside the app",
-            "settings_notify_preview" to "Show Message Preview",
-            "settings_notify_preview_desc" to "Display message text in notification body",
-            "settings_notify_broadcast" to "Broadcast Alerts",
-            "settings_notify_broadcast_desc" to "Notify for messages from Everyone channel",
-            "settings_chat_behavior" to "Chat Behavior",
-            "settings_chat_behavior_desc" to "Tune message and chat list appearance",
-            "settings_chat_compact" to "Compact Chat List",
-            "settings_chat_compact_desc" to "Use tighter rows in Contacts list",
-            "settings_chat_font" to "Message text size",
-            "small" to "Small",
-            "normal" to "Normal",
-            "large" to "Large",
-            "settings_region" to "Region & Time",
-            "settings_region_desc" to "Date and time formatting",
-            "settings_time_format" to "Time format",
-            "settings_date_format" to "Date format",
-            "short" to "Short",
-            "long" to "Long",
-            "copy" to "Copy",
-            "copied" to "Copied",
-            "no_chats_yet" to "No chats yet",
-            "quick_start_title" to "Quick start",
-            "quick_start_step_1" to "Open New contacts and wait until people appear.",
-            "quick_start_step_2" to "Tap a person to open a private chat.",
-            "quick_start_step_3" to "Send a message and wait for Delivered/Read marks.",
-            "got_it" to "Got it",
-            "theme" to "Theme",
-            "theme_light" to "Light",
-            "theme_dark" to "Black pink",
-            "language" to "Language",
-            "save" to "Save",
-            "profile_updated" to "Profile updated",
-            "original_name_editable" to "Original name (editable)",
-            "original_name_fixed" to "Original name (fixed)",
-            "display_name_editable" to "Display name (editable)",
-            "display_name" to "Display name",
-            "everyone" to "Everyone",
-            "saved_messages" to "Saved messages",
-            "today" to "Today",
-            "yesterday" to "Yesterday",
-            "hint_save_message" to "save a message...",
-            "hint_type_message" to "type a message...",
-            "hint_message" to "message",
-            "online_now" to "online now",
-            "last_seen_prefix" to "Last seen:",
-            "status_searching_nearby" to "Searching nearby...",
-            "status_mesh_online" to "Mesh online",
-            "status_person_found" to "Nearby person found",
-            "status_secure_ready" to "Secure chat ready",
-            "status_permissions_needed" to "Permissions needed",
-            "status_bt_disabled" to "Bluetooth disabled",
-            "delivered" to "Delivered",
-            "read" to "Read",
-            "offline" to "Offline",
-            "patch" to "Patch",
-            "patch_upper" to "PATCH",
-            "mesh_starting" to "Mesh starting...",
-            "search_in_patch" to "search in patch...",
-            "direct_in_range" to "Direct in range",
-            "no_direct_peers" to "No direct peers in Bluetooth range",
-            "no_direct_matches" to "No direct matches",
-            "direct_ble" to "direct BLE",
-            "verified" to "Verified",
-            "reachable_via_hops" to "Reachable via hops",
-            "no_multihop_routes" to "No multi-hop routes discovered yet",
-            "no_hop_matches" to "No hop matches",
-            "via" to "via",
-            "hops" to "hops",
-            "photo" to "photo",
-            "private_notes" to "private notes for yourself",
-            "nearby_public_mesh" to "nearby public mesh",
-            "verified_contact" to "verified contact",
-            "tap_open_chat" to "tap to open chat",
-            "private_local_chat_desc" to "Private local chat stored on this device.",
-            "broadcast_chat_desc" to "Broadcast chat for everyone nearby.",
-            "peer_id" to "Peer ID",
-            "saved_auto_read" to "Saved messages are automatically marked as read.",
-            "messages_public_mesh" to "Messages here are public to nearby mesh users.",
-            "contact_verified_local" to "This contact is marked as verified on this device.",
-            "compare_code_verify" to "Compare the code with your friend, then mark it verified.",
-            "search_messages" to "Search messages",
-            "mark_verified" to "Mark as verified",
-            "contact_verified" to "Contact verified",
-            "close" to "Close",
-            "delete" to "Delete",
-            "edit" to "Edit",
-            "cancel" to "Cancel",
-            "delete_for_everyone_q" to "delete for everyone?",
-            "delete_for_myself_q" to "Delete for myself?",
-            "search_messages_hint" to "search messages...",
-            "type_to_search_chat" to "Type to search this chat",
-            "no_matches" to "No matches",
-            "search" to "Search",
-            "seen_recently" to "seen recently",
-            "seen" to "seen",
-            "min_ago" to "min ago",
-            "h_ago" to "h ago",
-            "d_ago" to "d ago",
-            "local" to "local",
-            "online" to "online",
-            "pin" to "Pin",
-            "unpin" to "Unpin",
-            "pinned" to "pinned",
-            "saved_empty" to "saved messages are empty",
-            "broadcast_empty" to "broadcast is empty",
-            "chat_empty" to "chat is empty",
-            "grow" to "Grow",
-            "grow_desc" to "Bring phones close to exchange local keys and join each other's patch.",
-            "start_discovery" to "Start discovery",
-            "scan_nearby_ble" to "scan nearby BLE mesh nodes",
-            "searching_nearby_patch" to "Searching nearby patch",
-            "open_patch" to "Open patch",
-            "show_direct_hop" to "show direct and hop peers",
-            "back_to_chats" to "Back to chats",
-            "start_chatting" to "Start chatting",
-            "choose_nickname" to "Choose a nickname",
-            "welcome_truskawka" to "Welcome to Truskawka",
-            "choose_mesh_nickname" to "Choose your mesh nickname",
-            "nickname_rules" to "The @ stays fixed. Max 12 characters.",
-            "nickname_change_online_only" to "Nickname can be changed when mesh is online",
-            "nickname_change_once_week" to "Nickname can be changed once a week",
-            "could_not_read_image" to "Could not read image",
-            "image_too_large" to "Image is too large",
-            "incoming_image_unavailable" to "incoming image not available on device",
-            "incoming_audio_unavailable" to "incoming voice message not available on device",
-            "status_sprouting" to "Sprouting",
-            "status_ripe" to "Ripe",
-            "status_failed" to "Failed",
-            "mesh_hop_limit_reached" to "Peer is beyond your max hops setting",
-            "broadcast" to "Broadcast",
-            "enable_nearby_chat" to "Enable nearby chat",
-            "permissions_intro_desc" to "Truskawka needs Bluetooth, Nearby devices, Location, and Microphone access so mesh radio can discover phones and send voice notes. Internet and router Wi-Fi are not required.",
-            "continue" to "Continue",
-            "permissions_recovery_toast" to "Allow Bluetooth, Nearby devices, Location, and Microphone for mesh radio",
-            "preparing_image" to "preparing image...",
-            "sending_image" to "sending image...",
-            "image_sent" to "image sent",
-            "image_received" to "image received",
-            "you" to "You",
-            "direct" to "Direct",
-            "mesh_hops" to "Mesh hops"
-            ,
-            "send" to "Send",
-            "add_caption" to "Add a caption...",
-            "preview_image" to "Image preview",
-            "voice_message" to "voice message",
-            "recording_voice" to "recording voice...",
-            "sending_voice" to "sending voice...",
-            "voice_sent" to "voice sent",
-            "voice_received" to "voice received",
-            "voice_send_failed" to "voice send failed",
-            "voice_too_large" to "voice message is too large",
-            "voice_too_short" to "hold to record a bit longer",
-            "voice_read_failed" to "could not read recorded voice",
-            "play" to "Play",
-            "stop" to "Stop",
-            "mic_permission_needed" to "Microphone permission is required",
-            "voice_record_failed" to "Could not start recording",
-            "mic" to "MIC",
-            "mic_icon" to "\uD83C\uDFA4",
-            "recording_short" to "REC",
-            "voice_canceled" to "voice canceled",
-            "replying_to" to "Replying to",
-            "react" to "React",
-            "forward_saved" to "Forward to Saved",
-            "forwarded_to_saved" to "Forwarded to Saved messages",
-            "tools" to "Tools",
-            "export_backup" to "Export backup",
-            "import_backup" to "Import backup",
-            "cleanup_cache" to "Cleanup media cache",
-            "cleanup_done" to "Cache cleanup completed",
-            "backup_exported" to "Backup exported",
-            "backup_imported" to "Backup imported",
-            "restored_messages" to "messages restored",
-            "backup_busy" to "Backup operation already running",
-            "backup_import_confirm" to "Import will replace current local history. Continue?",
-            "backup_invalid_file" to "Select a valid .tbk backup file",
-            "backup_corrupted" to "Backup file is corrupted or incomplete",
-            "backup_failed" to "Backup operation failed",
-            "connection_diagnostics" to "Connection diagnostics",
-            "diag_sent" to "Sent",
-            "diag_delivered" to "Delivered",
-            "diag_read" to "Read",
-            "diag_failed" to "Failed",
-            "diag_delivery_ratio" to "Delivery ratio",
-            "diag_direct_nodes" to "Direct nodes",
-            "diag_hop_nodes" to "Hop nodes",
-            "diag_avg_hops" to "Average hops",
-            "diag_last_relay" to "Last relay status"
-        )
-        val ru = mapOf(
-            "chats" to "Чаты",
-            "new_contacts" to "Новые контакты",
-            "contacts" to "Контакты",
-            "profile" to "Профиль",
-            "settings" to "Настройки",
-            "no_chats_yet" to "Чатов пока нет",
-            "theme" to "Тема",
-            "theme_light" to "Светлая",
-            "theme_dark" to "Черно-розовая",
-            "language" to "Язык",
-            "save" to "Сохранить",
-            "profile_updated" to "Профиль обновлен",
-            "original_name_fixed" to "Оригинальное имя (фиксированное)",
-            "display_name_editable" to "Отображаемое имя (изменяемое)",
-            "display_name" to "Отображаемое имя",
-            "everyone" to "Все",
-            "saved_messages" to "Избранное",
-            "today" to "Сегодня",
-            "yesterday" to "Вчера",
-            "hint_save_message" to "сохранить сообщение...",
-            "hint_type_message" to "введите сообщение...",
-            "hint_message" to "сообщение",
-            "online_now" to "в сети",
-            "last_seen_prefix" to "Был(а) в сети:",
-            "status_searching_nearby" to "Поиск рядом...",
-            "status_mesh_online" to "Mesh онлайн",
-            "status_person_found" to "Найден человек рядом",
-            "status_secure_ready" to "Защищенный чат готов",
-            "status_permissions_needed" to "Нужны разрешения",
-            "status_bt_disabled" to "Bluetooth выключен",
-            "delivered" to "Доставлено",
-            "read" to "Прочитано",
-            "offline" to "Оффлайн",
-            "patch" to "Патч",
-            "patch_upper" to "ПАТЧ",
-            "mesh_starting" to "Mesh запускается...",
-            "search_in_patch" to "поиск в патче...",
-            "direct_in_range" to "Прямо в зоне",
-            "no_direct_peers" to "Нет прямых устройств в зоне Bluetooth",
-            "no_direct_matches" to "Нет прямых совпадений",
-            "direct_ble" to "прямой BLE",
-            "verified" to "Подтверждено",
-            "reachable_via_hops" to "Доступно через хопы",
-            "no_multihop_routes" to "Маршруты через хопы пока не найдены",
-            "no_hop_matches" to "Нет совпадений по хопам",
-            "via" to "через",
-            "hops" to "хопов",
-            "photo" to "фото",
-            "private_notes" to "личные заметки",
-            "nearby_public_mesh" to "публичный nearby mesh",
-            "verified_contact" to "подтвержденный контакт",
-            "tap_open_chat" to "нажмите, чтобы открыть чат",
-            "private_local_chat_desc" to "Локальный приватный чат на этом устройстве.",
-            "broadcast_chat_desc" to "Публичный чат для всех рядом.",
-            "peer_id" to "Peer ID",
-            "saved_auto_read" to "Избранное автоматически считается прочитанным.",
-            "messages_public_mesh" to "Сообщения здесь публичны для nearby mesh.",
-            "contact_verified_local" to "Этот контакт помечен как подтвержденный на этом устройстве.",
-            "compare_code_verify" to "Сверьте код с другом и подтвердите контакт.",
-            "search_messages" to "Поиск сообщений",
-            "mark_verified" to "Отметить как подтвержденный",
-            "contact_verified" to "Контакт подтвержден",
-            "close" to "Закрыть",
-            "delete" to "Удалить",
-            "edit" to "Изменить",
-            "cancel" to "Отмена",
-            "delete_for_everyone_q" to "удалить для всех?",
-            "delete_for_myself_q" to "Удалить только у себя?",
-            "search_messages_hint" to "поиск сообщений...",
-            "type_to_search_chat" to "Введите текст для поиска в чате",
-            "no_matches" to "Совпадений нет",
-            "search" to "Поиск",
-            "seen_recently" to "был(а) недавно",
-            "seen" to "был(а)",
-            "min_ago" to "мин назад",
-            "h_ago" to "ч назад",
-            "d_ago" to "д назад",
-            "local" to "локально",
-            "online" to "онлайн",
-            "pin" to "Закрепить",
-            "unpin" to "Открепить",
-            "pinned" to "закреплено",
-            "saved_empty" to "избранное пусто",
-            "broadcast_empty" to "эфир пуст",
-            "chat_empty" to "чат пуст",
-            "grow" to "Grow",
-            "grow_desc" to "Поднесите телефоны ближе для обмена ключами и входа в патч.",
-            "start_discovery" to "Начать поиск",
-            "scan_nearby_ble" to "скан nearby BLE mesh узлов",
-            "searching_nearby_patch" to "Идет поиск nearby patch",
-            "open_patch" to "Открыть патч",
-            "show_direct_hop" to "показать прямые и hop узлы",
-            "back_to_chats" to "Назад к чатам",
-            "start_chatting" to "Начать чат",
-            "choose_nickname" to "Выберите никнейм",
-            "welcome_truskawka" to "Добро пожаловать в Truskawka",
-            "choose_mesh_nickname" to "Выберите mesh никнейм",
-            "nickname_rules" to "Символ @ фиксирован. Максимум 12 символов.",
-            "nickname_change_online_only" to "Ник можно менять, когда mesh онлайн",
-            "nickname_change_once_week" to "Ник можно менять раз в неделю",
-            "could_not_read_image" to "Не удалось прочитать изображение",
-            "image_too_large" to "Изображение слишком большое",
-            "incoming_image_unavailable" to "полученное изображение недоступно на устройстве",
-            "incoming_audio_unavailable" to "полученное голосовое недоступно на устройстве",
-            "status_sprouting" to "В пути",
-            "status_ripe" to "Доставлено",
-            "status_failed" to "Не отправлено",
-            "mesh_hop_limit_reached" to "Собеседник вне выбранного лимита hop",
-            "broadcast" to "Эфир",
-            "enable_nearby_chat" to "Включить nearby чат",
-            "permissions_intro_desc" to "Truskawka требует полный доступ к Bluetooth, Nearby devices и Location, чтобы mesh radio мог рекламироваться и сканировать телефоны рядом. Интернет и роутерный Wi-Fi не нужны.",
-            "continue" to "Продолжить",
-            "permissions_recovery_toast" to "Разрешите Bluetooth, Nearby devices и Location для mesh radio",
-            "preparing_image" to "подготовка изображения...",
-            "sending_image" to "отправка изображения...",
-            "image_sent" to "изображение отправлено",
-            "image_received" to "изображение получено",
-            "you" to "Вы",
-            "direct" to "Прямые",
-            "mesh_hops" to "Mesh хопы"
-            ,
-            "send" to "Отправить",
-            "add_caption" to "Добавить подпись...",
-            "preview_image" to "Предпросмотр изображения",
-            "voice_message" to "голосовое сообщение",
-            "recording_voice" to "запись голосового...",
-            "sending_voice" to "отправка голосового...",
-            "voice_sent" to "голосовое отправлено",
-            "voice_received" to "голосовое получено",
-            "voice_send_failed" to "ошибка отправки голосового",
-            "voice_too_large" to "голосовое слишком большое",
-            "voice_too_short" to "удерживайте кнопку чуть дольше",
-            "voice_read_failed" to "не удалось прочитать запись",
-            "play" to "Слушать",
-            "stop" to "Стоп",
-            "mic_permission_needed" to "Нужно разрешение на микрофон",
-            "voice_record_failed" to "Не удалось начать запись",
-            "mic" to "МИК",
-            "mic_icon" to "\uD83C\uDFA4",
-            "recording_short" to "ЗАП",
-            "voice_canceled" to "голосовое отменено",
-            "replying_to" to "Ответ на",
-            "react" to "Реакция",
-            "forward_saved" to "Переслать в Избранное",
-            "forwarded_to_saved" to "Переслано в Избранное",
-            "tools" to "Инструменты",
-            "export_backup" to "Экспорт backup",
-            "import_backup" to "Импорт backup",
-            "cleanup_cache" to "Очистить кэш медиа",
-            "cleanup_done" to "Кэш очищен",
-            "backup_exported" to "Backup экспортирован",
-            "backup_imported" to "Backup импортирован",
-            "restored_messages" to "сообщений восстановлено",
-            "backup_busy" to "Операция backup уже выполняется",
-            "backup_import_confirm" to "Импорт заменит текущую локальную историю. Продолжить?",
-            "backup_invalid_file" to "Выберите корректный файл backup .tbk",
-            "backup_corrupted" to "Файл backup поврежден или неполный",
-            "backup_failed" to "Ошибка backup",
-            "connection_diagnostics" to "Диагностика соединения",
-            "diag_sent" to "Отправлено",
-            "diag_delivered" to "Доставлено",
-            "diag_read" to "Прочитано",
-            "diag_failed" to "Ошибки",
-            "diag_delivery_ratio" to "Доля доставки",
-            "diag_direct_nodes" to "Прямые узлы",
-            "diag_hop_nodes" to "Hop узлы",
-            "diag_avg_hops" to "Средние hop",
-            "diag_last_relay" to "Последний relay статус"
-        )
-        val pl = mapOf(
-            "chats" to "Czaty",
-            "new_contacts" to "Nowe kontakty",
-            "contacts" to "Kontakty",
-            "profile" to "Profil",
-            "settings" to "Ustawienia",
-            "no_chats_yet" to "Brak czatow",
-            "theme" to "Motyw",
-            "theme_light" to "Jasny",
-            "theme_dark" to "Czarno-rozowy",
-            "language" to "Jezyk",
-            "save" to "Zapisz",
-            "profile_updated" to "Profil zaktualizowany",
-            "original_name_fixed" to "Oryginalna nazwa (stala)",
-            "display_name_editable" to "Nazwa wyswietlana (edytowalna)",
-            "display_name" to "Nazwa wyswietlana",
-            "everyone" to "Wszyscy",
-            "saved_messages" to "Zapisane",
-            "today" to "Dzis",
-            "yesterday" to "Wczoraj",
-            "hint_save_message" to "zapisz wiadomosc...",
-            "hint_type_message" to "napisz wiadomosc...",
-            "hint_message" to "wiadomosc",
-            "online_now" to "online",
-            "last_seen_prefix" to "Ostatnio widziany:",
-            "status_searching_nearby" to "Szukanie w poblizu...",
-            "status_mesh_online" to "Mesh online",
-            "status_person_found" to "Znaleziono osobe",
-            "status_secure_ready" to "Bezpieczny chat gotowy",
-            "status_permissions_needed" to "Wymagane uprawnienia",
-            "status_bt_disabled" to "Bluetooth wylaczony",
-            "delivered" to "Dostarczono",
-            "read" to "Przeczytano",
-            "offline" to "Offline",
-            "patch" to "Patch",
-            "patch_upper" to "PATCH",
-            "mesh_starting" to "Mesh startuje...",
-            "search_in_patch" to "szukaj w patch...",
-            "direct_in_range" to "Bezposrednio w zasiegu",
-            "no_direct_peers" to "Brak bezposrednich urzadzen w zasiegu Bluetooth",
-            "no_direct_matches" to "Brak bezposrednich dopasowan",
-            "direct_ble" to "bezposredni BLE",
-            "verified" to "Zweryfikowano",
-            "reachable_via_hops" to "Dostepne przez hop",
-            "no_multihop_routes" to "Brak tras wielohopowych",
-            "no_hop_matches" to "Brak dopasowan hop",
-            "via" to "przez",
-            "hops" to "hop",
-            "photo" to "zdjecie",
-            "private_notes" to "prywatne notatki",
-            "nearby_public_mesh" to "publiczny nearby mesh",
-            "verified_contact" to "zweryfikowany kontakt",
-            "tap_open_chat" to "dotknij, aby otworzyc chat",
-            "private_local_chat_desc" to "Prywatny lokalny chat na tym urzadzeniu.",
-            "broadcast_chat_desc" to "Publiczny chat dla wszystkich w poblizu.",
-            "peer_id" to "Peer ID",
-            "saved_auto_read" to "Zapisane wiadomosci sa automatycznie przeczytane.",
-            "messages_public_mesh" to "Wiadomosci tutaj sa publiczne dla nearby mesh.",
-            "contact_verified_local" to "Ten kontakt jest zweryfikowany na tym urzadzeniu.",
-            "compare_code_verify" to "Porownaj kod z znajomym i oznacz jako zweryfikowany.",
-            "search_messages" to "Szukaj wiadomosci",
-            "mark_verified" to "Oznacz jako zweryfikowany",
-            "contact_verified" to "Kontakt zweryfikowany",
-            "close" to "Zamknij",
-            "delete" to "Usun",
-            "edit" to "Edytuj",
-            "cancel" to "Anuluj",
-            "delete_for_everyone_q" to "usun dla wszystkich?",
-            "delete_for_myself_q" to "Usun tylko u mnie?",
-            "search_messages_hint" to "szukaj wiadomosci...",
-            "type_to_search_chat" to "Wpisz, aby szukac w tym chacie",
-            "no_matches" to "Brak wynikow",
-            "search" to "Szukaj",
-            "seen_recently" to "widziany niedawno",
-            "seen" to "widziany",
-            "min_ago" to "min temu",
-            "h_ago" to "h temu",
-            "d_ago" to "d temu",
-            "local" to "lokalnie",
-            "online" to "online",
-            "pin" to "Przypnij",
-            "unpin" to "Odepnij",
-            "pinned" to "przypiete",
-            "saved_empty" to "zapisane wiadomosci sa puste",
-            "broadcast_empty" to "broadcast jest pusty",
-            "chat_empty" to "chat jest pusty",
-            "grow" to "Grow",
-            "grow_desc" to "Zbliz telefony, aby wymienic klucze i dolaczyc do patch.",
-            "start_discovery" to "Rozpocznij wykrywanie",
-            "scan_nearby_ble" to "skanuj nearby BLE mesh",
-            "searching_nearby_patch" to "Szukanie nearby patch",
-            "open_patch" to "Otworz patch",
-            "show_direct_hop" to "pokaz bezposrednie i hop wezly",
-            "back_to_chats" to "Wroc do chatow",
-            "start_chatting" to "Zacznij chat",
-            "choose_nickname" to "Wybierz nickname",
-            "welcome_truskawka" to "Witamy w Truskawka",
-            "choose_mesh_nickname" to "Wybierz mesh nickname",
-            "nickname_rules" to "@ pozostaje stale. Maks 12 znakow.",
-            "nickname_change_online_only" to "Nickname mozna zmienic, gdy mesh jest online",
-            "nickname_change_once_week" to "Nickname mozna zmienic raz w tygodniu",
-            "could_not_read_image" to "Nie mozna odczytac obrazu",
-            "image_too_large" to "Obraz jest za duzy",
-            "incoming_image_unavailable" to "odebrany obraz niedostepny na urzadzeniu",
-            "incoming_audio_unavailable" to "odebrana wiadomosc glosowa niedostepna",
-            "status_sprouting" to "W drodze",
-            "status_ripe" to "Dostarczono",
-            "status_failed" to "Nie wysłano",
-            "mesh_hop_limit_reached" to "Kontakt jest poza ustawionym limitem hop",
-            "broadcast" to "Broadcast",
-            "enable_nearby_chat" to "Wlacz nearby chat",
-            "permissions_intro_desc" to "Truskawka wymaga pelnego dostepu do Bluetooth, Nearby devices i Location, aby mesh radio moglo reklamowac i skanowac telefony obok. Internet i Wi-Fi routera nie sa wymagane.",
-            "continue" to "Kontynuuj",
-            "permissions_recovery_toast" to "Zezwol na Bluetooth, Nearby devices i Location dla mesh radio",
-            "preparing_image" to "przygotowywanie obrazu...",
-            "sending_image" to "wysylanie obrazu...",
-            "image_sent" to "obraz wyslany",
-            "image_received" to "obraz odebrany",
-            "you" to "Ty",
-            "direct" to "Direct",
-            "mesh_hops" to "Mesh hops"
-            ,
-            "send" to "Wyslij",
-            "add_caption" to "Dodaj podpis...",
-            "preview_image" to "Podglad obrazu",
-            "voice_message" to "wiadomosc glosowa",
-            "recording_voice" to "nagrywanie glosu...",
-            "sending_voice" to "wysylanie glosu...",
-            "voice_sent" to "glos wyslany",
-            "voice_received" to "glos odebrany",
-            "voice_send_failed" to "blad wysylania glosu",
-            "voice_too_large" to "wiadomosc glosowa jest za duza",
-            "voice_too_short" to "przytrzymaj przycisk troche dluzej",
-            "voice_read_failed" to "nie mozna odczytac nagrania",
-            "play" to "Play",
-            "stop" to "Stop",
-            "mic_permission_needed" to "Wymagane uprawnienie mikrofonu",
-            "voice_record_failed" to "Nie mozna rozpoczac nagrywania",
-            "mic" to "MIK",
-            "mic_icon" to "\uD83C\uDFA4",
-            "recording_short" to "REC",
-            "voice_canceled" to "wiadomosc glosowa anulowana",
-            "replying_to" to "Odpowiedz do",
-            "react" to "Reakcja",
-            "forward_saved" to "Przekaz do Zapisanych",
-            "forwarded_to_saved" to "Przekazano do Zapisanych",
-            "tools" to "Narzędzia",
-            "export_backup" to "Eksport backup",
-            "import_backup" to "Import backup",
-            "cleanup_cache" to "Wyczysc cache mediow",
-            "cleanup_done" to "Cache wyczyszczony",
-            "backup_exported" to "Backup wyeksportowany",
-            "backup_imported" to "Backup zaimportowany",
-            "restored_messages" to "wiadomosci przywrocono",
-            "backup_busy" to "Operacja backup jest juz uruchomiona",
-            "backup_import_confirm" to "Import zastapi biezaca lokalna historie. Kontynuowac?",
-            "backup_invalid_file" to "Wybierz poprawny plik backup .tbk",
-            "backup_corrupted" to "Plik backup jest uszkodzony lub niepelny",
-            "backup_failed" to "Blad backup",
-            "connection_diagnostics" to "Diagnostyka polaczenia",
-            "diag_sent" to "Wyslane",
-            "diag_delivered" to "Dostarczone",
-            "diag_read" to "Przeczytane",
-            "diag_failed" to "Bledy",
-            "diag_delivery_ratio" to "Wskaznik dostarczenia",
-            "diag_direct_nodes" to "Direct wezly",
-            "diag_hop_nodes" to "Hop wezly",
-            "diag_avg_hops" to "Srednie hop",
-            "diag_last_relay" to "Ostatni relay status"
-        )
-        val es = mapOf(
-            "chats" to "Chats",
-            "new_contacts" to "Nuevos contactos",
-            "contacts" to "Contactos",
-            "profile" to "Perfil",
-            "settings" to "Ajustes",
-            "no_chats_yet" to "Sin chats todavia",
-            "theme" to "Tema",
-            "theme_light" to "Claro",
-            "theme_dark" to "Negro rosa",
-            "language" to "Idioma",
-            "save" to "Guardar",
-            "profile_updated" to "Perfil actualizado",
-            "original_name_fixed" to "Nombre original (fijo)",
-            "display_name_editable" to "Nombre visible (editable)",
-            "display_name" to "Nombre visible",
-            "everyone" to "Todos",
-            "saved_messages" to "Guardados",
-            "today" to "Hoy",
-            "yesterday" to "Ayer",
-            "hint_save_message" to "guardar mensaje...",
-            "hint_type_message" to "escribe un mensaje...",
-            "hint_message" to "mensaje",
-            "online_now" to "en linea",
-            "last_seen_prefix" to "Ultima vez:",
-            "status_searching_nearby" to "Buscando cerca...",
-            "status_mesh_online" to "Mesh en linea",
-            "status_person_found" to "Persona cercana encontrada",
-            "status_secure_ready" to "Chat seguro listo",
-            "status_permissions_needed" to "Permisos necesarios",
-            "status_bt_disabled" to "Bluetooth desactivado",
-            "delivered" to "Entregado",
-            "read" to "Leido",
-            "offline" to "Offline",
-            "patch" to "Patch",
-            "patch_upper" to "PATCH",
-            "mesh_starting" to "Mesh iniciando...",
-            "search_in_patch" to "buscar en patch...",
-            "direct_in_range" to "Directo en rango",
-            "no_direct_peers" to "No hay pares directos en rango Bluetooth",
-            "no_direct_matches" to "Sin coincidencias directas",
-            "direct_ble" to "BLE directo",
-            "verified" to "Verificado",
-            "reachable_via_hops" to "Alcanzable por hops",
-            "no_multihop_routes" to "No hay rutas multi-hop aun",
-            "no_hop_matches" to "Sin coincidencias de hops",
-            "via" to "via",
-            "hops" to "hops",
-            "photo" to "foto",
-            "private_notes" to "notas privadas",
-            "nearby_public_mesh" to "nearby mesh publico",
-            "verified_contact" to "contacto verificado",
-            "tap_open_chat" to "toca para abrir chat",
-            "private_local_chat_desc" to "Chat local privado guardado en este dispositivo.",
-            "broadcast_chat_desc" to "Chat publico para todos cerca.",
-            "peer_id" to "Peer ID",
-            "saved_auto_read" to "Guardados se marcan como leidos automaticamente.",
-            "messages_public_mesh" to "Los mensajes aqui son publicos para nearby mesh.",
-            "contact_verified_local" to "Este contacto esta marcado como verificado en este dispositivo.",
-            "compare_code_verify" to "Compara el codigo con tu amigo y luego verificalo.",
-            "search_messages" to "Buscar mensajes",
-            "mark_verified" to "Marcar como verificado",
-            "contact_verified" to "Contacto verificado",
-            "close" to "Cerrar",
-            "delete" to "Eliminar",
-            "edit" to "Editar",
-            "cancel" to "Cancelar",
-            "delete_for_everyone_q" to "eliminar para todos?",
-            "delete_for_myself_q" to "Eliminar solo para mi?",
-            "search_messages_hint" to "buscar mensajes...",
-            "type_to_search_chat" to "Escribe para buscar en este chat",
-            "no_matches" to "Sin coincidencias",
-            "search" to "Buscar",
-            "seen_recently" to "visto recientemente",
-            "seen" to "visto",
-            "min_ago" to "min atras",
-            "h_ago" to "h atras",
-            "d_ago" to "d atras",
-            "local" to "local",
-            "online" to "online",
-            "pin" to "Fijar",
-            "unpin" to "Desfijar",
-            "pinned" to "fijado",
-            "saved_empty" to "guardados vacio",
-            "broadcast_empty" to "broadcast vacio",
-            "chat_empty" to "chat vacio",
-            "grow" to "Grow",
-            "grow_desc" to "Acerca los telefonos para intercambiar claves y unirte al patch.",
-            "start_discovery" to "Iniciar descubrimiento",
-            "scan_nearby_ble" to "escanear nodos nearby BLE mesh",
-            "searching_nearby_patch" to "Buscando nearby patch",
-            "open_patch" to "Abrir patch",
-            "show_direct_hop" to "mostrar nodos directos y hop",
-            "back_to_chats" to "Volver a chats",
-            "start_chatting" to "Comenzar chat",
-            "choose_nickname" to "Elige un nickname",
-            "welcome_truskawka" to "Bienvenido a Truskawka",
-            "choose_mesh_nickname" to "Elige tu mesh nickname",
-            "nickname_rules" to "@ se mantiene fijo. Maximo 12 caracteres.",
-            "nickname_change_online_only" to "El nickname puede cambiarse cuando mesh esta online",
-            "nickname_change_once_week" to "El nickname puede cambiarse una vez por semana",
-            "could_not_read_image" to "No se pudo leer la imagen",
-            "image_too_large" to "La imagen es demasiado grande",
-            "incoming_image_unavailable" to "la imagen recibida no esta disponible en el dispositivo",
-            "incoming_audio_unavailable" to "el audio recibido no esta disponible en el dispositivo",
-            "status_sprouting" to "En ruta",
-            "status_ripe" to "Entregado",
-            "status_failed" to "No enviado",
-            "mesh_hop_limit_reached" to "El contacto está fuera del límite de hops configurado",
-            "broadcast" to "Broadcast",
-            "enable_nearby_chat" to "Activar chat nearby",
-            "permissions_intro_desc" to "Truskawka necesita acceso completo a Bluetooth, Nearby devices y Location para que mesh radio pueda anunciarse y escanear telefonos cercanos. Internet y Wi-Fi de router no son necesarios.",
-            "continue" to "Continuar",
-            "permissions_recovery_toast" to "Permite Bluetooth, Nearby devices y Location para mesh radio",
-            "preparing_image" to "preparando imagen...",
-            "sending_image" to "enviando imagen...",
-            "image_sent" to "imagen enviada",
-            "image_received" to "imagen recibida",
-            "you" to "Tu",
-            "direct" to "Directo",
-            "mesh_hops" to "Mesh hops"
-            ,
-            "send" to "Enviar",
-            "add_caption" to "Agregar texto...",
-            "preview_image" to "Vista previa de imagen",
-            "voice_message" to "mensaje de voz",
-            "recording_voice" to "grabando voz...",
-            "sending_voice" to "enviando voz...",
-            "voice_sent" to "voz enviada",
-            "voice_received" to "voz recibida",
-            "voice_send_failed" to "error al enviar voz",
-            "voice_too_large" to "el mensaje de voz es demasiado grande",
-            "voice_too_short" to "manten pulsado un poco mas",
-            "voice_read_failed" to "no se pudo leer la grabacion",
-            "play" to "Play",
-            "stop" to "Stop",
-            "mic_permission_needed" to "Se requiere permiso de microfono",
-            "voice_record_failed" to "No se pudo iniciar la grabacion",
-            "mic" to "MIC",
-            "mic_icon" to "\uD83C\uDFA4",
-            "recording_short" to "REC",
-            "voice_canceled" to "voz cancelada",
-            "replying_to" to "Respondiendo a",
-            "react" to "Reaccion",
-            "forward_saved" to "Enviar a Guardados",
-            "forwarded_to_saved" to "Enviado a Guardados",
-            "tools" to "Herramientas",
-            "export_backup" to "Exportar backup",
-            "import_backup" to "Importar backup",
-            "cleanup_cache" to "Limpiar cache de medios",
-            "cleanup_done" to "Cache limpiado",
-            "backup_exported" to "Backup exportado",
-            "backup_imported" to "Backup importado",
-            "restored_messages" to "mensajes restaurados",
-            "backup_busy" to "La operacion de backup ya esta en curso",
-            "backup_import_confirm" to "La importacion reemplazara el historial local actual. Continuar?",
-            "backup_invalid_file" to "Selecciona un archivo backup .tbk valido",
-            "backup_corrupted" to "El archivo de backup esta dañado o incompleto",
-            "backup_failed" to "Error de backup",
-            "connection_diagnostics" to "Diagnostico de conexion",
-            "diag_sent" to "Enviados",
-            "diag_delivered" to "Entregados",
-            "diag_read" to "Leidos",
-            "diag_failed" to "Fallidos",
-            "diag_delivery_ratio" to "Ratio de entrega",
-            "diag_direct_nodes" to "Nodos directos",
-            "diag_hop_nodes" to "Nodos hop",
-            "diag_avg_hops" to "Hop promedio",
-            "diag_last_relay" to "Estado relay ultimo"
-        )
-        val source = when (selectedLanguage) {
-            AppLanguage.EN -> en
-            AppLanguage.PL -> pl
-            AppLanguage.ES -> es
-            AppLanguage.RU -> ru
-        }
-        val settingsOverrides = when (selectedLanguage) {
-            AppLanguage.EN -> emptyMap<String, String>()
-            AppLanguage.RU -> mapOf(
-                "settings_subtitle" to "Внешний вид, язык и локальные данные",
-                "settings_appearance" to "Внешний вид",
-                "settings_appearance_desc" to "Настройка темы и вида",
-                "settings_language_desc" to "Язык интерфейса",
-                "settings_security" to "Приватность и защита",
-                "settings_security_desc" to "PIN и блокировка приложения",
-                "settings_lock_enable" to "Включить блокировку",
-                "settings_lock_enable_desc" to "Запрашивать PIN при возврате",
-                "settings_lock_pin" to "Задать PIN",
-                "settings_lock_pin_desc" to "PIN для разблокировки Truskawka",
-                "settings_lock_pin_hint" to "Введите PIN 4-8 цифр",
-                "settings_lock_pin_short" to "PIN должен быть минимум 4 цифры",
-                "settings_lock_timeout" to "Таймаут автоблокировки",
-                "settings_lock_title" to "Truskawka заблокирована",
-                "settings_lock_enter_pin" to "Введите PIN",
-                "settings_lock_invalid_pin" to "Неверный PIN",
-                "unlock" to "Разблокировать",
-                "settings_mesh_section" to "Mesh радио",
-                "settings_mesh_desc" to "Параметры поиска сети",
-                "settings_mesh_mode" to "Режим поиска",
-                "mesh_mode_balanced" to "Сбалансированный",
-                "mesh_mode_aggressive" to "Агрессивный",
-                "settings_max_hops" to "Макс. hop",
-                "settings_restart_mesh" to "Перезапустить Mesh поиск",
-                "settings_restart_mesh_desc" to "Запустить скан и advertise заново",
-                "settings_notifications" to "Уведомления",
-                "settings_notifications_desc" to "Когда и как показывать уведомления",
-                "settings_notify_enable" to "Включить уведомления",
-                "settings_notify_enable_desc" to "Показывать уведомления вне приложения",
-                "settings_notify_preview" to "Превью сообщений",
-                "settings_notify_preview_desc" to "Показывать текст в уведомлении",
-                "settings_notify_broadcast" to "Уведомления Everyone",
-                "settings_notify_broadcast_desc" to "Уведомлять о сообщениях в Everyone",
-                "settings_chat_behavior" to "Поведение чата",
-                "settings_chat_behavior_desc" to "Вид списка чатов и сообщений",
-                "settings_chat_compact" to "Компактный список чатов",
-                "settings_chat_compact_desc" to "Плотные строки в Contacts",
-                "settings_chat_font" to "Размер текста",
-                "settings_region" to "Регион и время",
-                "settings_region_desc" to "Форматы даты и времени",
-                "settings_time_format" to "Формат времени",
-                "settings_date_format" to "Формат даты",
-                "settings_data_storage" to "Данные и хранилище",
-                "settings_data_storage_desc" to "Backup и обслуживание",
-                "settings_export_backup" to "Экспорт backup чата",
-                "settings_export_backup_desc" to "Сохранить историю в файл .tbk",
-                "settings_import_backup" to "Импорт backup чата",
-                "settings_import_backup_desc" to "Восстановить чат из .tbk",
-                "settings_cleanup_cache" to "Очистить кэш медиа",
-                "settings_cleanup_cache_desc" to "Удалить старые медиа файлы",
-                "settings_connection_diag" to "Диагностика сети",
-                "settings_connection_diag_desc" to "Статистика доставки и маршрутов",
-                "small" to "Маленький",
-                "normal" to "Обычный",
-                "large" to "Большой",
-                "short" to "Короткий",
-                "long" to "Длинный",
-                "copy" to "Копировать",
-                "copied" to "Скопировано"
-            )
-            AppLanguage.PL -> mapOf(
-                "settings_subtitle" to "Wyglad, jezyk i dane lokalne",
-                "settings_appearance" to "Wyglad",
-                "settings_appearance_desc" to "Ustawienia motywu i wygladu",
-                "settings_language_desc" to "Jezyk interfejsu",
-                "settings_security" to "Prywatnosc i ochrona",
-                "settings_security_desc" to "PIN i blokada aplikacji",
-                "settings_lock_enable" to "Wlacz blokade",
-                "settings_lock_enable_desc" to "Wymagaj PIN po powrocie",
-                "settings_lock_pin" to "Ustaw PIN",
-                "settings_lock_pin_desc" to "PIN do odblokowania Truskawka",
-                "settings_lock_pin_hint" to "Wpisz PIN 4-8 cyfr",
-                "settings_lock_pin_short" to "PIN musi miec co najmniej 4 cyfry",
-                "settings_lock_timeout" to "Timeout auto blokady",
-                "settings_lock_title" to "Truskawka jest zablokowana",
-                "settings_lock_enter_pin" to "Wpisz PIN",
-                "settings_lock_invalid_pin" to "Nieprawidlowy PIN",
-                "unlock" to "Odblokuj",
-                "settings_mesh_section" to "Mesh radio",
-                "settings_mesh_desc" to "Parametry wykrywania sieci",
-                "settings_mesh_mode" to "Tryb wykrywania",
-                "mesh_mode_balanced" to "Zrownowazony",
-                "mesh_mode_aggressive" to "Agresywny",
-                "settings_max_hops" to "Maks. hop",
-                "settings_restart_mesh" to "Restart wykrywania Mesh",
-                "settings_restart_mesh_desc" to "Uruchom skan i advertise ponownie",
-                "settings_notifications" to "Powiadomienia",
-                "settings_notifications_desc" to "Kiedy i jak pokazywac alerty",
-                "settings_notify_enable" to "Wlacz powiadomienia",
-                "settings_notify_enable_desc" to "Pokazuj powiadomienia poza aplikacja",
-                "settings_notify_preview" to "Podglad wiadomosci",
-                "settings_notify_preview_desc" to "Pokaz tekst wiadomosci w powiadomieniu",
-                "settings_notify_broadcast" to "Alerty Everyone",
-                "settings_notify_broadcast_desc" to "Powiadamiaj o wiadomosciach Everyone",
-                "settings_chat_behavior" to "Zachowanie chatu",
-                "settings_chat_behavior_desc" to "Wyglad listy chatow i wiadomosci",
-                "settings_chat_compact" to "Kompaktowa lista chatow",
-                "settings_chat_compact_desc" to "Gestsze wiersze w Contacts",
-                "settings_chat_font" to "Rozmiar tekstu",
-                "settings_region" to "Region i czas",
-                "settings_region_desc" to "Format daty i godziny",
-                "settings_time_format" to "Format godziny",
-                "settings_date_format" to "Format daty",
-                "settings_data_storage" to "Dane i pamiec",
-                "settings_data_storage_desc" to "Backup i narzedzia serwisowe",
-                "settings_export_backup" to "Eksport backupu chatu",
-                "settings_export_backup_desc" to "Zapisz historie do pliku .tbk",
-                "settings_import_backup" to "Import backupu chatu",
-                "settings_import_backup_desc" to "Przywroc chat z pliku .tbk",
-                "settings_cleanup_cache" to "Wyczysc cache mediow",
-                "settings_cleanup_cache_desc" to "Usun stare pliki mediow",
-                "settings_connection_diag" to "Diagnostyka sieci",
-                "settings_connection_diag_desc" to "Statystyki dostarczenia i tras",
-                "small" to "Maly",
-                "normal" to "Normalny",
-                "large" to "Duzy",
-                "short" to "Krotki",
-                "long" to "Dlugi",
-                "copy" to "Kopiuj",
-                "copied" to "Skopiowano"
-            )
-            AppLanguage.ES -> mapOf(
-                "settings_subtitle" to "Apariencia, idioma y datos locales",
-                "settings_appearance" to "Apariencia",
-                "settings_appearance_desc" to "Configura tema y aspecto",
-                "settings_language_desc" to "Idioma de la interfaz",
-                "settings_security" to "Privacidad y seguridad",
-                "settings_security_desc" to "PIN y bloqueo de la app",
-                "settings_lock_enable" to "Activar bloqueo",
-                "settings_lock_enable_desc" to "Pedir PIN al volver a la app",
-                "settings_lock_pin" to "Configurar PIN",
-                "settings_lock_pin_desc" to "PIN para desbloquear Truskawka",
-                "settings_lock_pin_hint" to "Ingresa PIN de 4-8 digitos",
-                "settings_lock_pin_short" to "El PIN debe tener al menos 4 digitos",
-                "settings_lock_timeout" to "Tiempo de autobloqueo",
-                "settings_lock_title" to "Truskawka esta bloqueada",
-                "settings_lock_enter_pin" to "Ingresa PIN",
-                "settings_lock_invalid_pin" to "PIN incorrecto",
-                "unlock" to "Desbloquear",
-                "settings_mesh_section" to "Radio Mesh",
-                "settings_mesh_desc" to "Parametros de descubrimiento de red",
-                "settings_mesh_mode" to "Modo de descubrimiento",
-                "mesh_mode_balanced" to "Equilibrado",
-                "mesh_mode_aggressive" to "Agresivo",
-                "settings_max_hops" to "Max. hops",
-                "settings_restart_mesh" to "Reiniciar descubrimiento Mesh",
-                "settings_restart_mesh_desc" to "Iniciar escaneo y advertise de nuevo",
-                "settings_notifications" to "Notificaciones",
-                "settings_notifications_desc" to "Cuando y como mostrar alertas",
-                "settings_notify_enable" to "Activar notificaciones",
-                "settings_notify_enable_desc" to "Mostrar notificaciones fuera de la app",
-                "settings_notify_preview" to "Vista previa del mensaje",
-                "settings_notify_preview_desc" to "Mostrar texto en la notificacion",
-                "settings_notify_broadcast" to "Alertas de Everyone",
-                "settings_notify_broadcast_desc" to "Notificar mensajes del canal Everyone",
-                "settings_chat_behavior" to "Comportamiento del chat",
-                "settings_chat_behavior_desc" to "Aspecto de lista y mensajes",
-                "settings_chat_compact" to "Lista compacta de chats",
-                "settings_chat_compact_desc" to "Filas mas compactas en Contacts",
-                "settings_chat_font" to "Tamano del texto",
-                "settings_region" to "Region y hora",
-                "settings_region_desc" to "Formato de fecha y hora",
-                "settings_time_format" to "Formato de hora",
-                "settings_date_format" to "Formato de fecha",
-                "settings_data_storage" to "Datos y almacenamiento",
-                "settings_data_storage_desc" to "Backup y mantenimiento",
-                "settings_export_backup" to "Exportar backup del chat",
-                "settings_export_backup_desc" to "Guardar historial en archivo .tbk",
-                "settings_import_backup" to "Importar backup del chat",
-                "settings_import_backup_desc" to "Restaurar chat desde archivo .tbk",
-                "settings_cleanup_cache" to "Limpiar cache de medios",
-                "settings_cleanup_cache_desc" to "Eliminar archivos antiguos de medios",
-                "settings_connection_diag" to "Diagnostico de red",
-                "settings_connection_diag_desc" to "Estadisticas de entrega y rutas",
-                "small" to "Pequeno",
-                "normal" to "Normal",
-                "large" to "Grande",
-                "short" to "Corto",
-                "long" to "Largo",
-                "copy" to "Copiar",
-                "copied" to "Copiado"
-            )
-        }
-        return source[key] ?: settingsOverrides[key] ?: en[key] ?: key
-    }
-
-    private fun getDisplayName(): String =
-        getSharedPreferences("bitchat_profile", Context.MODE_PRIVATE)
-            .getString("display_name", "")
-            .orEmpty()
-
-    private fun setDisplayName(value: String) {
-        getSharedPreferences("bitchat_profile", Context.MODE_PRIVATE)
-            .edit()
-            .putString("display_name", value.trim().take(24))
-            .apply()
-    }
+    private fun tr(key: String): String = Translations.tr(selectedLanguage, key)
 
     private fun contactDisplayName(): String {
-        val display = getDisplayName().trim()
+        val display = AppProfileStore.displayName(this).trim()
         return display.ifBlank { currentNickname.removePrefix("@") }
     }
 
@@ -5096,12 +4238,6 @@ class MainActivity : Activity() {
         dialog.show()
     }
 
-    private data class StyledActionItem(
-        val label: String,
-        val destructive: Boolean = false,
-        val action: () -> Unit
-    )
-
     private fun showStyledActionDialog(actions: List<StyledActionItem>) {
         val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
         val content = LinearLayout(this).apply {
@@ -5232,12 +4368,12 @@ class MainActivity : Activity() {
     }
 
     private fun requestMissingPermissions() {
-        val permissions = requiredPermissions().filter {
-            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+        val permissions = MeshPermissionPolicy.missingRequiredPermissions {
+            checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
         }.toTypedArray()
 
         if (permissions.isNotEmpty()) {
-            requestPermissions(permissions, 42)
+            requestPermissions(permissions, MESH_PERMISSIONS_REQUEST_CODE)
         } else {
             startAppAfterPermissions()
         }
@@ -5305,7 +4441,7 @@ class MainActivity : Activity() {
             }
             return
         }
-        if (requestCode != 42) return
+        if (requestCode != MESH_PERMISSIONS_REQUEST_CODE) return
 
         if (hasRequiredPermissions()) {
             startAppAfterPermissions()
@@ -5317,7 +4453,7 @@ class MainActivity : Activity() {
 
     private fun startAppAfterPermissions() {
         if (!ensureBluetoothEnabled()) return
-        if (!ensureLocationEnabled()) return
+        if (MeshPermissionPolicy.requiresLocationServices() && !ensureLocationEnabled()) return
         startAndBindMeshService()
     }
 
@@ -5355,21 +4491,9 @@ class MainActivity : Activity() {
     }
 
     private fun hasRequiredPermissions(): Boolean =
-        requiredPermissions().all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
-
-    private fun requiredPermissions(): List<String> = buildList {
-        add(Manifest.permission.ACCESS_COARSE_LOCATION)
-        add(Manifest.permission.ACCESS_FINE_LOCATION)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            add(Manifest.permission.BLUETOOTH_SCAN)
-            add(Manifest.permission.BLUETOOTH_ADVERTISE)
-            add(Manifest.permission.BLUETOOTH_CONNECT)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            add(Manifest.permission.NEARBY_WIFI_DEVICES)
-            add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-    }
+        MeshPermissionPolicy.missingRequiredPermissions {
+            checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+        }.isEmpty()
 
     private fun showPermissionRecovery() {
         Toast.makeText(
@@ -5435,7 +4559,7 @@ class MainActivity : Activity() {
     private fun terminalText(value: String): TextView =
         TextView(this).apply {
             text = value
-            typeface = Typeface.MONOSPACE
+            typeface = Typeface.DEFAULT
             setTextColor(BERRY_TEXT)
             includeFontPadding = false
         }
@@ -5443,7 +4567,7 @@ class MainActivity : Activity() {
     private fun terminalAction(value: String): TextView =
         TextView(this).apply {
             text = value
-            typeface = Typeface.MONOSPACE
+            typeface = Typeface.DEFAULT_BOLD
             setTextColor(BERRY_TEXT)
             setBackgroundColor(Color.TRANSPARENT)
             setPadding(dp(6), dp(4), dp(6), dp(4))
@@ -5529,104 +4653,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun queryDisplayName(uri: Uri): String {
-        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (index >= 0) return cursor.getString(index)
-            }
-        }
-        return "image.jpg"
-    }
-
-    private fun copyImageToLocalFile(fileName: String, bytes: ByteArray): File {
-        val directory = File(filesDir, "sent_images").apply { mkdirs() }
-        val safeName = fileName.replace(Regex("[^A-Za-z0-9._-]"), "_").ifBlank { "image.jpg" }
-        return File(directory, "${System.currentTimeMillis()}_$safeName").also { it.writeBytes(bytes) }
-    }
-
-    private fun prepareImageForTransfer(uri: Uri, originalName: String): PreparedImage? {
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        val boundsStream = contentResolver.openInputStream(uri) ?: return null
-        boundsStream.use {
-            BitmapFactory.decodeStream(it, null, bounds)
-        }
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-            return decodeImageWithImageDecoder(uri)?.let { bitmap ->
-                val scaled = scaleBitmapIfNeeded(bitmap, MAX_IMAGE_DIMENSION)
-                val compressed = compressBitmap(scaled)
-                if (scaled !== bitmap && !scaled.isRecycled) scaled.recycle()
-                if (!bitmap.isRecycled) bitmap.recycle()
-                PreparedImage("${originalName.substringBeforeLast('.', "image")}.jpg", "image/jpeg", compressed)
-            }
-        }
-
-        val options = BitmapFactory.Options().apply {
-            inSampleSize = calculateInSampleSize(bounds, MAX_IMAGE_DIMENSION)
-        }
-        val bitmap = contentResolver.openInputStream(uri)?.use {
-            BitmapFactory.decodeStream(it, null, options)
-        } ?: decodeImageWithImageDecoder(uri) ?: return null
-
-        val scaled = scaleBitmapIfNeeded(bitmap, MAX_IMAGE_DIMENSION)
-        val compressed = compressBitmap(scaled)
-        if (scaled !== bitmap && !scaled.isRecycled) scaled.recycle()
-        if (!bitmap.isRecycled) bitmap.recycle()
-        val safeName = originalName
-            .substringBeforeLast('.', originalName)
-            .ifBlank { "image" }
-            .replace(Regex("[^A-Za-z0-9._-]"), "_")
-            .take(80)
-        return PreparedImage("$safeName.jpg", "image/jpeg", compressed)
-    }
-
-    private fun decodeImageWithImageDecoder(uri: Uri): Bitmap? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
-        return runCatching {
-            ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { decoder, _, _ ->
-                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-            }
-        }.getOrNull()
-    }
-
-    private fun scaleBitmapIfNeeded(bitmap: Bitmap, maxDimension: Int): Bitmap {
-        val width = bitmap.width
-        val height = bitmap.height
-        val longest = maxOf(width, height)
-        if (longest <= maxDimension) return bitmap
-        val scale = maxDimension.toFloat() / longest.toFloat()
-        return Bitmap.createScaledBitmap(
-            bitmap,
-            (width * scale).toInt().coerceAtLeast(1),
-            (height * scale).toInt().coerceAtLeast(1),
-            true
-        )
-    }
-
-    private fun calculateInSampleSize(options: BitmapFactory.Options, maxDimension: Int): Int {
-        var sampleSize = 1
-        var width = options.outWidth
-        var height = options.outHeight
-        while (width / 2 >= maxDimension || height / 2 >= maxDimension) {
-            width /= 2
-            height /= 2
-            sampleSize *= 2
-        }
-        return sampleSize
-    }
-
-    private fun compressBitmap(bitmap: Bitmap): ByteArray {
-        var quality = 82
-        var bytes: ByteArray
-        do {
-            val output = ByteArrayOutputStream()
-            bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)
-            bytes = output.toByteArray()
-            quality -= 8
-        } while (bytes.size > TARGET_IMAGE_BYTES && quality >= 50)
-        return bytes
-    }
-
     private fun showImageProgress(text: String) {
         transferStatusView.text = text
         transferStatusView.visibility = View.VISIBLE
@@ -5706,596 +4732,6 @@ class MainActivity : Activity() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-    private inner class PatchRadarView(context: Context) : View(context) {
-        private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = dp(1).toFloat()
-            color = SOFT_PINK_STROKE
-        }
-        private val centerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.FILL
-            color = STRAWBERRY_RED
-        }
-        private val directPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.FILL
-            color = LEAF_GREEN
-        }
-        private val meshPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.FILL
-            color = 0x66FF4359
-        }
-        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = BERRY_TEXT_DIM
-            textSize = dp(11).toFloat()
-            textAlign = Paint.Align.CENTER
-        }
-
-        private var directCount: Int = 0
-        private var meshCount: Int = 0
-
-        fun setPeerCounts(direct: Int, mesh: Int) {
-            directCount = direct
-            meshCount = mesh
-            invalidate()
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            val cx = width / 2f
-            val cy = height / 2f
-            val radius = minOf(width, height) * 0.42f
-
-            canvas.drawCircle(cx, cy, radius, ringPaint)
-            canvas.drawCircle(cx, cy, radius * 0.72f, ringPaint)
-            canvas.drawCircle(cx, cy, radius * 0.45f, ringPaint)
-            canvas.drawCircle(cx, cy, radius * 0.18f, centerPaint)
-            canvas.drawText(tr("you"), cx, cy + dp(4), Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.WHITE
-                textSize = dp(10).toFloat()
-                textAlign = Paint.Align.CENTER
-            })
-
-            drawPeers(canvas, cx, cy, radius * 0.52f, directCount, directPaint)
-            drawPeers(canvas, cx, cy, radius * 0.84f, meshCount, meshPaint)
-
-            canvas.drawText("${tr("direct")}: $directCount", cx, height - dp(26).toFloat(), textPaint)
-            canvas.drawText("${tr("mesh_hops")}: $meshCount", cx, height - dp(10).toFloat(), textPaint)
-        }
-
-        private fun drawPeers(canvas: Canvas, cx: Float, cy: Float, radius: Float, count: Int, paint: Paint) {
-            if (count <= 0) return
-            repeat(count.coerceAtMost(14)) { index ->
-                val angle = (index.toFloat() / count.toFloat()) * (Math.PI * 2.0)
-                val x = cx + (kotlin.math.cos(angle).toFloat() * radius)
-                val y = cy + (kotlin.math.sin(angle).toFloat() * radius)
-                canvas.drawCircle(x, y, dp(4).toFloat(), paint)
-            }
-        }
-    }
-
-    private inner class ChatAdapter(private val items: List<ChatMessage>) : BaseAdapter() {
-        override fun getCount(): Int = items.size
-        override fun getItem(position: Int): ChatMessage = items[position]
-        override fun getItemId(position: Int): Long = position.toLong()
-
-        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-            val item = getItem(position)
-            val isServiceLog = item.author == "system" || item.author == "mesh"
-            return LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = when {
-                    isServiceLog -> Gravity.CENTER_HORIZONTAL
-                    item.mine -> Gravity.RIGHT
-                    else -> Gravity.LEFT
-                }
-                setPadding(dp(8), dp(6), dp(8), dp(6))
-                if (shouldShowDateHeader(position)) {
-                    addView(dateHeader(item), LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT
-                    ).apply {
-                        gravity = Gravity.CENTER_HORIZONTAL
-                        bottomMargin = dp(8)
-                    })
-                }
-                if (shouldShowSenderLabel(position, item, isServiceLog)) {
-                    addView(senderLabel(item), LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT
-                    ).apply {
-                        gravity = Gravity.LEFT
-                        bottomMargin = dp(4)
-                    })
-                }
-                if (item.imagePath != null) {
-                    val bitmap = BitmapFactory.decodeFile(item.imagePath)
-                    val imageSize = calculateChatImageSize(bitmap)
-                    val image = BorderedImageView(this@MainActivity).apply {
-                        setImageBitmap(bitmap)
-                        adjustViewBounds = false
-                        scaleType = ImageView.ScaleType.FIT_CENTER
-                        setBackgroundColor(Color.TRANSPARENT)
-                        setOnClickListener { showImagePreview(item.imagePath) }
-                        setOnLongClickListener {
-                            showMessageActions(item)
-                            true
-                        }
-                    }
-                    addView(image, LinearLayout.LayoutParams(
-                        imageSize.first,
-                        imageSize.second
-                    ))
-                    addView(messageTimeView(item, overOutgoing = item.mine).apply {
-                        setPadding(0, dp(4), dp(4), 0)
-                    }, LinearLayout.LayoutParams(
-                        imageSize.first,
-                        ViewGroup.LayoutParams.WRAP_CONTENT
-                    ))
-                    reactionBadge(item)?.let { badge ->
-                        addView(badge, LinearLayout.LayoutParams(
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                            ViewGroup.LayoutParams.WRAP_CONTENT
-                        ).apply {
-                            gravity = if (item.mine) Gravity.RIGHT else Gravity.LEFT
-                            topMargin = dp(3)
-                        })
-                    }
-                    attachReplySwipe(image, item)
-                    return@apply
-                }
-                if (item.audioPath != null) {
-                    val bubble = voiceBubble(item)
-                    addView(bubble, LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT
-                    ))
-                    attachReplySwipe(bubble, item)
-                    return@apply
-                }
-
-                val bubble = if (isServiceLog) {
-                    serviceBubble(item)
-                } else {
-                    messageBubble(item)
-                }
-                addView(bubble, LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ))
-                reactionBadge(item)?.let { badge ->
-                    addView(badge, LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT
-                    ).apply {
-                        gravity = if (item.mine) Gravity.RIGHT else Gravity.LEFT
-                        topMargin = dp(3)
-                    })
-                }
-                if (!isServiceLog) {
-                    bubble.setOnLongClickListener {
-                        showMessageActions(item)
-                        true
-                    }
-                    attachReplySwipe(bubble, item)
-                }
-            }
-        }
-
-        private fun shouldShowSenderLabel(position: Int, item: ChatMessage, isServiceLog: Boolean): Boolean {
-            if (isServiceLog || item.mine) return false
-            if (position == 0) return true
-            val previous = getItem(position - 1)
-            if (previous.author == "system" || previous.author == "mesh") return true
-            if (previous.mine) return true
-            return previous.author != item.author
-        }
-
-        private fun senderLabel(item: ChatMessage): TextView =
-            terminalText(item.displayAuthor()).apply {
-                textSize = 12f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(BERRY_TEXT_DIM)
-                setPadding(dp(6), 0, dp(6), 0)
-            }
-
-        private fun shouldShowDateHeader(position: Int): Boolean {
-            if (position == 0) return true
-            val current = Calendar.getInstance().apply { timeInMillis = getItem(position).timestamp }
-            val previous = Calendar.getInstance().apply { timeInMillis = getItem(position - 1).timestamp }
-            return !current.isSameDay(previous)
-        }
-
-        private fun dateHeader(item: ChatMessage): TextView =
-            TextView(this@MainActivity).apply {
-                text = item.displayDate()
-                textSize = 12f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(BERRY_TEXT_DIM)
-                gravity = Gravity.CENTER
-                background = roundedDrawable(SERVICE_BUBBLE, dp(26), SERVICE_BUBBLE_STROKE)
-                setPadding(dp(14), dp(6), dp(14), dp(6))
-            }
-
-        private fun serviceBubble(item: ChatMessage): TextView =
-            TextView(this@MainActivity).apply {
-                text = "i ${item.body}"
-                typeface = Typeface.MONOSPACE
-                textSize = 14f
-                setLineSpacing(dp(2).toFloat(), 1f)
-                gravity = Gravity.CENTER
-                minWidth = 0
-                minHeight = 0
-                setTextColor(MUTED_CORAL)
-                background = roundedDrawable(SERVICE_BUBBLE, dp(26), SERVICE_BUBBLE_STROKE)
-                setPadding(dp(22), dp(12), dp(22), dp(12))
-                maxWidth = (resources.displayMetrics.widthPixels * 0.78f).toInt()
-            }
-
-        private fun messageBubble(item: ChatMessage): LinearLayout =
-            LinearLayout(this@MainActivity).apply {
-                val scaledText = 15f * messageTextScale
-                val scaledTime = 11f * messageTextScale
-                orientation = LinearLayout.VERTICAL
-                minimumWidth = dp(74)
-                minimumHeight = dp(46)
-                background = if (item.mine) {
-                    roundedDrawable(OUTGOING_BUBBLE, dp(26), OUTGOING_BUBBLE_STROKE)
-                } else {
-                    roundedDrawable(INCOMING_BUBBLE, dp(26), INCOMING_BUBBLE_STROKE)
-                }
-                setPadding(dp(18), dp(10), dp(14), dp(8))
-
-                addView(TextView(this@MainActivity).apply {
-                    text = item.body.wrapForChatBubble()
-                    typeface = Typeface.DEFAULT
-                    textSize = scaledText
-                    setLineSpacing(dp(2).toFloat(), 1f)
-                    setTextColor(if (item.mine) Color.WHITE else INCOMING_TEXT)
-                    maxWidth = (resources.displayMetrics.widthPixels * 0.70f).toInt()
-                }, LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ))
-
-                addView(messageTimeView(item, overOutgoing = item.mine, textSize = scaledTime), LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    gravity = Gravity.RIGHT
-                    topMargin = dp(2)
-                })
-            }
-
-        private fun voiceBubble(item: ChatMessage): LinearLayout =
-            LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                background = if (item.mine) {
-                    roundedDrawable(OUTGOING_BUBBLE, dp(26), OUTGOING_BUBBLE_STROKE)
-                } else {
-                    roundedDrawable(INCOMING_BUBBLE, dp(26), INCOMING_BUBBLE_STROKE)
-                }
-                setPadding(dp(16), dp(10), dp(14), dp(8))
-                addView(LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    val action = terminalAction(
-                        if (activePlayingPath == item.audioPath) tr("stop") else tr("play")
-                    ).apply {
-                        textSize = 12f
-                        setTextColor(if (item.mine) Color.WHITE else INCOMING_TEXT)
-                        background = roundedDrawable(
-                            if (item.mine) 0x40FFFFFF else 0x22FF4359,
-                            dp(12),
-                            if (item.mine) 0x55FFFFFF else SOFT_PINK_STROKE
-                        )
-                        setPadding(dp(10), dp(6), dp(10), dp(6))
-                        setOnClickListener {
-                            toggleAudioPlayback(item.audioPath, this)
-                        }
-                    }
-                    addView(action)
-                    addView(terminalText(audioDurationLabel(item.audioPath)).apply {
-                        textSize = 12f
-                        setTextColor(if (item.mine) 0xE6FFFFFF.toInt() else BERRY_TEXT_DIM)
-                        setPadding(dp(10), 0, 0, 0)
-                    })
-                })
-                addView(messageTimeView(item, overOutgoing = item.mine), LinearLayout.LayoutParams(
-                    // keep shared time style with message scaling
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    gravity = Gravity.RIGHT
-                    topMargin = dp(2)
-                })
-                setOnLongClickListener {
-                    showMessageActions(item)
-                    true
-                }
-            }
-
-        private fun reactionBadge(item: ChatMessage): TextView? {
-            val reaction = item.reaction ?: return null
-            return terminalText(reaction).apply {
-                textSize = 14f
-                background = roundedDrawable(INPUT_SURFACE, dp(12), SOFT_PINK_STROKE)
-                setPadding(dp(8), dp(3), dp(8), dp(3))
-            }
-        }
-
-        private fun messageTimeView(item: ChatMessage, overOutgoing: Boolean, textSize: Float = 11f * messageTextScale): View {
-            val tint = if (overOutgoing) 0xE6FFFFFF.toInt() else BERRY_TEXT_DIM
-            val statusLabel = when (item.status) {
-                MessageStatus.SENDING -> tr("status_sprouting")
-                MessageStatus.DELIVERED -> tr("status_ripe")
-                MessageStatus.READ -> tr("status_ripe")
-                MessageStatus.FAILED -> tr("status_failed")
-                null -> if (selectedRecipientId == null) tr("broadcast") else ""
-            }
-            if (!item.mine || item.status == null) {
-                return TextView(this@MainActivity).apply {
-                    text = listOf(statusLabel, item.displayTime())
-                        .filter { it.isNotBlank() }
-                        .joinToString("  ")
-                    this.textSize = textSize
-                    typeface = Typeface.DEFAULT
-                    gravity = Gravity.RIGHT
-                    setTextColor(tint)
-                }
-            }
-
-            return LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                addView(TextView(this@MainActivity).apply {
-                    text = listOf(statusLabel, item.displayTime())
-                        .filter { it.isNotBlank() }
-                        .joinToString("  ")
-                    this.textSize = textSize
-                    typeface = Typeface.DEFAULT
-                    gravity = Gravity.RIGHT
-                    setTextColor(tint)
-                })
-                addView(CheckMarksView(this@MainActivity, item.status ?: MessageStatus.DELIVERED, tint), LinearLayout.LayoutParams(
-                    dp(18),
-                    dp(12)
-                ).apply {
-                    marginStart = dp(4)
-                })
-            }
-        }
-    }
-
-    private inner class CheckMarksView(
-        context: Context,
-        private val status: MessageStatus,
-        color: Int
-    ) : View(context) {
-        private val markPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            style = Paint.Style.STROKE
-            strokeWidth = px(1.8f)
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            when (status) {
-                MessageStatus.SENDING -> drawClock(canvas)
-                MessageStatus.DELIVERED -> drawMark(canvas, px(6f))
-                MessageStatus.READ -> {
-                    drawMark(canvas, px(1f))
-                    drawMark(canvas, px(7f))
-                }
-                MessageStatus.FAILED -> drawFail(canvas)
-            }
-        }
-
-        private fun drawClock(canvas: Canvas) {
-            canvas.drawCircle(px(9f), px(6f), px(4.2f), markPaint)
-            canvas.drawLine(px(9f), px(6f), px(9f), px(3.5f), markPaint)
-            canvas.drawLine(px(9f), px(6f), px(11.2f), px(7.5f), markPaint)
-        }
-
-        private fun drawMark(canvas: Canvas, startX: Float) {
-            val path = Path().apply {
-                moveTo(startX, px(6.5f))
-                lineTo(startX + px(3.5f), px(10f))
-                lineTo(startX + px(10f), px(2f))
-            }
-            canvas.drawPath(path, markPaint)
-        }
-
-        private fun drawFail(canvas: Canvas) {
-            canvas.drawLine(px(5f), px(3f), px(13f), px(11f), markPaint)
-            canvas.drawLine(px(13f), px(3f), px(5f), px(11f), markPaint)
-        }
-
-        private fun px(value: Float): Float =
-            value * resources.displayMetrics.density
-    }
-
-    private inner class BorderedImageView(context: Context) : ImageView(context) {
-        private val clipPath = Path()
-        private val clipRect = RectF()
-        private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = dp(1).toFloat()
-            color = IMAGE_BORDER
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            val radius = dp(8).toFloat()
-            clipRect.set(0f, 0f, width.toFloat(), height.toFloat())
-            clipPath.reset()
-            clipPath.addRoundRect(clipRect, radius, radius, Path.Direction.CW)
-            val saveCount = canvas.save()
-            canvas.clipPath(clipPath)
-            super.onDraw(canvas)
-            canvas.restoreToCount(saveCount)
-
-            val halfStroke = borderPaint.strokeWidth / 2f
-            val rect = RectF(
-                halfStroke,
-                halfStroke,
-                width - halfStroke,
-                height - halfStroke
-            )
-            canvas.drawRoundRect(rect, radius, radius, borderPaint)
-        }
-    }
-
-    private inner class ZoomableImageView(
-        context: Context,
-        private val onDragAtOriginalSize: () -> Unit
-    ) : ImageView(context) {
-        private val contentMatrix = Matrix()
-        private var minScale = 1f
-        private var currentScale = 1f
-        private var lastX = 0f
-        private var lastY = 0f
-        private var downX = 0f
-        private var downY = 0f
-        private var closeTriggered = false
-        private var originalDragPrimed = false
-        private var dragging = false
-
-        private val scaleDetector = ScaleGestureDetector(
-            context,
-            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-                override fun onScale(detector: ScaleGestureDetector): Boolean {
-                    val target = (currentScale * detector.scaleFactor).coerceIn(minScale, minScale * 5f)
-                    val factor = target / currentScale
-                    currentScale = target
-                    if (currentScale > minScale * 1.05f) {
-                        originalDragPrimed = false
-                    }
-                    contentMatrix.postScale(factor, factor, detector.focusX, detector.focusY)
-                    constrainImage()
-                    imageMatrix = contentMatrix
-                    return true
-                }
-            }
-        )
-
-        private val gestureDetector = GestureDetector(
-            context,
-            object : GestureDetector.SimpleOnGestureListener() {
-                override fun onDoubleTap(e: MotionEvent): Boolean {
-                    val target = if (currentScale > minScale * 1.4f) minScale else minScale * 2.4f
-                    val factor = target / currentScale
-                    currentScale = target
-                    originalDragPrimed = false
-                    contentMatrix.postScale(factor, factor, e.x, e.y)
-                    constrainImage()
-                    imageMatrix = contentMatrix
-                    return true
-                }
-            }
-        )
-
-        init {
-            scaleType = ScaleType.MATRIX
-            isClickable = true
-        }
-
-        override fun setImageBitmap(bm: Bitmap?) {
-            super.setImageBitmap(bm)
-            post { resetImageMatrix() }
-        }
-
-        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-            super.onSizeChanged(w, h, oldw, oldh)
-            resetImageMatrix()
-        }
-
-        override fun onTouchEvent(event: MotionEvent): Boolean {
-            gestureDetector.onTouchEvent(event)
-            scaleDetector.onTouchEvent(event)
-
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    lastX = event.x
-                    lastY = event.y
-                    downX = event.x
-                    downY = event.y
-                    closeTriggered = false
-                    dragging = true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    if (dragging && !scaleDetector.isInProgress && currentScale <= minScale * 1.05f) {
-                        val moved = kotlin.math.hypot(
-                            (event.x - downX).toDouble(),
-                            (event.y - downY).toDouble()
-                        )
-                        if (!closeTriggered && moved > dp(34)) {
-                            closeTriggered = true
-                            if (originalDragPrimed) {
-                                onDragAtOriginalSize()
-                            } else {
-                                originalDragPrimed = true
-                                resetImageMatrix()
-                            }
-                        }
-                    } else if (dragging && !scaleDetector.isInProgress && currentScale > minScale) {
-                        contentMatrix.postTranslate(event.x - lastX, event.y - lastY)
-                        constrainImage()
-                        imageMatrix = contentMatrix
-                    }
-                    lastX = event.x
-                    lastY = event.y
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> dragging = false
-            }
-            return true
-        }
-
-        private fun resetImageMatrix() {
-            val drawable = drawable ?: return
-            if (width == 0 || height == 0 || drawable.intrinsicWidth <= 0 || drawable.intrinsicHeight <= 0) return
-
-            val scale = minOf(
-                width.toFloat() / drawable.intrinsicWidth.toFloat(),
-                height.toFloat() / drawable.intrinsicHeight.toFloat()
-            )
-            val dx = (width - drawable.intrinsicWidth * scale) / 2f
-            val dy = (height - drawable.intrinsicHeight * scale) / 2f
-
-            minScale = scale
-            currentScale = scale
-            contentMatrix.reset()
-            contentMatrix.setScale(scale, scale)
-            contentMatrix.postTranslate(dx, dy)
-            imageMatrix = contentMatrix
-        }
-
-        private fun constrainImage() {
-            val drawable = drawable ?: return
-            val rect = RectF(
-                0f,
-                0f,
-                drawable.intrinsicWidth.toFloat(),
-                drawable.intrinsicHeight.toFloat()
-            )
-            contentMatrix.mapRect(rect)
-
-            val dx = when {
-                rect.width() <= width -> width / 2f - rect.centerX()
-                rect.left > 0f -> -rect.left
-                rect.right < width -> width - rect.right
-                else -> 0f
-            }
-            val dy = when {
-                rect.height() <= height -> height / 2f - rect.centerY()
-                rect.top > 0f -> -rect.top
-                rect.bottom < height -> height - rect.bottom
-                else -> 0f
-            }
-            contentMatrix.postTranslate(dx, dy)
-        }
-    }
-
     private fun calculateChatImageSize(bitmap: Bitmap?): Pair<Int, Int> {
         if (bitmap == null || bitmap.width <= 0 || bitmap.height <= 0) {
             return (resources.displayMetrics.widthPixels * 0.58f).toInt() to dp(180)
@@ -6317,167 +4753,4 @@ class MainActivity : Activity() {
         }
     }
 
-    private data class ChatMessage(
-        var author: String,
-        var body: String,
-        val mine: Boolean,
-        val imagePath: String? = null,
-        val audioPath: String? = null,
-        var reaction: String? = null,
-        val timestamp: Long = System.currentTimeMillis(),
-        var messageId: UUID? = null,
-        var status: MessageStatus? = null,
-        var localId: Long = 0L
-    )
-
-    private enum class MessageStatus {
-        SENDING,
-        FAILED,
-        DELIVERED,
-        READ
-    }
-
-    private data class PreparedImage(
-        val fileName: String,
-        val mimeType: String,
-        val bytes: ByteArray
-    )
-
-    private data class IncomingSender(
-        val label: String,
-        val nodeId: UUID?,
-        val isBroadcast: Boolean
-    )
-
-    private data class IncomingMeta(
-        val senderRaw: String,
-        val timestamp: Long,
-        val payload: String
-    )
-
-    companion object {
-        private const val LIGHT_CREAM_BACKGROUND = 0xFFFFFDF9.toInt()
-        private const val LIGHT_BERRY_TEXT = 0xFF3C2328.toInt()
-        private const val LIGHT_BERRY_TEXT_DIM = 0xFF8B6A71.toInt()
-        private const val LIGHT_ACCENT_PINK = 0xFFFFD9DE.toInt()
-        private const val LIGHT_STRAWBERRY_RED = 0xFFFF4359.toInt()
-        private const val LIGHT_LEAF_GREEN = 0xFF2ECC71.toInt()
-        private const val LIGHT_INPUT_SURFACE = 0xFFFFFDFD.toInt()
-        private const val LIGHT_PINK_SHADOW_STROKE = 0xFFFFCBD3.toInt()
-        private const val LIGHT_MUTED_CORAL = 0xFFE88E8E.toInt()
-        private const val LIGHT_SERVICE_BUBBLE = 0xFFFFF0F2.toInt()
-        private const val LIGHT_SERVICE_BUBBLE_STROKE = 0xFFFFD0D7.toInt()
-        private const val LIGHT_INCOMING_BUBBLE = 0xD9FFFFFF.toInt()
-        private const val LIGHT_INCOMING_BUBBLE_STROKE = 0xCCF1D7DC.toInt()
-        private const val LIGHT_INCOMING_TEXT = 0xFF536174.toInt()
-        private const val LIGHT_OUTGOING_BUBBLE = 0xD9FF8A99.toInt()
-        private const val LIGHT_OUTGOING_BUBBLE_STROKE = 0xCCFF7184.toInt()
-        private const val LIGHT_IMAGE_BORDER = 0xFFFF7086.toInt()
-        private const val LIGHT_SOFT_PINK_PANEL = 0xFFFFF3F5.toInt()
-        private const val LIGHT_SOFT_PINK_STROKE = 0xFFFFE0E5.toInt()
-
-        private const val DARK_BACKGROUND = 0xFF1A0B0E.toInt()
-        private const val DARK_TEXT = 0xFFFCECEF.toInt()
-        private const val DARK_TEXT_DIM = 0xFFC8AAB1.toInt()
-        private const val DARK_ACCENT = 0xFF442026.toInt()
-        private const val DARK_STRAWBERRY = 0xFFFF5E76.toInt()
-        private const val DARK_SURFACE = 0xFF2A1117.toInt()
-        private const val DARK_STROKE = 0xFF5C2B34.toInt()
-        private const val DARK_CORAL = 0xFFE39AAB.toInt()
-        private const val DARK_SERVICE_BUBBLE = 0xFF2E151B.toInt()
-        private const val DARK_SERVICE_STROKE = 0xFF5A2A34.toInt()
-        private const val DARK_INCOMING_BUBBLE = 0xD93C2228.toInt()
-        private const val DARK_INCOMING_BUBBLE_STROKE = 0xCC70414C.toInt()
-        private const val DARK_INCOMING_TEXT = 0xFFF6E8EB.toInt()
-        private const val DARK_OUTGOING_BUBBLE = 0xD9FF5E76.toInt()
-        private const val DARK_OUTGOING_BUBBLE_STROKE = 0xCCFF7E90.toInt()
-        private const val DARK_IMAGE_BORDER = 0xFFFF8FA1.toInt()
-        private const val DARK_PANEL = 0xFF241015.toInt()
-        private const val DARK_SOFT_STROKE = 0xFF4C2430.toInt()
-
-        private var CREAM_BACKGROUND = LIGHT_CREAM_BACKGROUND
-        private var BERRY_TEXT = LIGHT_BERRY_TEXT
-        private var BERRY_TEXT_DIM = LIGHT_BERRY_TEXT_DIM
-        private var ACCENT_PINK = LIGHT_ACCENT_PINK
-        private var STRAWBERRY_RED = LIGHT_STRAWBERRY_RED
-        private var LEAF_GREEN = LIGHT_LEAF_GREEN
-        private var INPUT_SURFACE = LIGHT_INPUT_SURFACE
-        private var PINK_SHADOW_STROKE = LIGHT_PINK_SHADOW_STROKE
-        private var MUTED_CORAL = LIGHT_MUTED_CORAL
-        private var SERVICE_BUBBLE = LIGHT_SERVICE_BUBBLE
-        private var SERVICE_BUBBLE_STROKE = LIGHT_SERVICE_BUBBLE_STROKE
-        private var INCOMING_BUBBLE = LIGHT_INCOMING_BUBBLE
-        private var INCOMING_BUBBLE_STROKE = LIGHT_INCOMING_BUBBLE_STROKE
-        private var INCOMING_TEXT = LIGHT_INCOMING_TEXT
-        private var OUTGOING_BUBBLE = LIGHT_OUTGOING_BUBBLE
-        private var OUTGOING_BUBBLE_STROKE = LIGHT_OUTGOING_BUBBLE_STROKE
-        private var IMAGE_BORDER = LIGHT_IMAGE_BORDER
-        private var SOFT_PINK_PANEL = LIGHT_SOFT_PINK_PANEL
-        private var SOFT_PINK_STROKE = LIGHT_SOFT_PINK_STROKE
-
-        private const val MAX_NICKNAME_LENGTH = 12
-        private const val CHAT_EVERYONE = "everyone"
-        private const val CHAT_SAVED = "saved"
-        private const val SAVED_MESSAGES_PREFS = "saved_messages"
-        private const val SAVED_MESSAGES_KEY = "items"
-        private const val UI_SETTINGS_PREFS = "truskawka_ui_settings"
-        private const val UI_SETTINGS_THEME_DARK = "theme_dark"
-        private const val UI_SETTINGS_LANGUAGE = "language"
-        private const val UI_SETTINGS_APP_LOCK_ENABLED = "app_lock_enabled"
-        private const val UI_SETTINGS_APP_LOCK_PIN = "app_lock_pin"
-        private const val UI_SETTINGS_APP_LOCK_TIMEOUT = "app_lock_timeout_min"
-        private const val UI_SETTINGS_NOTIF_ENABLED = "notif_enabled"
-        private const val UI_SETTINGS_NOTIF_PREVIEW = "notif_preview"
-        private const val UI_SETTINGS_NOTIF_BROADCAST = "notif_broadcast"
-        private const val UI_SETTINGS_CHAT_COMPACT = "chat_compact"
-        private const val UI_SETTINGS_CHAT_TEXT_SCALE = "chat_text_scale"
-        private const val UI_SETTINGS_TIME_24H = "time_24h"
-        private const val UI_SETTINGS_DATE_SHORT = "date_short"
-        private const val UI_SETTINGS_MESH_AGGRESSIVE = "mesh_aggressive"
-        private const val UI_SETTINGS_MESH_MAX_HOPS = "mesh_max_hops"
-        private const val UI_SETTINGS_QUICK_START_HIDDEN = "quick_start_hidden"
-        private const val RECORD_AUDIO_REQUEST_CODE = 43
-        private const val IMAGE_PICK_REQUEST = 93
-        private const val BACKUP_IMPORT_REQUEST = 94
-        private const val BACKUP_EXPORT_REQUEST = 95
-        private const val MAX_BACKUP_BYTES = 32 * 1024 * 1024
-        private const val MAX_IMAGE_BYTES = 2 * 1024 * 1024
-        private const val TARGET_IMAGE_BYTES = 512 * 1024
-        private const val MAX_IMAGE_DIMENSION = 1280
-        private const val VOICE_MIN_DURATION_MS = 400L
-        private const val VOICE_MAX_DURATION_MS = 60_000L
-        private const val MAX_VOICE_BYTES = 1_200_000L
-private const val MESSAGE_SEND_TIMEOUT_MS = 60_000L
-        private const val MESSAGE_RETRY_INTERVAL_MS = 2_500L
-        private const val MESSAGE_RETRY_ATTEMPTS = 8
-        private const val MAX_MEDIA_CACHE_BYTES = 120L * 1024L * 1024L
-        private const val BUBBLE_WRAP_CHARS = 24
-        private const val CONTROL_PREFIX = "__truskawka_ctl__:"
-        private const val CONTROL_DELETE_MESSAGE = "dm"
-        private const val CONTROL_DELETE_CHAT = "dc"
-    }
-
-    private fun String.wrapForChatBubble(): String {
-        if (length <= BUBBLE_WRAP_CHARS) return this
-        val lines = mutableListOf<String>()
-        var current = StringBuilder()
-        split(Regex("\\s+")).filter { it.isNotBlank() }.forEach { word ->
-            if (word.length > BUBBLE_WRAP_CHARS) {
-                if (current.isNotEmpty()) {
-                    lines += current.toString()
-                    current = StringBuilder()
-                }
-                word.chunked(BUBBLE_WRAP_CHARS).forEach { lines += it }
-            } else if (current.isEmpty()) {
-                current.append(word)
-            } else if (current.length + 1 + word.length <= BUBBLE_WRAP_CHARS) {
-                current.append(' ').append(word)
-            } else {
-                lines += current.toString()
-                current = StringBuilder(word)
-            }
-        }
-        if (current.isNotEmpty()) lines += current.toString()
-        return lines.joinToString("\n")
-    }
 }

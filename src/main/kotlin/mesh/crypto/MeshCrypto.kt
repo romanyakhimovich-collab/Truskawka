@@ -8,6 +8,7 @@ import java.nio.ByteBuffer
 import java.security.*
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
 import javax.crypto.spec.GCMParameterSpec
@@ -210,7 +211,7 @@ class MeshCrypto(private val secureStorage: SecureKeyStorage) {
             peerIdentity = identityPubKey,
             peerFingerprint = fingerprint,
             establishedAt = System.currentTimeMillis(),
-            messageCounter = 0
+            messageCounter = AtomicLong(0)
         )
 
         // Update trusted peers (TOFU)
@@ -283,7 +284,7 @@ class MeshCrypto(private val secureStorage: SecureKeyStorage) {
             peerIdentity = identityPubKey,
             peerFingerprint = fingerprint,
             establishedAt = System.currentTimeMillis(),
-            messageCounter = 0
+            messageCounter = AtomicLong(0)
         )
 
         // TOFU update
@@ -320,8 +321,7 @@ class MeshCrypto(private val secureStorage: SecureKeyStorage) {
         val session = sessions[recipientNodeId] ?: return null
 
         // Increment nonce counter
-        val nonce = generateNonce(session.messageCounter)
-        session.messageCounter++
+        val nonce = generateNonce(session.messageCounter.getAndIncrement())
 
         // Encrypt with session key
         val ciphertext = encryptWithKey(plaintext, session.sessionKey, nonce)
@@ -520,7 +520,7 @@ data class SessionInfo(
     val peerIdentity: ByteArray,
     val peerFingerprint: String,
     val establishedAt: Long,
-    var messageCounter: Long
+    val messageCounter: AtomicLong
 )
 
 data class TrustInfo(

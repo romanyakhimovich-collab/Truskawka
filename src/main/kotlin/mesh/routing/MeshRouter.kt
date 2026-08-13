@@ -23,7 +23,8 @@ import java.util.concurrent.ConcurrentLinkedDeque
 class MeshRouter(
     private val localNodeId: UUID,
     private val messageHandler: MessageHandler,
-    private val transmitter: PacketTransmitter
+    private val transmitter: PacketTransmitter,
+    private val clock: () -> Long = { System.currentTimeMillis() }
 ) {
     private var maxRelayHops: Byte = MeshPacket.DEFAULT_TTL
     // Deduplication: seen message IDs with timestamp (auto-expire after 1 hour)
@@ -32,7 +33,7 @@ class MeshRouter(
 
     // Store-and-forward queue: messages waiting for delivery
     private val pendingMessages = ConcurrentLinkedDeque<PendingMessage>()
-    private val maxPendingMessages = 1000
+    private val maxPendingMessages = 8000
     private val pendingMessageTTL = 24 * 3600_000L // 24 hours
 
     // Known neighbors with last-seen timestamp
@@ -74,10 +75,16 @@ class MeshRouter(
      * ```
      */
     fun onPacketReceived(packet: MeshPacket, rssi: Int, sourceInterface: TransportType) {
-        val now = System.currentTimeMillis()
+        val now = clock()
 
         // Step 1: Deduplication check
         if (isDuplicate(packet.messageId)) {
+            if (packet.recipientId == localNodeId && packet.flags.requiresAck) {
+                sendAcknowledgment(packet)
+            } else if (shouldRelayDuplicate(packet, now)) {
+                markAsSeen(packet.messageId, now)
+                relayPacket(packet)
+            }
             return
         }
         markAsSeen(packet.messageId, now)
@@ -112,10 +119,10 @@ class MeshRouter(
 
         if (isForUs || isBroadcast) {
             // Deliver to application layer
-            messageHandler.onMessageReceived(packet)
+            val accepted = messageHandler.onMessageReceived(packet)
 
             // Send ACK for unicast messages
-            if (isForUs && packet.flags.requiresAck) {
+            if (accepted && isForUs && packet.flags.requiresAck) {
                 sendAcknowledgment(packet)
             }
 
@@ -161,17 +168,33 @@ class MeshRouter(
         signature: ByteArray,
         requiresAck: Boolean = true
     ): UUID {
-        val packet = MeshPacket(
+        return sendPacket(
             type = PacketType.MESSAGE,
+            recipientId = recipientId,
+            payload = payload,
+            signature = signature,
             flags = mesh.protocol.PacketFlags(
                 requiresAck = requiresAck,
                 isEncrypted = true
-            ),
+            )
+        )
+    }
+
+    fun sendPacket(
+        type: PacketType,
+        recipientId: UUID,
+        payload: ByteArray,
+        signature: ByteArray,
+        flags: mesh.protocol.PacketFlags
+    ): UUID {
+        val packet = MeshPacket(
+            type = type,
+            flags = flags,
             ttl = maxRelayHops,
             messageId = UUID.randomUUID(),
             senderId = localNodeId,
             recipientId = recipientId,
-            timestamp = System.currentTimeMillis(),
+            timestamp = clock(),
             payload = payload,
             signature = signature
         )
@@ -186,7 +209,7 @@ class MeshRouter(
         }
 
         // Store for retry if ACK required
-        if (requiresAck) {
+        if (flags.requiresAck) {
             storePendingMessage(packet)
         }
         return packet.messageId
@@ -194,6 +217,18 @@ class MeshRouter(
 
     fun setMaxRelayHops(maxHops: Int) {
         maxRelayHops = maxHops.coerceIn(1, MeshPacket.DEFAULT_TTL.toInt()).toByte()
+    }
+
+    fun diagnosticsSnapshot(): RouterDiagnostics {
+        val now = clock()
+        return RouterDiagnostics(
+            neighborCount = neighbors.size,
+            pendingMessageCount = pendingMessages.size,
+            retryReadyCount = pendingMessages.count { now >= it.nextRetryAt },
+            seenMessageCount = seenMessages.size,
+            routeCount = routingTable.size,
+            maxRelayHops = maxRelayHops.toInt()
+        )
     }
 
     /**
@@ -205,8 +240,9 @@ class MeshRouter(
         }
         pendingMessages.add(PendingMessage(
             packet = packet,
-            storedAt = System.currentTimeMillis(),
-            retryCount = 0
+            storedAt = clock(),
+            retryCount = 0,
+            nextRetryAt = clock() + RETRY_BASE_DELAY_MS
         ))
     }
 
@@ -214,7 +250,7 @@ class MeshRouter(
      * Called when a new neighbor is discovered - triggers store-and-forward sync
      */
     fun onNeighborDiscovered(neighborId: UUID) {
-        val now = System.currentTimeMillis()
+        val now = clock()
 
         // Check pending messages for this neighbor
         pendingMessages.forEach { pending ->
@@ -223,6 +259,7 @@ class MeshRouter(
                 // Found a pending message for this neighbor!
                 transmitter.sendTo(neighborId, pending.packet)
                 pending.retryCount++
+                pending.nextRetryAt = now + retryDelayForAttempt(pending.retryCount)
             }
         }
 
@@ -269,9 +306,9 @@ class MeshRouter(
             }
             return
         }
+        if (!messageHandler.isControlPacketAuthentic(packet)) return
         if (packet.payload.size < 16) return
-        val buffer = ByteBuffer.wrap(packet.payload)
-        val ackedMessageId = UUID(buffer.long, buffer.long)
+        val ackedMessageId = packet.payload.readUuidOrNull() ?: return
         pendingMessages.removeIf { it.packet.messageId == ackedMessageId }
         messageHandler.onAckReceived(ackedMessageId)
     }
@@ -279,10 +316,8 @@ class MeshRouter(
     private fun handleReadReceipt(packet: MeshPacket) {
         val isForUs = packet.recipientId == localNodeId
         if (isForUs) {
-            val readMessageId = UUID(
-                java.nio.ByteBuffer.wrap(packet.payload).long,
-                java.nio.ByteBuffer.wrap(packet.payload, 8, 8).long
-            )
+            if (!messageHandler.isControlPacketAuthentic(packet)) return
+            val readMessageId = packet.payload.readUuidOrNull() ?: return
             messageHandler.onReadReceiptReceived(packet.senderId, readMessageId)
             return
         }
@@ -294,10 +329,7 @@ class MeshRouter(
 
     private fun handleRouteRequest(packet: MeshPacket) {
         // Simplified AODV route request
-        val targetId = UUID(
-            java.nio.ByteBuffer.wrap(packet.payload).long,
-            java.nio.ByteBuffer.wrap(packet.payload, 8, 8).long
-        )
+        val targetId = packet.payload.readUuidOrNull() ?: return
 
         if (targetId == localNodeId) {
             // We are the target, send route reply
@@ -310,14 +342,11 @@ class MeshRouter(
 
     private fun handleRouteReply(packet: MeshPacket) {
         // Update routing table
-        val targetId = UUID(
-            java.nio.ByteBuffer.wrap(packet.payload).long,
-            java.nio.ByteBuffer.wrap(packet.payload, 8, 8).long
-        )
+        val targetId = packet.payload.readUuidOrNull() ?: return
         routingTable[targetId] = RouteEntry(
             nextHop = packet.senderId,
             hopCount = packet.hopCount.toInt(),
-            lastUpdated = System.currentTimeMillis()
+            lastUpdated = clock()
         )
     }
 
@@ -329,11 +358,11 @@ class MeshRouter(
 
         val packet = MeshPacket(
             type = PacketType.ROUTE_REP,
-            flags = mesh.protocol.PacketFlags(),
+            flags = mesh.protocol.PacketFlags(isEncrypted = false),
             messageId = UUID.randomUUID(),
             senderId = localNodeId,
             recipientId = requesterId,
-            timestamp = System.currentTimeMillis(),
+            timestamp = clock(),
             payload = payload,
             signature = ByteArray(0) // Route packets don't need signature
         )
@@ -348,13 +377,13 @@ class MeshRouter(
 
         val ackPacket = MeshPacket(
             type = PacketType.ACK,
-            flags = mesh.protocol.PacketFlags(),
+            flags = mesh.protocol.PacketFlags(isEncrypted = false),
             messageId = UUID.randomUUID(),
             senderId = localNodeId,
             recipientId = originalPacket.senderId,
-            timestamp = System.currentTimeMillis(),
+            timestamp = clock(),
             payload = payload,
-            signature = ByteArray(0)
+            signature = messageHandler.signControlPayload(payload)
         )
         if (neighbors.containsKey(originalPacket.senderId)) {
             transmitter.sendTo(originalPacket.senderId, ackPacket)
@@ -367,6 +396,15 @@ class MeshRouter(
 
     private fun isDuplicate(messageId: UUID): Boolean {
         return seenMessages.containsKey(messageId)
+    }
+
+    private fun shouldRelayDuplicate(packet: MeshPacket, now: Long): Boolean {
+        if (packet.isBroadcast() || !packet.flags.requiresAck || packet.recipientId == localNodeId) {
+            return false
+        }
+        if (packet.isExpired()) return false
+        val lastSeen = seenMessages[packet.messageId] ?: return false
+        return now - lastSeen >= DUPLICATE_RELAY_INTERVAL_MS && shouldRelay(packet)
     }
 
     private fun markAsSeen(messageId: UUID, timestamp: Long) {
@@ -402,7 +440,7 @@ class MeshRouter(
      * Periodic maintenance: cleanup expired entries, retry pending messages
      */
     fun performMaintenance() {
-        val now = System.currentTimeMillis()
+        val now = clock()
 
         // Cleanup expired neighbors
         neighbors.entries.removeIf { now - it.value.lastSeen > neighborTimeout }
@@ -418,13 +456,27 @@ class MeshRouter(
     }
 
     private fun retryPendingMessages() {
-        pendingMessages.forEach { pending ->
-            if (pending.retryCount < 5) { // Max 5 retries
-                // Check if any neighbor might reach the destination
-                transmitter.broadcast(pending.packet)
-                pending.retryCount++
+        val now = clock()
+        pendingMessages.removeIf { pending ->
+            if (pending.retryCount >= MAX_RETRY_ATTEMPTS) {
+                messageHandler.onDeliveryFailed(pending.packet.messageId)
+                return@removeIf true
             }
+            if (now < pending.nextRetryAt) {
+                return@removeIf false
+            }
+
+            // Check if any neighbor might reach the destination.
+            transmitter.broadcast(pending.packet)
+            pending.retryCount++
+            pending.nextRetryAt = now + retryDelayForAttempt(pending.retryCount)
+            false
         }
+    }
+
+    private fun retryDelayForAttempt(attempt: Int): Long {
+        val multiplier = 1L shl attempt.coerceIn(0, 4)
+        return (RETRY_BASE_DELAY_MS * multiplier).coerceAtMost(RETRY_MAX_DELAY_MS)
     }
 }
 
@@ -447,7 +499,17 @@ data class RouteEntry(
 data class PendingMessage(
     val packet: MeshPacket,
     val storedAt: Long,
-    var retryCount: Int
+    var retryCount: Int,
+    var nextRetryAt: Long
+)
+
+data class RouterDiagnostics(
+    val neighborCount: Int,
+    val pendingMessageCount: Int,
+    val retryReadyCount: Int,
+    val seenMessageCount: Int,
+    val routeCount: Int,
+    val maxRelayHops: Int
 )
 
 enum class TransportType {
@@ -473,10 +535,24 @@ interface OpportunisticPacketTransmitter : PacketTransmitter {
  * Callbacks to application layer
  */
 interface MessageHandler {
-    fun onMessageReceived(packet: MeshPacket)
+    fun onMessageReceived(packet: MeshPacket): Boolean
     fun onNeighborDiscovered(nodeId: UUID, payload: ByteArray)
     fun onHandshakeReceived(nodeId: UUID, publicKey: ByteArray)
     fun onHandshakeAckReceived(nodeId: UUID, encryptedPayload: ByteArray)
     fun onAckReceived(messageId: UUID)
     fun onReadReceiptReceived(senderId: UUID, messageId: UUID)
+    fun onDeliveryFailed(messageId: UUID) = Unit
+    fun signControlPayload(payload: ByteArray): ByteArray = ByteArray(0)
+    fun isControlPacketAuthentic(packet: MeshPacket): Boolean = true
 }
+
+private fun ByteArray.readUuidOrNull(): UUID? {
+    if (size < 16) return null
+    val buffer = ByteBuffer.wrap(this)
+    return UUID(buffer.long, buffer.long)
+}
+
+private const val RETRY_BASE_DELAY_MS = 2_500L
+private const val RETRY_MAX_DELAY_MS = 60_000L
+private const val MAX_RETRY_ATTEMPTS = 5
+private const val DUPLICATE_RELAY_INTERVAL_MS = 2_000L

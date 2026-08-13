@@ -8,6 +8,7 @@ import mesh.routing.PacketTransmitter
 import mesh.routing.TransportType
 import java.util.*
 import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * BLE Transport Service - MVP Implementation for Android
@@ -73,6 +74,10 @@ abstract class BleTransportService(
 
     // Message queue for pending transmissions
     protected val transmitQueue = LinkedBlockingQueue<TransmitTask>()
+    private val transmitDrainRunning = AtomicBoolean(false)
+
+    // Fragment reassembly is scoped by BLE address because transfer ids are only unique per sender.
+    private val reassemblers = ConcurrentHashMap<String, BlePacketFramer.Reassembler>()
 
     // Router reference (set after initialization)
     protected var meshRouter: MeshRouter? = null
@@ -176,19 +181,37 @@ abstract class BleTransportService(
     }
 
     protected fun processTransmitQueue() {
+        if (!transmitDrainRunning.compareAndSet(false, true)) return
         executor.submit {
-            while (transmitQueue.isNotEmpty()) {
-                val task = transmitQueue.poll() ?: break
+            try {
+                while (true) {
+                    val task = transmitQueue.poll() ?: break
+                    val mtu = connectedPeers[task.address]?.mtu ?: 23
+                    val maxPayload = (mtu - 3).coerceAtLeast(20)
+                    val frames = try {
+                        BlePacketFramer.fragment(task.data, maxPayload)
+                    } catch (e: IllegalArgumentException) {
+                        serviceCallback?.onError("Failed to frame BLE packet: ${e.message}")
+                        continue
+                    }
 
-                if (task.isBroadcast) {
-                    writeToDevice(task.address, task.data)
-                    notifyAllDevices(task.data)
-                } else if (!writeToDevice(task.address, task.data)) {
-                    notifyAllDevices(task.data)
+                    frames.forEach { frame ->
+                        if (task.isBroadcast) {
+                            writeToDevice(task.address, frame)
+                            notifyAllDevices(frame)
+                        } else if (!writeToDevice(task.address, frame)) {
+                            notifyAllDevices(frame)
+                        }
+
+                        // Small delay between transmissions to avoid congestion
+                        Thread.sleep(10)
+                    }
                 }
-
-                // Small delay between transmissions to avoid congestion
-                Thread.sleep(10)
+            } finally {
+                transmitDrainRunning.set(false)
+                if (transmitQueue.isNotEmpty()) {
+                    processTransmitQueue()
+                }
             }
         }
     }
@@ -200,7 +223,10 @@ abstract class BleTransportService(
      */
     protected fun onDataReceived(address: String, data: ByteArray, rssi: Int) {
         try {
-            val packet = MeshPacket.fromBytes(data)
+            val packetBytes = reassemblers.getOrPut(address) { BlePacketFramer.Reassembler() }
+                .accept(data)
+                ?: return
+            val packet = MeshPacket.fromBytes(packetBytes)
 
             // Track peer node ID
             if (!peerNodeIds.containsKey(address)) {
@@ -246,6 +272,7 @@ abstract class BleTransportService(
 
         } else {
             connectedPeers.remove(address)
+            reassemblers.remove(address)
             peerNodeIds.remove(address)?.let { nodeId ->
                 nodeAddresses.remove(nodeId)
             }

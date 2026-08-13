@@ -30,7 +30,9 @@ import mesh.transport.MeshBleUuids
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 @SuppressLint("MissingPermission")
 class AndroidBleService(
@@ -46,6 +48,8 @@ class AndroidBleService(
 
     private val gattClients = ConcurrentHashMap<String, BluetoothGatt>()
     private val advertisedPeers = ConcurrentHashMap<UUID, Long>()
+    private val pendingWrites = ConcurrentHashMap<String, ArrayBlockingQueue<Boolean>>()
+    private val writeLocks = ConcurrentHashMap<String, Any>()
 
     fun setLocalAlias(alias: String) {
         val normalized = alias.trim().take(12).ifBlank { "@${localNodeId.toString().take(8)}" }
@@ -142,6 +146,8 @@ class AndroidBleService(
 
     override fun disconnectDevice(address: String) {
         if (!hasConnectPermission()) return
+        writeLocks.remove(address)
+        pendingWrites.remove(address)
         gattClients.remove(address)?.let { gatt ->
             gatt.disconnect()
             gatt.close()
@@ -159,9 +165,21 @@ class AndroidBleService(
             serviceCallback?.onError("Packet ${data.size} bytes exceeds negotiated BLE payload $maxPayload")
             return false
         }
-        tx.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        tx.value = data
-        return gatt.writeCharacteristic(tx)
+        val lock = writeLocks.getOrPut(address) { Any() }
+        synchronized(lock) {
+            tx.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            tx.value = data
+            val completion = ArrayBlockingQueue<Boolean>(1)
+            pendingWrites[address] = completion
+            val started = gatt.writeCharacteristic(tx)
+            if (!started) {
+                pendingWrites.remove(address, completion)
+                return false
+            }
+            val completed = completion.poll(GATT_WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS) == true
+            pendingWrites.remove(address, completion)
+            return completed
+        }
     }
 
     override fun notifyAllDevices(data: ByteArray) {
@@ -276,6 +294,7 @@ class AndroidBleService(
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 gattClients.remove(address)
+                writeLocks.remove(address)
                 onConnectionStateChanged(address, false)
                 gatt.close()
             }
@@ -316,6 +335,16 @@ class AndroidBleService(
         ) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 handleCharacteristicRead(gatt, characteristic, value)
+            }
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            if (characteristic.uuid == MeshBleUuids.CHAR_TX_UUID) {
+                pendingWrites.remove(gatt.device.address)?.offer(status == BluetoothGatt.GATT_SUCCESS)
             }
         }
 
@@ -471,5 +500,6 @@ class AndroidBleService(
         private const val RADIO_HELLO_VERSION: Byte = 1
         private const val MAX_ADVERTISED_ALIAS_BYTES = 12
         private const val ADVERTISED_PEER_NOTIFY_INTERVAL_MS = 3_000L
+        private const val GATT_WRITE_TIMEOUT_MS = 1_500L
     }
 }

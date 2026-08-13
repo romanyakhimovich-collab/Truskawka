@@ -27,6 +27,8 @@ data class MeshPacket(
         const val HEADER_SIZE = 70                  // Fixed binary header size
         const val MAX_BLE_PAYLOAD = 512            // BLE MTU constraint
         const val MAX_WIFI_PAYLOAD = 65535         // Wi-Fi Direct
+        const val MAX_PACKET_PAYLOAD = 2 * 1024 * 1024
+        const val MAX_SIGNATURE_SIZE = 65535
 
         val BROADCAST_ID: UUID = UUID(0L, 0L)      // All zeros = broadcast
 
@@ -38,6 +40,7 @@ data class MeshPacket(
             val buffer = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
 
             val version = buffer.get()
+            require(version == PROTOCOL_VERSION) { "Unsupported protocol version: $version" }
             val type = PacketType.fromByte(buffer.get())
             val flags = PacketFlags.fromByte(buffer.get())
             val hopCount = buffer.get()
@@ -50,9 +53,9 @@ data class MeshPacket(
             val timestamp = buffer.long
 
             val payloadLength = buffer.int
-            val signatureLength = buffer.short.toInt()
-            require(payloadLength >= 0) { "Invalid payload length: $payloadLength" }
-            require(signatureLength >= 0) { "Invalid signature length: $signatureLength" }
+            val signatureLength = buffer.short.toInt() and 0xFFFF
+            require(payloadLength in 0..MAX_PACKET_PAYLOAD) { "Invalid payload length: $payloadLength" }
+            require(signatureLength <= MAX_SIGNATURE_SIZE) { "Invalid signature length: $signatureLength" }
             require(buffer.remaining() >= payloadLength + signatureLength) {
                 "Packet truncated: expected ${payloadLength + signatureLength} bytes, got ${buffer.remaining()}"
             }
@@ -62,6 +65,7 @@ data class MeshPacket(
 
             val signature = ByteArray(signatureLength)
             buffer.get(signature)
+            require(!buffer.hasRemaining()) { "Packet has trailing bytes: ${buffer.remaining()}" }
 
             return MeshPacket(
                 version, type, flags, hopCount, ttl,
@@ -75,7 +79,10 @@ data class MeshPacket(
      * Serialize packet to binary for transmission
      */
     fun toBytes(): ByteArray {
-        require(signature.size <= Short.MAX_VALUE) {
+        require(payload.size <= MAX_PACKET_PAYLOAD) {
+            "Payload too large for protocol packet: ${payload.size} bytes"
+        }
+        require(signature.size <= MeshPacket.MAX_SIGNATURE_SIZE) {
             "Signature too large for protocol header: ${signature.size} bytes"
         }
         val totalSize = HEADER_SIZE + payload.size + signature.size
@@ -150,7 +157,8 @@ enum class PacketType(val value: Byte) {
 
     companion object {
         fun fromByte(value: Byte): PacketType =
-            entries.find { it.value == value } ?: MESSAGE
+            entries.find { it.value == value }
+                ?: throw IllegalArgumentException("Unknown packet type: ${value.toInt() and 0xFF}")
     }
 }
 

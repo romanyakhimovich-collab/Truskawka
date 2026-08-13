@@ -11,6 +11,7 @@ import mesh.routing.MeshRouter
 import mesh.routing.MessageHandler
 import mesh.routing.OpportunisticPacketTransmitter
 import mesh.routing.PacketTransmitter
+import mesh.routing.RouterDiagnostics
 import mesh.routing.TransportType
 import mesh.transport.BleServiceCallback
 import mesh.transport.BleTransportService
@@ -74,6 +75,8 @@ class MeshManager(
     private val knownPeers = ConcurrentHashMap<UUID, PeerInfo>()
     private val aliases = ConcurrentHashMap<UUID, String>()
     private val incomingFiles = ConcurrentHashMap<UUID, IncomingFileTransfer>()
+    private val orphanFileChunks = ConcurrentHashMap<UUID, OrphanFileChunks>()
+    private val trackedMessageDeliveries = ConcurrentHashMap.newKeySet<UUID>()
     private var localAlias: String = "@${localNodeId.toString().take(8)}"
     private var maxRelayHops: Int = MeshPacket.DEFAULT_TTL.toInt()
 
@@ -205,6 +208,10 @@ class MeshManager(
         if (bytes.size > MAX_IMAGE_BYTES) return SendResult.Failed("Image is too large")
 
         val target = recipientId ?: MeshPacket.BROADCAST_ID
+        if (target != MeshPacket.BROADCAST_ID && !crypto.hasSessionWith(target)) {
+            initiateHandshake(target)
+            return SendResult.Failed("Secure session not established; handshake initiated")
+        }
         val transferId = UUID.randomUUID()
         val chunks = bytes.asIterableChunks(FILE_CHUNK_SIZE)
         val safeName = fileName.take(96).ifBlank { "image.jpg" }
@@ -227,7 +234,9 @@ class MeshManager(
             .put(nameBytes)
             .array()
 
-        sendFilePacket(PacketType.FILE_META, target, metaPayload)
+        if (!sendFilePacket(PacketType.FILE_META, target, metaPayload)) {
+            return SendResult.Failed("Failed to send file metadata")
+        }
         onProgress?.invoke(0, chunks.size)
         chunks.forEachIndexed { index, chunk ->
             val chunkPayload = ByteBuffer.allocate(4 + 16 + 4 + 4 + chunk.size)
@@ -238,29 +247,48 @@ class MeshManager(
                 .putInt(chunks.size)
                 .put(chunk)
                 .array()
-            sendFilePacket(PacketType.FILE_CHUNK, target, chunkPayload)
+            if (!sendFilePacket(PacketType.FILE_CHUNK, target, chunkPayload)) {
+                return SendResult.Failed("Failed to send file chunk ${index + 1}/${chunks.size}")
+            }
             onProgress?.invoke(index + 1, chunks.size)
         }
         return SendResult.Sent(transferId)
     }
 
-    private fun sendFilePacket(type: PacketType, recipientId: UUID, payload: ByteArray) {
+    private fun sendFilePacket(type: PacketType, recipientId: UUID, payload: ByteArray): Boolean {
+        val isBroadcast = recipientId == MeshPacket.BROADCAST_ID
+        val wirePayload = if (isBroadcast) {
+            payload
+        } else {
+            val encrypted = crypto.encryptMessage(recipientId, payload) ?: return false
+            encodeEncryptedPayload(encrypted)
+        }
         val packet = MeshPacket(
             type = type,
-            flags = PacketFlags(isEncrypted = false),
+            flags = PacketFlags(
+                isEncrypted = !isBroadcast,
+                requiresAck = !isBroadcast
+            ),
             ttl = maxRelayHops.toByte(),
             messageId = UUID.randomUUID(),
             senderId = localNodeId,
             recipientId = recipientId,
             timestamp = System.currentTimeMillis(),
-            payload = payload,
-            signature = crypto.sign(payload)
+            payload = wirePayload,
+            signature = crypto.sign(wirePayload)
         )
-        if (recipientId == MeshPacket.BROADCAST_ID) {
+        if (isBroadcast) {
             combinedTransmitter.broadcast(packet)
         } else {
-            combinedTransmitter.sendTo(recipientId, packet)
+            router.sendPacket(
+                type = type,
+                recipientId = recipientId,
+                payload = wirePayload,
+                signature = packet.signature,
+                flags = packet.flags
+            )
         }
+        return true
     }
 
     private fun sendEncryptedMessage(recipientId: UUID, plaintext: ByteArray): SendResult {
@@ -270,14 +298,11 @@ class MeshManager(
 
         // Build packet
         // Payload format: [nonce_len(1) | nonce | ciphertext]
-        val payload = ByteBuffer.allocate(1 + encrypted.nonce.size + encrypted.ciphertext.size)
-            .put(encrypted.nonce.size.toByte())
-            .put(encrypted.nonce)
-            .put(encrypted.ciphertext)
-            .array()
+        val payload = encodeEncryptedPayload(encrypted)
         val signature = crypto.sign(payload)
 
         val messageId = router.sendMessage(recipientId, payload, signature, requiresAck = true)
+        trackedMessageDeliveries.add(messageId)
         return SendResult.Sent(messageId)
     }
 
@@ -349,7 +374,7 @@ class MeshManager(
 
         val packet = MeshPacket(
             type = PacketType.HANDSHAKE,
-            flags = PacketFlags(),
+            flags = PacketFlags(isEncrypted = false),
             ttl = maxRelayHops.toByte(),
             messageId = UUID.randomUUID(),
             senderId = localNodeId,
@@ -370,18 +395,19 @@ class MeshManager(
 
     // ==================== MessageHandler Interface ====================
 
-    override fun onMessageReceived(packet: MeshPacket) {
-        when (packet.type) {
+    override fun onMessageReceived(packet: MeshPacket): Boolean {
+        return when (packet.type) {
             PacketType.MESSAGE -> handleIncomingMessage(packet)
             PacketType.FILE_META -> handleIncomingFileMeta(packet)
             PacketType.FILE_CHUNK -> handleIncomingFileChunk(packet)
-            else -> { /* Handled by router */ }
+            else -> true /* Handled by router */
         }
     }
 
-    private fun handleIncomingFileMeta(packet: MeshPacket) {
+    private fun handleIncomingFileMeta(packet: MeshPacket): Boolean =
         runCatching {
-            val buffer = ByteBuffer.wrap(packet.payload)
+            val payload = decodeFilePayload(packet) ?: return@runCatching false
+            val buffer = ByteBuffer.wrap(payload)
             val magic = ByteArray(4).also { buffer.get(it) }
             require(magic.contentEquals(FILE_META_MAGIC))
             val transferId = UUID(buffer.long, buffer.long)
@@ -404,74 +430,129 @@ class MeshManager(
                 timestamp = packet.timestamp,
                 isBroadcast = packet.isBroadcast()
             )
-        }
-    }
+            orphanFileChunks.remove(transferId)?.let { orphan ->
+                val transfer = incomingFiles[transferId] ?: return@let
+                orphan.chunks.forEachIndexed { index, chunk ->
+                    if (index in transfer.chunks.indices && chunk != null) {
+                        transfer.chunks[index] = chunk
+                    }
+                }
+                completeFileTransferIfReady(transferId, transfer)
+            }
+            true
+        }.getOrDefault(false)
 
-    private fun handleIncomingFileChunk(packet: MeshPacket) {
+    private fun handleIncomingFileChunk(packet: MeshPacket): Boolean =
         runCatching {
-            val buffer = ByteBuffer.wrap(packet.payload)
+            val payload = decodeFilePayload(packet) ?: return@runCatching false
+            val buffer = ByteBuffer.wrap(payload)
             val magic = ByteArray(4).also { buffer.get(it) }
             require(magic.contentEquals(FILE_CHUNK_MAGIC))
             val transferId = UUID(buffer.long, buffer.long)
             val index = buffer.int
             val totalChunks = buffer.int
-            val transfer = incomingFiles[transferId] ?: return
+            val chunk = ByteArray(buffer.remaining()).also { buffer.get(it) }
+            val transfer = incomingFiles[transferId]
+            if (transfer == null) {
+                storeOrphanFileChunk(transferId, index, totalChunks, chunk)
+                return@runCatching true
+            }
             require(totalChunks == transfer.chunks.size)
             require(index in transfer.chunks.indices)
-            val chunk = ByteArray(buffer.remaining()).also { buffer.get(it) }
+            require(chunk.size <= FILE_CHUNK_SIZE)
             transfer.chunks[index] = chunk
 
-            if (transfer.chunks.all { it != null }) {
-                val bytes = ByteArray(transfer.totalBytes)
-                var offset = 0
-                transfer.chunks.forEach { part ->
-                    val safePart = part ?: return@forEach
-                    System.arraycopy(safePart, 0, bytes, offset, safePart.size)
-                    offset += safePart.size
-                }
-                if (offset == transfer.totalBytes) {
-                    incomingFiles.remove(transferId)
-                    fileListener?.invoke(
-                        transfer.senderId,
-                        transfer.fileName,
-                        transfer.mimeType,
-                        bytes,
-                        transfer.timestamp,
-                        transfer.isBroadcast
-                    )
-                }
+            completeFileTransferIfReady(transferId, transfer)
+            true
+        }.getOrDefault(false)
+
+    private fun storeOrphanFileChunk(transferId: UUID, index: Int, totalChunks: Int, chunk: ByteArray) {
+        require(totalChunks in 1..MAX_IMAGE_CHUNKS)
+        require(index in 0 until totalChunks)
+        require(chunk.size <= FILE_CHUNK_SIZE)
+        cleanupOrphanFileChunks()
+        val orphan = orphanFileChunks.compute(transferId) { _, existing ->
+            existing ?: OrphanFileChunks(arrayOfNulls(totalChunks), System.currentTimeMillis())
+        } ?: return
+        if (orphan.chunks.size != totalChunks) {
+            orphanFileChunks.remove(transferId)
+            return
+        }
+        orphan.chunks[index] = chunk
+    }
+
+    private fun completeFileTransferIfReady(transferId: UUID, transfer: IncomingFileTransfer) {
+        if (transfer.chunks.any { it == null }) return
+        val bytes = ByteArray(transfer.totalBytes)
+        var offset = 0
+        transfer.chunks.forEach { part ->
+            val safePart = part ?: return
+            if (offset + safePart.size > bytes.size) {
+                incomingFiles.remove(transferId)
+                return
             }
+            System.arraycopy(safePart, 0, bytes, offset, safePart.size)
+            offset += safePart.size
+        }
+        if (offset == transfer.totalBytes) {
+            incomingFiles.remove(transferId)
+            fileListener?.invoke(
+                transfer.senderId,
+                transfer.fileName,
+                transfer.mimeType,
+                bytes,
+                transfer.timestamp,
+                transfer.isBroadcast
+            )
         }
     }
 
-    private fun handleIncomingMessage(packet: MeshPacket) {
-        val plaintext: ByteArray
+    private fun cleanupOrphanFileChunks() {
+        val now = System.currentTimeMillis()
+        orphanFileChunks.entries.removeIf { now - it.value.createdAt > FILE_TRANSFER_TIMEOUT_MS }
+    }
 
-        if (packet.flags.isEncrypted) {
-            // Decrypt
-            val buffer = ByteBuffer.wrap(packet.payload)
-            val nonceLen = buffer.get().toInt()
-            val nonce = ByteArray(nonceLen).also { buffer.get(it) }
-            val ciphertext = ByteArray(buffer.remaining()).also { buffer.get(it) }
+    private fun decodeFilePayload(packet: MeshPacket): ByteArray? {
+        if (!packet.isBroadcast() && !packet.flags.isEncrypted) {
+            return null
+        }
+        return decodeMessagePayload(packet)
+    }
 
-            plaintext = crypto.decryptMessage(
-                packet.senderId,
-                EncryptedMessage(ciphertext, nonce)
-            ) ?: run {
-                // Decryption failed - maybe session not established?
-                return
-            }
-        } else {
-            // Unencrypted (broadcast)
-            plaintext = packet.payload
+    private fun decodeMessagePayload(packet: MeshPacket): ByteArray? {
+        if (!packet.flags.isEncrypted) {
+            if (!verifyOptionalPublicSignature(packet)) return null
+            return packet.payload
         }
 
-        if (packet.flags.isEncrypted) {
-            val peerIdentity = crypto.getSessionInfo(packet.senderId)?.peerIdentity ?: return
-            if (!crypto.verifySignature(packet.payload, packet.signature, peerIdentity)) {
-                return
-            }
+        val peerIdentity = crypto.getSessionInfo(packet.senderId)?.peerIdentity ?: return null
+        if (packet.signature.isEmpty() || !crypto.verifySignature(packet.payload, packet.signature, peerIdentity)) {
+            return null
         }
+
+        val encrypted = decodeEncryptedPayload(packet.payload) ?: return null
+        return crypto.decryptMessage(packet.senderId, encrypted)
+    }
+
+    private fun verifyOptionalPublicSignature(packet: MeshPacket): Boolean {
+        if (packet.signature.isEmpty()) return true
+        val peerIdentity = crypto.getSessionInfo(packet.senderId)?.peerIdentity ?: return true
+        return crypto.verifySignature(packet.payload, packet.signature, peerIdentity)
+    }
+
+    private fun decodeEncryptedPayload(payload: ByteArray): EncryptedMessage? {
+        if (payload.isEmpty()) return null
+        val buffer = ByteBuffer.wrap(payload)
+        val nonceLen = buffer.get().toInt() and 0xFF
+        if (nonceLen <= 0 || nonceLen > buffer.remaining()) return null
+        val nonce = ByteArray(nonceLen).also { buffer.get(it) }
+        if (buffer.remaining() <= 0) return null
+        val ciphertext = ByteArray(buffer.remaining()).also { buffer.get(it) }
+        return EncryptedMessage(ciphertext, nonce)
+    }
+
+    private fun handleIncomingMessage(packet: MeshPacket): Boolean {
+        val plaintext = decodeMessagePayload(packet) ?: return false
 
         // Deliver to application
         val message = String(plaintext, Charsets.UTF_8)
@@ -479,6 +560,7 @@ class MeshManager(
         if (!packet.isBroadcast()) {
             sendReadReceipt(packet.senderId, packet.messageId)
         }
+        return true
     }
 
     private fun sendReadReceipt(recipientId: UUID, readMessageId: UUID) {
@@ -494,7 +576,7 @@ class MeshManager(
             recipientId = recipientId,
             timestamp = System.currentTimeMillis(),
             payload = payload,
-            signature = ByteArray(0)
+            signature = crypto.sign(payload)
         )
         combinedTransmitter.sendTo(recipientId, packet)
     }
@@ -540,7 +622,7 @@ class MeshManager(
                 // Send ACK
                 val ackPacket = MeshPacket(
                     type = PacketType.HANDSHAKE_ACK,
-                    flags = PacketFlags(),
+                    flags = PacketFlags(isEncrypted = false),
                     messageId = UUID.randomUUID(),
                     senderId = localNodeId,
                     recipientId = nodeId,
@@ -578,11 +660,29 @@ class MeshManager(
     }
 
     override fun onAckReceived(messageId: UUID) {
-        messageStatusListener?.invoke(messageId, MessageDeliveryStatus.DELIVERED)
+        if (trackedMessageDeliveries.remove(messageId)) {
+            messageStatusListener?.invoke(messageId, MessageDeliveryStatus.DELIVERED)
+        }
     }
 
     override fun onReadReceiptReceived(senderId: UUID, messageId: UUID) {
-        messageStatusListener?.invoke(messageId, MessageDeliveryStatus.READ)
+        if (trackedMessageDeliveries.remove(messageId)) {
+            messageStatusListener?.invoke(messageId, MessageDeliveryStatus.READ)
+        }
+    }
+
+    override fun onDeliveryFailed(messageId: UUID) {
+        if (trackedMessageDeliveries.remove(messageId)) {
+            messageStatusListener?.invoke(messageId, MessageDeliveryStatus.FAILED)
+        }
+    }
+
+    override fun signControlPayload(payload: ByteArray): ByteArray = crypto.sign(payload)
+
+    override fun isControlPacketAuthentic(packet: MeshPacket): Boolean {
+        val peerIdentity = crypto.getSessionInfo(packet.senderId)?.peerIdentity ?: return false
+        return packet.signature.isNotEmpty() &&
+            crypto.verifySignature(packet.payload, packet.signature, peerIdentity)
     }
 
     // ==================== BleServiceCallback Interface ====================
@@ -648,6 +748,35 @@ class MeshManager(
             .toList()
     }
 
+    fun getDiagnostics(): MeshDiagnostics {
+        pruneStalePeers()
+        val peers = knownPeers.values.toList()
+        val pendingHandshakeMessages = pendingOutbox.values.sumOf { queue ->
+            synchronized(queue) { queue.size }
+        }
+        val routerDiagnostics = if (::router.isInitialized) {
+            router.diagnosticsSnapshot()
+        } else {
+            RouterDiagnostics(
+                neighborCount = 0,
+                pendingMessageCount = 0,
+                retryReadyCount = 0,
+                seenMessageCount = 0,
+                routeCount = 0,
+                maxRelayHops = maxRelayHops
+            )
+        }
+        return MeshDiagnostics(
+            knownPeerCount = peers.size,
+            directPeerCount = peers.count { it.isDirect || it.hopCount <= 1 },
+            routedPeerCount = peers.count { !(it.isDirect || it.hopCount <= 1) },
+            pendingHandshakeMessages = pendingHandshakeMessages,
+            incomingFileTransfers = incomingFiles.size,
+            maxRelayHops = maxRelayHops,
+            router = routerDiagnostics
+        )
+    }
+
     fun setMaxRelayHops(maxHops: Int) {
         maxRelayHops = maxHops.coerceIn(1, MeshPacket.DEFAULT_TTL.toInt())
         if (::router.isInitialized) {
@@ -692,6 +821,13 @@ class MeshManager(
     }
 }
 
+private fun encodeEncryptedPayload(encrypted: EncryptedMessage): ByteArray =
+    ByteBuffer.allocate(1 + encrypted.nonce.size + encrypted.ciphertext.size)
+        .put(encrypted.nonce.size.toByte())
+        .put(encrypted.nonce)
+        .put(encrypted.ciphertext)
+        .array()
+
 // ==================== Data Classes ====================
 
 data class PeerInfo(
@@ -718,6 +854,21 @@ data class IncomingFileTransfer(
     val isBroadcast: Boolean
 )
 
+data class OrphanFileChunks(
+    val chunks: Array<ByteArray?>,
+    val createdAt: Long
+)
+
+data class MeshDiagnostics(
+    val knownPeerCount: Int,
+    val directPeerCount: Int,
+    val routedPeerCount: Int,
+    val pendingHandshakeMessages: Int,
+    val incomingFileTransfers: Int,
+    val maxRelayHops: Int,
+    val router: RouterDiagnostics
+)
+
 enum class PeerEvent {
     DISCOVERED,
     SESSION_ESTABLISHED,
@@ -726,6 +877,7 @@ enum class PeerEvent {
 }
 
 enum class MessageDeliveryStatus {
+    FAILED,
     DELIVERED,
     READ
 }
@@ -741,6 +893,7 @@ private val FILE_CHUNK_MAGIC = byteArrayOf('I'.code.toByte(), 'M'.code.toByte(),
 private const val FILE_CHUNK_SIZE = 384
 private const val MAX_IMAGE_BYTES = 2 * 1024 * 1024
 private const val MAX_IMAGE_CHUNKS = 6000
+private const val FILE_TRANSFER_TIMEOUT_MS = 10 * 60 * 1000L
 private const val KNOWN_PEER_MAX_AGE_MS = 60_000L
 private const val MAX_PENDING_OUTBOX_PER_PEER = 96
 

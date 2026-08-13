@@ -142,6 +142,7 @@ class MeshNetworkService : Service() {
         }
         meshManager.setMessageStatusListener { messageId, status ->
             val label = when (status) {
+                MessageDeliveryStatus.FAILED -> "failed"
                 MessageDeliveryStatus.DELIVERED -> "delivered"
                 MessageDeliveryStatus.READ -> "read"
             }
@@ -183,6 +184,8 @@ class MeshNetworkService : Service() {
     }
 
     fun knownPeers() = meshManager.getKnownPeers()
+
+    fun meshDiagnostics() = meshManager.getDiagnostics()
 
     fun getLocalFingerprint(): String = meshManager.getLocalFingerprint()
 
@@ -464,7 +467,7 @@ class MeshNetworkService : Service() {
         if (!notificationsEnabled) return
         if (isBroadcast && !notificationBroadcastEnabled) return
         val manager = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+        if (MeshPermissionPolicy.requiresPostNotificationsPermission() &&
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
         ) {
             return
