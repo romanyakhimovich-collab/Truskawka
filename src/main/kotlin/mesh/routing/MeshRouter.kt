@@ -43,6 +43,9 @@ class MeshRouter(
     // Routing table: destination -> next hop (for optimized routing)
     private val routingTable = ConcurrentHashMap<UUID, RouteEntry>()
 
+    // Bounded packet cache used by epidemic sync when two peers meet later.
+    private val packetCache = ConcurrentHashMap<UUID, MeshPacket>()
+
     /**
      * Main entry point: called when a packet is received from any interface
      *
@@ -88,6 +91,7 @@ class MeshRouter(
             return
         }
         markAsSeen(packet.messageId, now)
+        cacheForSync(packet)
 
         // Step 2: TTL check
         if (packet.isExpired()) {
@@ -107,6 +111,8 @@ class MeshRouter(
             PacketType.READ_RECEIPT -> handleReadReceipt(packet)
             PacketType.ROUTE_REQ -> handleRouteRequest(packet)
             PacketType.ROUTE_REP -> handleRouteReply(packet)
+            PacketType.SYNC_SUMMARY -> handleSyncSummary(packet)
+            PacketType.SYNC_REQUEST -> handleSyncRequest(packet)
             PacketType.HEARTBEAT -> { /* Just neighbor update above */ }
             else -> handleMessage(packet) // Default: treat as message
         }
@@ -212,6 +218,7 @@ class MeshRouter(
         if (flags.requiresAck) {
             storePendingMessage(packet)
         }
+        cacheForSync(packet)
         return packet.messageId
     }
 
@@ -227,6 +234,7 @@ class MeshRouter(
             retryReadyCount = pendingMessages.count { now >= it.nextRetryAt },
             seenMessageCount = seenMessages.size,
             routeCount = routingTable.size,
+            cachedPacketCount = packetCache.size,
             maxRelayHops = maxRelayHops.toInt()
         )
     }
@@ -271,9 +279,21 @@ class MeshRouter(
      * Epidemic sync: exchange message IDs to find missing messages
      */
     private fun initiateEpidemicSync(neighborId: UUID) {
-        // Send summary vector of messages we have
-        // Neighbor responds with messages we're missing
-        // This is a simplified epidemic routing protocol
+        val ids = packetCache.keys.take(MAX_SYNC_IDS)
+        if (ids.isEmpty()) return
+        val payload = encodeUuidList(ids)
+        val packet = MeshPacket(
+            type = PacketType.SYNC_SUMMARY,
+            flags = mesh.protocol.PacketFlags(isEncrypted = false, useWifiDirect = true),
+            ttl = 1,
+            messageId = UUID.randomUUID(),
+            senderId = localNodeId,
+            recipientId = neighborId,
+            timestamp = clock(),
+            payload = payload,
+            signature = ByteArray(0)
+        )
+        transmitter.sendTo(neighborId, packet)
     }
 
     private fun handleDiscovery(packet: MeshPacket) {
@@ -350,6 +370,36 @@ class MeshRouter(
         )
     }
 
+    private fun handleSyncSummary(packet: MeshPacket) {
+        if (packet.recipientId != localNodeId) return
+        val missing = decodeUuidList(packet.payload)
+            .filterNot { seenMessages.containsKey(it) || packetCache.containsKey(it) }
+            .take(MAX_SYNC_IDS)
+        if (missing.isEmpty()) return
+        val request = MeshPacket(
+            type = PacketType.SYNC_REQUEST,
+            flags = mesh.protocol.PacketFlags(isEncrypted = false, useWifiDirect = true),
+            ttl = 1,
+            messageId = UUID.randomUUID(),
+            senderId = localNodeId,
+            recipientId = packet.senderId,
+            timestamp = clock(),
+            payload = encodeUuidList(missing),
+            signature = ByteArray(0)
+        )
+        transmitter.sendTo(packet.senderId, request)
+    }
+
+    private fun handleSyncRequest(packet: MeshPacket) {
+        if (packet.recipientId != localNodeId) return
+        decodeUuidList(packet.payload)
+            .mapNotNull { packetCache[it] }
+            .take(MAX_SYNC_IDS)
+            .forEach { cached ->
+                transmitter.sendTo(packet.senderId, cached)
+            }
+    }
+
     private fun sendRouteReply(requesterId: UUID, requestMessageId: UUID) {
         val payload = java.nio.ByteBuffer.allocate(16)
             .putLong(localNodeId.mostSignificantBits)
@@ -417,6 +467,16 @@ class MeshRouter(
 
     private fun cleanupSeenMessages(now: Long) {
         seenMessages.entries.removeIf { now - it.value > seenMessagesMaxAge }
+        packetCache.entries.removeIf { (_, packet) -> now - packet.timestamp > pendingMessageTTL }
+    }
+
+    private fun cacheForSync(packet: MeshPacket) {
+        if (packet.type !in SYNC_CACHE_TYPES) return
+        if (packetCache.size >= MAX_SYNC_CACHE_PACKETS) {
+            val oldest = packetCache.entries.minByOrNull { it.value.timestamp }?.key
+            if (oldest != null) packetCache.remove(oldest)
+        }
+        packetCache[packet.messageId] = packet
     }
 
     private fun updateNeighborInfo(
@@ -509,6 +569,7 @@ data class RouterDiagnostics(
     val retryReadyCount: Int,
     val seenMessageCount: Int,
     val routeCount: Int,
+    val cachedPacketCount: Int,
     val maxRelayHops: Int
 )
 
@@ -552,7 +613,29 @@ private fun ByteArray.readUuidOrNull(): UUID? {
     return UUID(buffer.long, buffer.long)
 }
 
+private fun encodeUuidList(ids: List<UUID>): ByteArray {
+    val safeIds = ids.take(MAX_SYNC_IDS)
+    val buffer = ByteBuffer.allocate(2 + safeIds.size * 16)
+    buffer.putShort(safeIds.size.toShort())
+    safeIds.forEach {
+        buffer.putLong(it.mostSignificantBits)
+        buffer.putLong(it.leastSignificantBits)
+    }
+    return buffer.array()
+}
+
+private fun decodeUuidList(payload: ByteArray): List<UUID> {
+    if (payload.size < 2) return emptyList()
+    val buffer = ByteBuffer.wrap(payload)
+    val count = buffer.short.toInt() and 0xFFFF
+    if (count > MAX_SYNC_IDS || buffer.remaining() < count * 16) return emptyList()
+    return List(count) { UUID(buffer.long, buffer.long) }
+}
+
 private const val RETRY_BASE_DELAY_MS = 2_500L
 private const val RETRY_MAX_DELAY_MS = 60_000L
 private const val MAX_RETRY_ATTEMPTS = 5
 private const val DUPLICATE_RELAY_INTERVAL_MS = 2_000L
+private const val MAX_SYNC_IDS = 128
+private const val MAX_SYNC_CACHE_PACKETS = 2048
+private val SYNC_CACHE_TYPES = setOf(PacketType.MESSAGE, PacketType.FILE_META, PacketType.FILE_CHUNK)

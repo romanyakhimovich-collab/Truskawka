@@ -34,6 +34,9 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         if (oldVersion < 6) {
             addColumnIfMissing(db, "messages", "reaction", "TEXT")
         }
+        if (oldVersion < 7) {
+            createTransfers(db)
+        }
     }
 
     fun ensureChat(chat: StoredChat) {
@@ -61,6 +64,25 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 SQLiteDatabase.CONFLICT_IGNORE
             )
         }
+    }
+
+    fun updateBaseChatTitles(everyoneTitle: String, savedTitle: String) {
+        writableDatabase.update(
+            "chats",
+            ContentValues().apply {
+                put("title", everyoneTitle)
+            },
+            "chat_key = ?",
+            arrayOf(CHAT_EVERYONE)
+        )
+        writableDatabase.update(
+            "chats",
+            ContentValues().apply {
+                put("title", savedTitle)
+            },
+            "chat_key = ?",
+            arrayOf(CHAT_SAVED)
+        )
     }
 
     fun upsertPeer(peer: StoredPeer) {
@@ -306,7 +328,59 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         writableDatabase.delete("messages", null, null)
         writableDatabase.delete("chats", null, null)
         writableDatabase.delete("peers", null, null)
+        writableDatabase.delete("transfers", null, null)
         seedBaseChats(writableDatabase)
+    }
+
+    fun upsertTransfer(transfer: StoredTransfer) {
+        writableDatabase.insertWithOnConflict(
+            "transfers",
+            null,
+            transfer.toValues(),
+            SQLiteDatabase.CONFLICT_REPLACE
+        )
+    }
+
+    fun updateTransferProgress(transferId: String, receivedBytes: Int, status: String) {
+        writableDatabase.update(
+            "transfers",
+            ContentValues().apply {
+                put("received_bytes", receivedBytes)
+                put("status", status)
+                put("updated_at", System.currentTimeMillis())
+            },
+            "transfer_id = ?",
+            arrayOf(transferId)
+        )
+    }
+
+    fun listRecentTransfers(limit: Int = 12): List<StoredTransfer> {
+        val rows = mutableListOf<StoredTransfer>()
+        readableDatabase.query(
+            "transfers",
+            null,
+            null,
+            null,
+            null,
+            null,
+            "updated_at DESC",
+            limit.coerceIn(1, 100).toString()
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                rows += StoredTransfer(
+                    transferId = cursor.getString(cursor.getColumnIndexOrThrow("transfer_id")),
+                    chatKey = cursor.getString(cursor.getColumnIndexOrThrow("chat_key")),
+                    fileName = cursor.getString(cursor.getColumnIndexOrThrow("file_name")),
+                    mimeType = cursor.getString(cursor.getColumnIndexOrThrow("mime_type")),
+                    totalBytes = cursor.getInt(cursor.getColumnIndexOrThrow("total_bytes")),
+                    receivedBytes = cursor.getInt(cursor.getColumnIndexOrThrow("received_bytes")),
+                    status = cursor.getString(cursor.getColumnIndexOrThrow("status")),
+                    createdAt = cursor.getLong(cursor.getColumnIndexOrThrow("created_at")),
+                    updatedAt = cursor.getLong(cursor.getColumnIndexOrThrow("updated_at"))
+                )
+            }
+        }
+        return rows
     }
 
     private fun createMessages(db: SQLiteDatabase) {
@@ -455,6 +529,19 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             put("last_seen", lastSeen)
         }
 
+    private fun StoredTransfer.toValues(): ContentValues =
+        ContentValues().apply {
+            put("transfer_id", transferId)
+            put("chat_key", chatKey)
+            put("file_name", fileName)
+            put("mime_type", mimeType)
+            put("total_bytes", totalBytes)
+            put("received_bytes", receivedBytes)
+            put("status", status)
+            put("created_at", createdAt)
+            put("updated_at", updatedAt)
+        }
+
     private fun android.database.Cursor.toPeer(): StoredPeer =
         StoredPeer(
             nodeId = getString(getColumnIndexOrThrow("node_id")),
@@ -466,7 +553,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
 
     companion object {
         private const val DB_NAME = "truskawka_chats.db"
-        private const val DB_VERSION = 6
+        private const val DB_VERSION = 7
         const val CHAT_EVERYONE = "everyone"
         const val CHAT_SAVED = "saved"
         private const val LEGACY_CHAT_MESH = "mesh"

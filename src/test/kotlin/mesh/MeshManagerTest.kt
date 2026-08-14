@@ -6,6 +6,8 @@ import mesh.protocol.MeshPacket
 import mesh.protocol.PacketType
 import mesh.routing.OpportunisticPacketTransmitter
 import mesh.transport.BleTransportService
+import java.io.File
+import java.nio.file.Files
 import java.security.KeyPair
 import java.util.UUID
 import kotlin.test.Test
@@ -96,6 +98,103 @@ class MeshManagerTest {
             .let(managerB::onWifiDirectPacketReceived)
 
         assertContentEquals(imageBytes, assertNotNull(receivedFiles.singleOrNull()))
+    }
+
+    @Test
+    fun `private image requests and resumes missing chunk`() {
+        val nodeA = UUID.randomUUID()
+        val nodeB = UUID.randomUUID()
+        val transportA = CapturingTransport()
+        val transportB = CapturingTransport()
+        val managerA = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeA), transportA, nodeA)
+        val managerB = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeB), transportB, nodeB)
+        val receivedFiles = mutableListOf<ByteArray>()
+
+        managerA.initialize()
+        managerB.initialize()
+        managerB.setFileListener { _, _, _, bytes, _, _ -> receivedFiles += bytes }
+
+        managerA.initiateHandshakeWith(nodeB)
+        transportA.takeSingle(PacketType.HANDSHAKE).let(managerB::onWifiDirectPacketReceived)
+        transportB.takeSingle(PacketType.HANDSHAKE_ACK).let(managerA::onWifiDirectPacketReceived)
+
+        val imageBytes = ByteArray(1_200) { (it % 199).toByte() }
+        val result = managerA.sendImage(nodeB, "resume.jpg", "image/jpeg", imageBytes)
+        assertTrue(result is SendResult.Sent)
+
+        val filePackets = transportA.takeAll().filter {
+            it.type == PacketType.FILE_META || it.type == PacketType.FILE_CHUNK
+        }
+        val meta = filePackets.single { it.type == PacketType.FILE_META }
+        val chunks = filePackets.filter { it.type == PacketType.FILE_CHUNK }
+        chunks.filterIndexed { index, _ -> index != 1 }
+            .forEach(managerB::onWifiDirectPacketReceived)
+        meta.let(managerB::onWifiDirectPacketReceived)
+
+        assertTrue(receivedFiles.isEmpty())
+        val request = transportB.takeAll().single { it.type == PacketType.FILE_CHUNK_REQUEST }
+        managerA.onWifiDirectPacketReceived(request)
+
+        val replayedChunks = transportA.takeAll().filter { it.type == PacketType.FILE_CHUNK }
+        assertTrue(replayedChunks.isNotEmpty())
+        replayedChunks.forEach(managerB::onWifiDirectPacketReceived)
+
+        assertContentEquals(imageBytes, assertNotNull(receivedFiles.singleOrNull()))
+    }
+
+    @Test
+    fun `incoming partial transfer is restored from disk and resumes`() {
+        val nodeA = UUID.randomUUID()
+        val nodeB = UUID.randomUUID()
+        val storageDir = Files.createTempDirectory("mesh-transfer-test").toFile()
+        val transportA = CapturingTransport()
+        val firstTransportB = CapturingTransport()
+        val secondTransportB = CapturingTransport()
+        val storageA = InMemorySecureKeyStorage()
+        val storageB = InMemorySecureKeyStorage()
+        val managerA = MeshManager(storageA, FakeBleTransport(nodeA), transportA, nodeA, storageDir.resolve("a"))
+        val firstManagerB = MeshManager(storageB, FakeBleTransport(nodeB), firstTransportB, nodeB, storageDir.resolve("b"))
+        val secondManagerB = MeshManager(storageB, FakeBleTransport(nodeB), secondTransportB, nodeB, storageDir.resolve("b"))
+        val receivedFiles = mutableListOf<ByteArray>()
+
+        try {
+            managerA.initialize()
+            firstManagerB.initialize()
+            managerA.initiateHandshakeWith(nodeB)
+            transportA.takeSingle(PacketType.HANDSHAKE).let(firstManagerB::onWifiDirectPacketReceived)
+            firstTransportB.takeSingle(PacketType.HANDSHAKE_ACK).let(managerA::onWifiDirectPacketReceived)
+
+            val imageBytes = ByteArray(1_200) { (it % 157).toByte() }
+            val result = managerA.sendImage(nodeB, "restore.jpg", "image/jpeg", imageBytes)
+            assertTrue(result is SendResult.Sent)
+
+            val filePackets = transportA.takeAll().filter {
+                it.type == PacketType.FILE_META || it.type == PacketType.FILE_CHUNK
+            }
+            val meta = filePackets.single { it.type == PacketType.FILE_META }
+            val chunks = filePackets.filter { it.type == PacketType.FILE_CHUNK }
+            chunks.filterIndexed { index, _ -> index != 1 }
+                .forEach(firstManagerB::onWifiDirectPacketReceived)
+            firstTransportB.takeAll()
+            meta.let(firstManagerB::onWifiDirectPacketReceived)
+            firstTransportB.takeAll()
+
+            secondManagerB.setFileListener { _, _, _, bytes, _, _ -> receivedFiles += bytes }
+            secondManagerB.initialize()
+            secondManagerB.initiateHandshakeWith(nodeA)
+            secondTransportB.takeSingle(PacketType.HANDSHAKE).let(managerA::onWifiDirectPacketReceived)
+            transportA.takeSingle(PacketType.HANDSHAKE_ACK).let(secondManagerB::onWifiDirectPacketReceived)
+
+            val request = secondTransportB.takeAll().single { it.type == PacketType.FILE_CHUNK_REQUEST }
+            managerA.onWifiDirectPacketReceived(request)
+            transportA.takeAll()
+                .filter { it.type == PacketType.FILE_CHUNK }
+                .forEach(secondManagerB::onWifiDirectPacketReceived)
+
+            assertContentEquals(imageBytes, assertNotNull(receivedFiles.singleOrNull()))
+        } finally {
+            storageDir.deleteRecursively()
+        }
     }
 
     @Test

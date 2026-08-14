@@ -18,6 +18,7 @@ interface ChatMessageAdapterDelegate {
     fun terminalAction(value: String): TextView
     fun roundedDrawable(color: Int, cornerRadius: Int, strokeColor: Int? = null): GradientDrawable
     fun calculateChatImageSize(bitmap: Bitmap?): Pair<Int, Int>
+    fun calculateChatImageSize(width: Int, height: Int): Pair<Int, Int>
     fun displayAuthor(message: ChatMessage): String
     fun displayTime(message: ChatMessage): String
     fun displayDate(message: ChatMessage): String

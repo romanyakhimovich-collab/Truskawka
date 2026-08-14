@@ -15,9 +15,12 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import mesh.MessageDeliveryStatus
+import mesh.FileTransferProgress
 import mesh.MeshManager
 import mesh.PeerEvent
 import mesh.SendResult
+import mesh.TransferDirection
+import mesh.TransferStatus
 import mesh.protocol.MeshPacket
 import mesh.transport.android.AndroidBleService
 import java.io.File
@@ -30,6 +33,7 @@ class MeshNetworkService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private lateinit var meshManager: MeshManager
+    private lateinit var chatStore: ChatStore
     private lateinit var bleTransport: AndroidBleService
     private lateinit var wifiDirectSocketManager: WifiDirectSocketManager
     private var emulatorRelayTransport: EmulatorRelayTransport? = null
@@ -59,6 +63,7 @@ class MeshNetworkService : Service() {
     override fun onCreate() {
         super.onCreate()
         loadRuntimeSettings()
+        chatStore = ChatStore(applicationContext)
         createNotificationChannel()
         startMeshForeground()
 
@@ -79,7 +84,7 @@ class MeshNetworkService : Service() {
             if (shouldUseDevRelay()) {
                 emulatorRelayTransport = EmulatorRelayTransport(
                     localNodeId = localNodeId,
-                    aliasProvider = ::getNickname,
+                    aliasProvider = ::publicDisplayName,
                     onLog = ::publish,
                     onPayloadReceived = ::handleTransportPayload,
                     onPeerSeen = ::handleEmulatorRelayPeerSeen,
@@ -92,7 +97,8 @@ class MeshNetworkService : Service() {
             secureStorage = AndroidSecureKeyStorage(applicationContext),
             bleTransport = bleTransport,
             wifiDirectTransport = CompositeOpportunisticTransport(opportunisticTransports),
-            localNodeId = localNodeId
+            localNodeId = localNodeId,
+            transferStorageDir = File(filesDir, "mesh_file_transfers")
         )
         meshManager.setMaxRelayHops(maxRelayHops)
         meshManager.setMessageListener { senderId, message, timestamp, isBroadcast ->
@@ -130,6 +136,7 @@ class MeshNetworkService : Service() {
                 publish("image from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: ${file.absolutePath}|$mimeType")
             }
         }
+        meshManager.setFileTransferProgressListener(::persistTransferProgress)
         meshManager.setPeerListener { nodeId, event ->
             val label = when (event) {
                 PeerEvent.DISCOVERED -> "discovered"
@@ -189,6 +196,16 @@ class MeshNetworkService : Service() {
 
     fun getLocalFingerprint(): String = meshManager.getLocalFingerprint()
 
+    fun getPeerFingerprint(peerId: UUID): String? = meshManager.getPeerFingerprint(peerId)
+
+    fun getPeerSafetyNumber(peerId: UUID): String? = meshManager.getPeerSafetyNumber(peerId)
+
+    fun markPeerVerified(peerId: UUID) {
+        meshManager.markPeerAsVerified(peerId)
+    }
+
+    fun recentTransfers(): List<StoredTransfer> = chatStore.listRecentTransfers()
+
     fun peerCount(): Int = knownPeers().size
 
     fun meshTransportStatus(): String {
@@ -214,10 +231,11 @@ class MeshNetworkService : Service() {
                 emulatorRelayTransport?.start()
                 emulatorRelayTransport?.announce()
             }
-            bleTransport.setLocalAlias(getNickname())
+            val alias = publicDisplayName()
+            bleTransport.setLocalAlias(alias)
             bleTransport.startAdvertising()
             bleTransport.startScanning()
-            meshManager.activeMeshScan(getNickname())
+            meshManager.activeMeshScan(alias)
         }.onFailure {
             publish("ble search failed: ${it.message}")
         }
@@ -272,6 +290,21 @@ class MeshNetworkService : Service() {
             ?.take(MAX_NICKNAME_LENGTH)
             ?: "@${localNodeId.shortId()}".take(MAX_NICKNAME_LENGTH)
 
+    fun publicDisplayName(): String =
+        AppProfileStore.displayName(this)
+            .trim()
+            .take(24)
+            .ifBlank { getNickname() }
+
+    fun refreshPublicDisplayName() {
+        if (!::meshManager.isInitialized || !::bleTransport.isInitialized) return
+        val alias = publicDisplayName()
+        bleTransport.setLocalAlias(alias)
+        meshManager.activeMeshScan(alias)
+        emulatorRelayTransport?.announce()
+        publish("display name updated: $alias")
+    }
+
     fun hasStoredNickname(): Boolean =
         getSharedPreferences("bitchat_profile", Context.MODE_PRIVATE)
             .contains("nickname")
@@ -306,8 +339,7 @@ class MeshNetworkService : Service() {
             .apply()
         publish("nick changed: $display")
         if (::meshManager.isInitialized) {
-            bleTransport.setLocalAlias(display)
-            meshManager.activeMeshScan(display)
+            refreshPublicDisplayName()
         }
         return display
     }
@@ -323,7 +355,7 @@ class MeshNetworkService : Service() {
 
     fun prepareChatWith(recipientText: String) {
         val recipient = runCatching { UUID.fromString(recipientText.trim()) }.getOrNull() ?: return
-        meshManager.activeMeshScan(getNickname())
+        meshManager.activeMeshScan(publicDisplayName())
         emulatorRelayTransport?.announce()
         runCatching { meshManager.initiateHandshakeWith(recipient) }
             .onFailure { publish("handshake failed: ${it.message}") }
@@ -343,14 +375,62 @@ class MeshNetworkService : Service() {
             ?.let { runCatching { UUID.fromString(it.trim()) }.getOrNull() }
         emulatorRelayTransport?.announce()
         val result = runCatching {
-            meshManager.sendImage(recipient, fileName, mimeType, bytes) { sent, total ->
+            meshManager.sendImage(recipient, fileName, mimeType, bytes) { progress ->
+                persistTransferProgress(progress)
+                val sent = progress.sentChunks
+                val total = progress.totalChunks
                 if (sent == 0 || sent == total || sent % maxOf(1, total / 10) == 0) {
                     publish("image progress: $sent/$total")
                 }
             }
         }.getOrElse { SendResult.Failed(it.message ?: "image send failed") }
+        if (result is SendResult.Failed) {
+            markLatestTransferFailed(recipient, fileName)
+        }
         publish("image send: ${result.label()}")
         return result
+    }
+
+    private fun persistTransferProgress(progress: FileTransferProgress) {
+        val chatKey = when {
+            progress.isBroadcast -> CHAT_EVERYONE
+            progress.direction == TransferDirection.INCOMING -> "peer:${progress.recipientId}"
+            else -> "peer:${progress.recipientId}"
+        }
+        val now = System.currentTimeMillis()
+        val sentBytes = if (progress.totalChunks <= 0) {
+            0
+        } else {
+            ((progress.sentChunks.toLong() * progress.totalBytes) / progress.totalChunks)
+                .coerceIn(0L, progress.totalBytes.toLong())
+                .toInt()
+        }
+        chatStore.upsertTransfer(
+            StoredTransfer(
+                transferId = progress.transferId.toString(),
+                chatKey = chatKey,
+                fileName = progress.fileName,
+                mimeType = progress.mimeType,
+                totalBytes = progress.totalBytes,
+                receivedBytes = sentBytes,
+                status = progress.status.toStorageLabel(progress.direction),
+                createdAt = now,
+                updatedAt = now
+            )
+        )
+    }
+
+    private fun markLatestTransferFailed(recipient: UUID?, fileName: String) {
+        val chatKey = recipient?.let { "peer:$it" } ?: CHAT_EVERYONE
+        chatStore.listRecentTransfers(limit = 20)
+            .firstOrNull { it.chatKey == chatKey && it.fileName == fileName && it.status == "sending" }
+            ?.let { transfer ->
+                chatStore.updateTransferProgress(
+                    transfer.transferId,
+                    transfer.receivedBytes,
+                    "failed"
+                )
+            }
     }
 
     private fun publish(message: String) {
@@ -374,19 +454,19 @@ class MeshNetworkService : Service() {
             if (!::meshManager.isInitialized) return@post
             publish("emulator relay ready")
             emulatorRelayTransport?.announce()
-            meshManager.activeMeshScan(getNickname())
+            meshManager.activeMeshScan(publicDisplayName())
             publish("peer counter: ${peerCount()}")
             mainHandler.postDelayed({
                 if (::meshManager.isInitialized) {
                     emulatorRelayTransport?.announce()
-                    meshManager.activeMeshScan(getNickname())
+                    meshManager.activeMeshScan(publicDisplayName())
                     publish("peer counter: ${peerCount()}")
                 }
             }, 1_000L)
             mainHandler.postDelayed({
                 if (::meshManager.isInitialized) {
                     emulatorRelayTransport?.announce()
-                    meshManager.activeMeshScan(getNickname())
+                    meshManager.activeMeshScan(publicDisplayName())
                     publish("peer counter: ${peerCount()}")
                 }
             }, 3_000L)
@@ -540,6 +620,12 @@ class MeshNetworkService : Service() {
         is SendResult.Sent -> "sent ${messageId.shortId()}"
         is SendResult.Queued -> "queued ($reason)"
         is SendResult.Failed -> "failed ($error)"
+    }
+
+    private fun TransferStatus.toStorageLabel(direction: TransferDirection): String = when (this) {
+        TransferStatus.ACTIVE -> if (direction == TransferDirection.INCOMING) "receiving" else "sending"
+        TransferStatus.COMPLETED -> "completed"
+        TransferStatus.FAILED -> "failed"
     }
 
     companion object {

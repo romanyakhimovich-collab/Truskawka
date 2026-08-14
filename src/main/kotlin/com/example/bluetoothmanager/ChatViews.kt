@@ -394,6 +394,7 @@ class ZoomableImageView(
     private val onDragAtOriginalSize: () -> Unit
 ) : ImageView(context) {
     private val contentMatrix = Matrix()
+    private val imageRect = RectF()
     private var minScale = 1f
     private var currentScale = 1f
     private var lastX = 0f
@@ -403,14 +404,29 @@ class ZoomableImageView(
     private val scaleDetector = ScaleGestureDetector(
         context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                dragging = false
+                lastX = detector.focusX
+                lastY = detector.focusY
+                return true
+            }
+
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 val target = (currentScale * detector.scaleFactor).coerceIn(minScale, minScale * 5f)
                 val factor = target / currentScale
+                if (!factor.isFinite() || factor <= 0f) return false
                 currentScale = target
                 contentMatrix.postScale(factor, factor, detector.focusX, detector.focusY)
                 constrainImage()
-                imageMatrix = contentMatrix
+                applyContentMatrix()
+                lastX = detector.focusX
+                lastY = detector.focusY
                 return true
+            }
+
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                lastX = detector.focusX
+                lastY = detector.focusY
             }
         }
     )
@@ -419,12 +435,13 @@ class ZoomableImageView(
         context,
         object : GestureDetector.SimpleOnGestureListener() {
             override fun onDoubleTap(e: MotionEvent): Boolean {
+                if (scaleDetector.isInProgress) return true
                 val target = if (currentScale > minScale * 1.4f) minScale else minScale * 2.4f
                 val factor = target / currentScale
                 currentScale = target
                 contentMatrix.postScale(factor, factor, e.x, e.y)
                 constrainImage()
-                imageMatrix = contentMatrix
+                applyContentMatrix()
                 return true
             }
 
@@ -455,8 +472,10 @@ class ZoomableImageView(
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         parent?.requestDisallowInterceptTouchEvent(true)
-        gestureDetector.onTouchEvent(event)
         scaleDetector.onTouchEvent(event)
+        if (event.pointerCount == 1 && !scaleDetector.isInProgress) {
+            gestureDetector.onTouchEvent(event)
+        }
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -465,17 +484,36 @@ class ZoomableImageView(
                 dragging = true
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
-                lastX = scaleDetector.focusX
-                lastY = scaleDetector.focusY
+                lastX = event.focusX()
+                lastY = event.focusY()
+                dragging = false
             }
             MotionEvent.ACTION_MOVE -> {
-                if (dragging && !scaleDetector.isInProgress && currentScale > minScale * 1.01f) {
+                if (scaleDetector.isInProgress || event.pointerCount > 1) {
+                    lastX = event.focusX()
+                    lastY = event.focusY()
+                    return true
+                }
+                if (dragging && currentScale > minScale * 1.01f) {
                     contentMatrix.postTranslate(event.x - lastX, event.y - lastY)
                     constrainImage()
-                    imageMatrix = contentMatrix
+                    applyContentMatrix()
                 }
                 lastX = event.x
                 lastY = event.y
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                val remaining = event.pointerCount - 1
+                if (remaining == 1) {
+                    val index = if (event.actionIndex == 0) 1 else 0
+                    lastX = event.getX(index)
+                    lastY = event.getY(index)
+                    dragging = currentScale > minScale * 1.01f
+                } else {
+                    lastX = event.focusX(event.actionIndex)
+                    lastY = event.focusY(event.actionIndex)
+                    dragging = false
+                }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 dragging = false
@@ -501,34 +539,58 @@ class ZoomableImageView(
         contentMatrix.reset()
         contentMatrix.setScale(scale, scale)
         contentMatrix.postTranslate(dx, dy)
-        imageMatrix = contentMatrix
+        applyContentMatrix()
     }
 
     private fun constrainImage() {
         val drawable = drawable ?: return
-        val rect = RectF(
+        if (width <= 0 || height <= 0) return
+        imageRect.set(
             0f,
             0f,
             drawable.intrinsicWidth.toFloat(),
             drawable.intrinsicHeight.toFloat()
         )
-        contentMatrix.mapRect(rect)
+        contentMatrix.mapRect(imageRect)
 
         val dx = when {
-            rect.width() <= width -> width / 2f - rect.centerX()
-            rect.left > 0f -> -rect.left
-            rect.right < width -> width - rect.right
+            imageRect.width() <= width -> width / 2f - imageRect.centerX()
+            imageRect.left > 0f -> -imageRect.left
+            imageRect.right < width -> width - imageRect.right
             else -> 0f
         }
         val dy = when {
-            rect.height() <= height -> height / 2f - rect.centerY()
-            rect.top > 0f -> -rect.top
-            rect.bottom < height -> height - rect.bottom
+            imageRect.height() <= height -> height / 2f - imageRect.centerY()
+            imageRect.top > 0f -> -imageRect.top
+            imageRect.bottom < height -> height - imageRect.bottom
             else -> 0f
         }
         contentMatrix.postTranslate(dx, dy)
     }
 
-    private fun dp(value: Int): Int =
-        (value * resources.displayMetrics.density).toInt()
+    private fun applyContentMatrix() {
+        imageMatrix = contentMatrix
+    }
+
+    private fun MotionEvent.focusX(skipPointerIndex: Int = -1): Float {
+        var sum = 0f
+        var count = 0
+        for (index in 0 until pointerCount) {
+            if (index == skipPointerIndex) continue
+            sum += getX(index)
+            count++
+        }
+        return if (count > 0) sum / count else lastX
+    }
+
+    private fun MotionEvent.focusY(skipPointerIndex: Int = -1): Float {
+        var sum = 0f
+        var count = 0
+        for (index in 0 until pointerCount) {
+            if (index == skipPointerIndex) continue
+            sum += getY(index)
+            count++
+        }
+        return if (count > 0) sum / count else lastY
+    }
 }

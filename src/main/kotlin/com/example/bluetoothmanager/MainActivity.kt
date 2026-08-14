@@ -154,6 +154,8 @@ class MainActivity : Activity() {
             this@MainActivity.roundedDrawable(color, cornerRadius, strokeColor)
         override fun calculateChatImageSize(bitmap: Bitmap?): Pair<Int, Int> =
             this@MainActivity.calculateChatImageSize(bitmap)
+        override fun calculateChatImageSize(width: Int, height: Int): Pair<Int, Int> =
+            this@MainActivity.calculateChatImageSize(width, height)
         override fun displayAuthor(message: ChatMessage): String = message.displayAuthor()
         override fun displayTime(message: ChatMessage): String = message.displayTime()
         override fun displayDate(message: ChatMessage): String = message.displayDate()
@@ -179,6 +181,8 @@ class MainActivity : Activity() {
     private var backupProgressText: TextView? = null
     private var backupOperationRunning = false
     private var backupRestoreErrorMessage: String? = null
+    private var returnToProfileAfterAvatarPick = false
+    private var ownProfileDialog: Dialog? = null
     private val pendingSendTimeouts = mutableMapOf<Long, Runnable>()
     private val pendingTextRetries = mutableMapOf<Long, Runnable>()
     private lateinit var chatStore: ChatStore
@@ -264,6 +268,7 @@ class MainActivity : Activity() {
         applyDateTimeFormat()
         applyThemePalette()
         chatStore = ChatStore(this)
+        updateLocalizedBaseChatTitles()
         loadStoredMessages()
         cleanupMediaCache()
         buildUi()
@@ -750,7 +755,8 @@ class MainActivity : Activity() {
         startActivityForResult(intent, IMAGE_PICK_REQUEST)
     }
 
-    private fun openProfileAvatarPicker() {
+    private fun openProfileAvatarPicker(returnToProfile: Boolean = true) {
+        returnToProfileAfterAvatarPick = returnToProfile
         val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             Intent(MediaStore.ACTION_PICK_IMAGES).apply {
                 type = "image/*"
@@ -816,7 +822,9 @@ class MainActivity : Activity() {
                     cropped.recycle()
                     runCatching { chatAdapter.notifyDataSetChanged() }
                     dialog.dismiss()
-                    showOwnProfilePage()
+                    if (returnToProfileAfterAvatarPick) {
+                        showOwnProfilePage()
+                    }
                 }
             }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -835,15 +843,46 @@ class MainActivity : Activity() {
     }
 
     private fun decodeBitmapForAvatar(uri: Uri): Bitmap? {
+        return decodeBitmapFromUri(uri, maxDimension = 1600)
+    }
+
+    private fun decodeBitmapFromUri(uri: Uri, maxDimension: Int): Bitmap? {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             runCatching {
-                ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { decoder, _, _ ->
+                ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { decoder, info, _ ->
                     decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    val size = info.size
+                    val longest = maxOf(size.width, size.height)
+                    if (longest > maxDimension) {
+                        val scale = maxDimension.toFloat() / longest.toFloat()
+                        decoder.setTargetSize(
+                            (size.width * scale).toInt().coerceAtLeast(1),
+                            (size.height * scale).toInt().coerceAtLeast(1)
+                        )
+                    }
                 }
             }.getOrNull()
         } else {
-            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            contentResolver.openInputStream(uri)?.use {
+                BitmapFactory.decodeStream(it, null, bounds)
+            }
+            val sample = calculateBitmapSampleSize(bounds.outWidth, bounds.outHeight, maxDimension, maxDimension)
+            contentResolver.openInputStream(uri)?.use {
+                BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply {
+                    inSampleSize = sample
+                })
+            }
         }
+    }
+
+    private fun calculateBitmapSampleSize(width: Int, height: Int, targetWidth: Int, targetHeight: Int): Int {
+        if (width <= 0 || height <= 0) return 1
+        var sample = 1
+        while (width / (sample * 2) >= targetWidth || height / (sample * 2) >= targetHeight) {
+            sample *= 2
+        }
+        return sample.coerceAtLeast(1)
     }
 
     private fun showSelectedImageComposer(uri: Uri) {
@@ -871,7 +910,7 @@ class MainActivity : Activity() {
             addView(ImageView(this@MainActivity).apply {
                 adjustViewBounds = true
                 scaleType = ImageView.ScaleType.CENTER_CROP
-                setImageURI(uri)
+                setImageBitmap(decodeBitmapFromUri(uri, maxDimension = 1280))
                 background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
                 setPadding(dp(6), dp(6), dp(6), dp(6))
             }, LinearLayout.LayoutParams(
@@ -1231,6 +1270,7 @@ class MainActivity : Activity() {
     private fun showChatList() {
         syncKnownPeers()
         chatStore.ensureBaseChats()
+        updateLocalizedBaseChatTitles()
 
         val dialog = Dialog(this).apply {
             requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -1400,7 +1440,7 @@ class MainActivity : Activity() {
                     summary = summary,
                     onClick = {
                         val peerId = summary.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
-                        selectChat(summary.chatKey, summary.title, peerId)
+                        selectChat(summary.chatKey, summaryDisplayTitle(summary), peerId)
                         dialog.dismiss()
                     },
                     onLongClick = {
@@ -1915,7 +1955,7 @@ class MainActivity : Activity() {
             setBackgroundColor(CREAM_BACKGROUND)
         }
         root.addView(ZoomableImageView(this) { dialog.dismiss() }.apply {
-            setImageBitmap(BitmapFactory.decodeFile(imagePath))
+            setImageBitmap(decodeBitmapFileForPreview(imagePath))
             setBackgroundColor(Color.TRANSPARENT)
         }, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1930,6 +1970,19 @@ class MainActivity : Activity() {
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT
         )
+    }
+
+    private fun decodeBitmapFileForPreview(imagePath: String): Bitmap? {
+        val targetWidth = (resources.displayMetrics.widthPixels * 2).coerceAtLeast(1)
+        val targetHeight = (resources.displayMetrics.heightPixels * 2).coerceAtLeast(1)
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(imagePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            return BitmapFactory.decodeFile(imagePath)
+        }
+        return BitmapFactory.decodeFile(imagePath, BitmapFactory.Options().apply {
+            inSampleSize = calculateBitmapSampleSize(bounds.outWidth, bounds.outHeight, targetWidth, targetHeight)
+        })
     }
 
     private fun addMessage(
@@ -2267,11 +2320,14 @@ class MainActivity : Activity() {
 
     private fun rememberPeer(peerId: UUID, label: String) {
         val existing = chatStore.getPeer(peerId.toString())
+        val fingerprint = meshService?.getPeerFingerprint(peerId)
+            ?: existing?.fingerprint
+            ?: peerFingerprint(peerId)
         chatStore.upsertPeer(
             StoredPeer(
                 nodeId = peerId.toString(),
                 alias = label,
-                fingerprint = peerFingerprint(peerId),
+                fingerprint = fingerprint,
                 verified = existing?.verified == true,
                 lastSeen = System.currentTimeMillis()
             )
@@ -2550,7 +2606,9 @@ class MainActivity : Activity() {
         }
         val peerId = selectedRecipientId
         val storedPeer = peerId?.let { chatStore.getPeer(it.toString()) }
-        val fingerprint = peerId?.let { storedPeer?.fingerprint ?: peerFingerprint(it) }
+        val cryptoFingerprint = peerId?.let { meshService?.getPeerFingerprint(it) }
+        val safetyNumber = peerId?.let { meshService?.getPeerSafetyNumber(it) }
+        val fingerprint = peerId?.let { cryptoFingerprint ?: storedPeer?.fingerprint ?: peerFingerprint(it) }
         val verified = storedPeer?.verified == true
         val subtitle = when {
             savedMessagesSelected -> tr("private_local_chat_desc")
@@ -2599,6 +2657,18 @@ class MainActivity : Activity() {
                 bottomMargin = dp(10)
             })
             if (peerId != null && fingerprint != null) {
+                safetyNumber?.let { safety ->
+                    addView(terminalText(safety).apply {
+                        textSize = 17f
+                        typeface = Typeface.MONOSPACE
+                        gravity = Gravity.CENTER
+                        setTextColor(BERRY_TEXT)
+                        background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                        setPadding(dp(12), dp(12), dp(12), dp(12))
+                    }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                        bottomMargin = dp(10)
+                    })
+                }
                 addView(terminalText(fingerprint.chunked(4).joinToString(" ")).apply {
                     textSize = 18f
                     typeface = Typeface.MONOSPACE
@@ -2615,6 +2685,7 @@ class MainActivity : Activity() {
                     background = roundedDrawable(if (verified) 0x33FF4D6D else ACCENT_PINK, dp(18), SOFT_PINK_STROKE)
                     setOnClickListener {
                         rememberPeer(peerId, selectedRecipientLabel)
+                        meshService?.markPeerVerified(peerId)
                         chatStore.setPeerVerified(peerId.toString(), true)
                         Toast.makeText(this@MainActivity, tr("contact_verified"), Toast.LENGTH_SHORT).show()
                         dialog.dismiss()
@@ -2640,8 +2711,17 @@ class MainActivity : Activity() {
     }
 
     private fun showOwnProfilePage() {
+        ownProfileDialog?.takeIf { it.isShowing }?.dismiss()
         val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
+        ownProfileDialog = dialog
+        dialog.setOnDismissListener {
+            if (ownProfileDialog === dialog) {
+                ownProfileDialog = null
+            }
+        }
         val originalName = meshService?.getNickname()?.take(MAX_NICKNAME_LENGTH) ?: currentNickname
+        val originalNickname = originalName.prefixAt().take(MAX_NICKNAME_LENGTH)
+        val originalDisplayName = AppProfileStore.displayName(this).trim().take(24)
         val avatarPath = AppProfileStore.avatarPath(this)
         val originalInput = EditText(this).apply {
             setText(originalName)
@@ -2671,7 +2751,7 @@ class MainActivity : Activity() {
             }
         })
         val displayInput = EditText(this).apply {
-            setText(AppProfileStore.displayName(this@MainActivity))
+            setText(originalDisplayName)
             setSingleLine(true)
             typeface = Typeface.DEFAULT
             textSize = 16f
@@ -2682,98 +2762,157 @@ class MainActivity : Activity() {
             background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
             setPadding(dp(14), dp(10), dp(14), dp(10))
         }
+        val saveButton = terminalAction(tr("save")).apply {
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = roundedDrawable(STRAWBERRY_RED, dp(18))
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            visibility = View.GONE
+            setOnClickListener {
+                val previousNickname = currentNickname
+                val requestedNickname = originalInput.text?.toString()
+                    .orEmpty()
+                    .trim()
+                    .ifBlank { originalNickname }
+                    .prefixAt()
+                    .take(MAX_NICKNAME_LENGTH)
+                val nicknameChanged = requestedNickname != originalNickname
+                val service = meshService
+                val appliedNickname = if (!nicknameChanged) {
+                    previousNickname
+                } else if (service == null) {
+                    Toast.makeText(this@MainActivity, tr("nickname_change_online_only"), Toast.LENGTH_SHORT).show()
+                    previousNickname
+                } else {
+                    service.setNickname(requestedNickname).take(MAX_NICKNAME_LENGTH).also { display ->
+                        if (display != requestedNickname) {
+                            Toast.makeText(this@MainActivity, tr("nickname_change_once_week"), Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+                if (appliedNickname != previousNickname) {
+                    currentNickname = appliedNickname
+                    renameLocalMessages(previousNickname, appliedNickname)
+                }
+                AppProfileStore.setDisplayName(this@MainActivity, displayInput.text?.toString().orEmpty())
+                meshService?.refreshPublicDisplayName()
+                usernameField.setText(contactDisplayName())
+                Toast.makeText(this@MainActivity, tr("profile_updated"), Toast.LENGTH_SHORT).show()
+                dialog.dismiss()
+                showOwnProfilePage()
+            }
+        }
+
+        fun updateSaveVisibility() {
+            val requestedNickname = originalInput.text?.toString()
+                .orEmpty()
+                .trim()
+                .ifBlank { originalNickname }
+                .prefixAt()
+                .take(MAX_NICKNAME_LENGTH)
+            val requestedDisplayName = displayInput.text?.toString().orEmpty().trim().take(24)
+            saveButton.visibility =
+                if (requestedNickname != originalNickname || requestedDisplayName != originalDisplayName) {
+                    View.VISIBLE
+                } else {
+                    View.GONE
+                }
+        }
+        val profileChangeWatcher = object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = updateSaveVisibility()
+            override fun afterTextChanged(s: Editable?) = updateSaveVisibility()
+        }
+        originalInput.addTextChangedListener(profileChangeWatcher)
+        displayInput.addTextChangedListener(profileChangeWatcher)
+        updateSaveVisibility()
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(44), dp(20), dp(20))
             setBackgroundColor(CREAM_BACKGROUND)
 
-            addView(AvatarView(
-                context = this@MainActivity,
-                label = contactDisplayName(),
-                imagePath = avatarPath,
-                accentColor = avatarAccent(contactDisplayName()),
-                verified = false
-            ).apply {
-                setOnClickListener {
-                    dialog.dismiss()
-                    openProfileAvatarPicker()
-                }
-            }, LinearLayout.LayoutParams(dp(86), dp(86)).apply {
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(0, dp(4), 0, dp(18))
+                addView(AvatarView(
+                    context = this@MainActivity,
+                    label = contactDisplayName(),
+                    imagePath = avatarPath,
+                    accentColor = avatarAccent(contactDisplayName()),
+                    verified = false
+                ).apply {
+                    setOnClickListener {
+                        openProfileAvatarPicker(returnToProfile = true)
+                    }
+                }, LinearLayout.LayoutParams(dp(112), dp(112)).apply {
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    bottomMargin = dp(12)
+                })
+                addView(terminalText(contactDisplayName()).apply {
+                    textSize = 22f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(BERRY_TEXT)
+                    gravity = Gravity.CENTER
+                })
+                addView(terminalText(originalName).apply {
+                    textSize = 13f
+                    setTextColor(BERRY_TEXT_DIM)
+                    gravity = Gravity.CENTER
+                    setPadding(0, dp(5), 0, 0)
+                })
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                setPadding(dp(14), dp(12), dp(14), dp(14))
+
+                addView(displayInput.apply {
+                    hint = tr("display_name")
+                    background = roundedDrawable(Color.TRANSPARENT, dp(0))
+                    setPadding(dp(2), dp(8), dp(2), dp(8))
+                })
+                addView(View(this@MainActivity).apply {
+                    setBackgroundColor(SOFT_PINK_STROKE)
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(1)
+                ).apply {
+                    topMargin = dp(4)
+                    bottomMargin = dp(4)
+                })
+                addView(originalInput.apply {
+                    hint = "@nickname"
+                    background = roundedDrawable(Color.TRANSPARENT, dp(0))
+                    setPadding(dp(2), dp(8), dp(2), dp(8))
+                })
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
                 bottomMargin = dp(12)
             })
 
             addView(terminalAction(tr("change_photo")).apply {
-                textSize = 14f
+                textSize = 15f
                 gravity = Gravity.CENTER
                 setTextColor(STRAWBERRY_RED)
                 background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
-                setPadding(dp(14), dp(9), dp(14), dp(9))
-                setOnClickListener {
-                    dialog.dismiss()
-                    openProfileAvatarPicker()
-                }
-            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(16)
-            })
-
-            addView(terminalText(tr("profile")).apply {
-                textSize = 24f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(BERRY_TEXT)
-            })
-
-            addView(terminalText(tr("original_name_editable")).apply {
-                textSize = 12f
-                setTextColor(BERRY_TEXT_DIM)
-                setPadding(0, dp(16), 0, dp(6))
-            })
-            addView(originalInput)
-
-            addView(terminalText(tr("display_name_editable")).apply {
-                textSize = 12f
-                setTextColor(BERRY_TEXT_DIM)
-                setPadding(0, dp(14), 0, dp(6))
-            })
-            addView(displayInput)
-
-            addView(terminalAction(tr("save")).apply {
-                textSize = 16f
-                gravity = Gravity.CENTER
-                setTextColor(Color.WHITE)
-                background = roundedDrawable(STRAWBERRY_RED, dp(18))
                 setPadding(dp(14), dp(10), dp(14), dp(10))
                 setOnClickListener {
-                    val previousNickname = currentNickname
-                    val requestedNickname = originalInput.text?.toString()
-                        .orEmpty()
-                        .trim()
-                        .ifBlank { previousNickname }
-                        .prefixAt()
-                        .take(MAX_NICKNAME_LENGTH)
-                    val service = meshService
-                    val appliedNickname = if (service == null) {
-                        Toast.makeText(this@MainActivity, tr("nickname_change_online_only"), Toast.LENGTH_SHORT).show()
-                        previousNickname
-                    } else {
-                        service.setNickname(requestedNickname).take(MAX_NICKNAME_LENGTH).also { display ->
-                            if (display != requestedNickname) {
-                                Toast.makeText(this@MainActivity, tr("nickname_change_once_week"), Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                    }
-                    if (appliedNickname != previousNickname) {
-                        currentNickname = appliedNickname
-                        renameLocalMessages(previousNickname, appliedNickname)
-                    }
-                    AppProfileStore.setDisplayName(this@MainActivity, displayInput.text?.toString().orEmpty())
-                    usernameField.setText(contactDisplayName())
-                    Toast.makeText(this@MainActivity, tr("profile_updated"), Toast.LENGTH_SHORT).show()
-                    dialog.dismiss()
-                    showChatList()
+                    openProfileAvatarPicker(returnToProfile = true)
                 }
-            }, LinearLayout.LayoutParams(
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(12)
+            })
+
+            addView(saveButton, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply {
@@ -2821,6 +2960,7 @@ class MainActivity : Activity() {
         fun applySettingsNow(refreshMessages: Boolean = false, recreateUi: Boolean = false) {
             applyDateTimeFormat()
             saveUiSettings()
+            updateLocalizedBaseChatTitles()
             meshService?.configureNotificationSettings(
                 enabled = notificationEnabled,
                 showPreview = notificationPreviewEnabled,
@@ -2837,6 +2977,15 @@ class MainActivity : Activity() {
                 window.statusBarColor = CREAM_BACKGROUND
                 window.navigationBarColor = CREAM_BACKGROUND
             }
+        }
+
+        fun rebuildCurrentScreenText() {
+            applyThemePalette()
+            buildUi()
+            updateRecipientHint()
+            updateChatTitle()
+            refreshHeader()
+            runCatching { chatAdapter.notifyDataSetChanged() }
         }
 
         val root = LinearLayout(this).apply {
@@ -3122,6 +3271,7 @@ class MainActivity : Activity() {
             AppLanguage.entries.forEachIndexed { index, lang ->
                 val button = chatListBottomItem(lang.label, selectedLanguage == lang) { }
                 button.setOnClickListener {
+                    if (selectedLanguage == lang) return@setOnClickListener
                     selectedLanguage = lang
                     langButtons.forEach { (candidate, view) ->
                         if (candidate == lang) {
@@ -3133,6 +3283,9 @@ class MainActivity : Activity() {
                         }
                     }
                     applySettingsNow(recreateUi = true)
+                    rebuildCurrentScreenText()
+                    dialog.dismiss()
+                    showSettingsPage(group)
                 }
                 langButtons[lang] = button
                 langRow.addView(button, LinearLayout.LayoutParams(0, dp(44), 1f).apply {
@@ -3720,6 +3873,7 @@ class MainActivity : Activity() {
     private fun showConnectionDiagnostics() {
         val peers = meshService?.knownPeers().orEmpty()
         val diagnostics = meshService?.meshDiagnostics()
+        val transfers = meshService?.recentTransfers().orEmpty()
         val direct = peers.count { it.isDirect || it.hopCount <= 1 }
         val hops = peers.count { !(it.isDirect || it.hopCount <= 1) }
         val ratio = if (sentCounter <= 0) 0 else ((deliveredCounter * 100f) / sentCounter).toInt()
@@ -3740,9 +3894,21 @@ class MainActivity : Activity() {
                 append("${tr("diag_pending_delivery")}: ${snapshot.router.pendingMessageCount}\n")
                 append("${tr("diag_retry_ready")}: ${snapshot.router.retryReadyCount}\n")
                 append("${tr("diag_seen_cache")}: ${snapshot.router.seenMessageCount}\n")
+                append("Sync cache: ${snapshot.router.cachedPacketCount}\n")
                 append("${tr("diag_routes")}: ${snapshot.router.routeCount}\n")
                 append("${tr("diag_pending_handshake")}: ${snapshot.pendingHandshakeMessages}\n")
                 append("${tr("diag_incoming_files")}: ${snapshot.incomingFileTransfers}\n")
+            }
+            if (transfers.isNotEmpty()) {
+                append("Transfers:\n")
+                transfers.forEach { transfer ->
+                    val percent = if (transfer.totalBytes <= 0) {
+                        0
+                    } else {
+                        ((transfer.receivedBytes * 100f) / transfer.totalBytes).toInt().coerceIn(0, 100)
+                    }
+                    append("- ${transfer.status} $percent% ${transfer.fileName.take(32)}\n")
+                }
             }
             append("${tr("diag_last_relay")}: $lastRelayInfo")
         }
@@ -3935,6 +4101,15 @@ class MainActivity : Activity() {
 
     private fun tr(key: String): String = Translations.tr(selectedLanguage, key)
 
+    private fun updateLocalizedBaseChatTitles() {
+        if (!::chatStore.isInitialized) return
+        chatStore.ensureBaseChats()
+        chatStore.updateBaseChatTitles(
+            everyoneTitle = tr("everyone"),
+            savedTitle = tr("saved_messages")
+        )
+    }
+
     private fun contactDisplayName(): String {
         val display = AppProfileStore.displayName(this).trim()
         return display.ifBlank { currentNickname.removePrefix("@") }
@@ -4073,8 +4248,12 @@ class MainActivity : Activity() {
     }
 
     private fun summaryDisplayTitle(summary: ChatSummary): String {
-        val title = summary.title.toDisplayTitle()
-        return if (summary.kind == ChatKind.PEER.name) title.removePrefix("@") else title
+        return when (summary.kind) {
+            ChatKind.SAVED.name -> tr("saved_messages")
+            ChatKind.EVERYONE.name -> tr("everyone")
+            ChatKind.PEER.name -> summary.title.toDisplayTitle().removePrefix("@")
+            else -> summary.title.toDisplayTitle()
+        }
     }
 
     private fun summaryPresence(summary: ChatSummary): Pair<String, Boolean> {
@@ -5037,8 +5216,15 @@ class MainActivity : Activity() {
         if (bitmap == null || bitmap.width <= 0 || bitmap.height <= 0) {
             return (resources.displayMetrics.widthPixels * 0.58f).toInt() to dp(180)
         }
+        return calculateChatImageSize(bitmap.width, bitmap.height)
+    }
 
-        val aspect = bitmap.width.toFloat() / bitmap.height.toFloat()
+    private fun calculateChatImageSize(width: Int, height: Int): Pair<Int, Int> {
+        if (width <= 0 || height <= 0) {
+            return (resources.displayMetrics.widthPixels * 0.58f).toInt() to dp(180)
+        }
+
+        val aspect = width.toFloat() / height.toFloat()
         val maxWideWidth = (resources.displayMetrics.widthPixels * 0.58f).toInt()
         val maxPortraitHeight = dp(380)
         val maxLandscapeHeight = dp(220)

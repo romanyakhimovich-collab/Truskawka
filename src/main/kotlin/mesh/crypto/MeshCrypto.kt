@@ -494,6 +494,11 @@ class MeshCrypto(private val secureStorage: SecureKeyStorage) {
 
     fun getSessionInfo(nodeId: UUID): SessionInfo? = sessions[nodeId]
 
+    fun getSafetyNumber(nodeId: UUID): String? {
+        val session = sessions[nodeId] ?: return null
+        return computeSafetyNumber(identityKeyPair.public.encoded, session.peerIdentity)
+    }
+
     private fun loadTrustedPeers() {
         secureStorage.loadTrustedPeers()?.forEach { trustedPeers[it.fingerprint] = it }
     }

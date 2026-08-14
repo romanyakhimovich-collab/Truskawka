@@ -15,6 +15,7 @@ import mesh.routing.RouterDiagnostics
 import mesh.routing.TransportType
 import mesh.transport.BleServiceCallback
 import mesh.transport.BleTransportService
+import java.io.File
 import java.nio.ByteBuffer
 import java.util.*
 import java.util.Collections
@@ -49,7 +50,8 @@ class MeshManager(
     private val secureStorage: SecureKeyStorage,
     private val bleTransport: BleTransportService,
     private val wifiDirectTransport: OpportunisticPacketTransmitter? = null,
-    val localNodeId: UUID = UUID.randomUUID()
+    val localNodeId: UUID = UUID.randomUUID(),
+    private val transferStorageDir: File? = null
 ) : MessageHandler, BleServiceCallback {
 
     // Core components
@@ -76,6 +78,7 @@ class MeshManager(
     private val aliases = ConcurrentHashMap<UUID, String>()
     private val incomingFiles = ConcurrentHashMap<UUID, IncomingFileTransfer>()
     private val orphanFileChunks = ConcurrentHashMap<UUID, OrphanFileChunks>()
+    private val outgoingFiles = ConcurrentHashMap<UUID, OutgoingFileTransfer>()
     private val trackedMessageDeliveries = ConcurrentHashMap.newKeySet<UUID>()
     private var localAlias: String = "@${localNodeId.toString().take(8)}"
     private var maxRelayHops: Int = MeshPacket.DEFAULT_TTL.toInt()
@@ -86,6 +89,7 @@ class MeshManager(
     // Message listeners
     private var messageListener: ((senderId: UUID, message: String, timestamp: Long, isBroadcast: Boolean) -> Unit)? = null
     private var fileListener: ((senderId: UUID, fileName: String, mimeType: String, bytes: ByteArray, timestamp: Long, isBroadcast: Boolean) -> Unit)? = null
+    private var fileTransferProgressListener: ((FileTransferProgress) -> Unit)? = null
     private var peerListener: ((nodeId: UUID, event: PeerEvent) -> Unit)? = null
     private var messageStatusListener: ((messageId: UUID, status: MessageDeliveryStatus) -> Unit)? = null
     private var transportLogListener: ((message: String) -> Unit)? = null
@@ -108,6 +112,7 @@ class MeshManager(
         bleTransport.setRouter(router)
         bleTransport.setCallback(this)
         bleTransport.initialize()
+        restorePersistedFileTransfers()
     }
 
     fun onWifiDirectPacketReceived(packet: MeshPacket) {
@@ -138,6 +143,11 @@ class MeshManager(
         executor.scheduleAtFixedRate(
             { retryPendingMessages() },
             10, 10, TimeUnit.SECONDS
+        )
+
+        executor.scheduleAtFixedRate(
+            { requestMissingFileChunks() },
+            3, 3, TimeUnit.SECONDS
         )
     }
 
@@ -202,7 +212,7 @@ class MeshManager(
         fileName: String,
         mimeType: String,
         bytes: ByteArray,
-        onProgress: ((sentChunks: Int, totalChunks: Int) -> Unit)? = null
+        onProgress: ((FileTransferProgress) -> Unit)? = null
     ): SendResult {
         if (bytes.isEmpty()) return SendResult.Failed("Image is empty")
         if (bytes.size > MAX_IMAGE_BYTES) return SendResult.Failed("Image is too large")
@@ -218,6 +228,17 @@ class MeshManager(
         val safeMime = mimeType.take(64).ifBlank { "image/*" }
         val nameBytes = safeName.toByteArray(Charsets.UTF_8)
         val mimeBytes = safeMime.toByteArray(Charsets.UTF_8)
+        outgoingFiles[transferId] = OutgoingFileTransfer(
+            recipientId = target,
+            fileName = safeName,
+            mimeType = safeMime,
+            totalBytes = bytes.size,
+            chunks = chunks,
+            createdAt = System.currentTimeMillis(),
+            isBroadcast = target == MeshPacket.BROADCAST_ID
+        )
+        persistOutgoingFileTransfer(transferId, outgoingFiles[transferId]!!)
+        cleanupOutgoingFiles()
 
         val metaPayload = ByteBuffer.allocate(
             4 + 16 + 4 + 4 + 4 + 2 + 2 + mimeBytes.size + nameBytes.size
@@ -237,7 +258,20 @@ class MeshManager(
         if (!sendFilePacket(PacketType.FILE_META, target, metaPayload)) {
             return SendResult.Failed("Failed to send file metadata")
         }
-        onProgress?.invoke(0, chunks.size)
+        onProgress?.invoke(
+            FileTransferProgress(
+                transferId = transferId,
+                sentChunks = 0,
+                totalChunks = chunks.size,
+                totalBytes = bytes.size,
+                fileName = safeName,
+                mimeType = safeMime,
+                recipientId = target,
+                isBroadcast = target == MeshPacket.BROADCAST_ID,
+                direction = TransferDirection.OUTGOING,
+                status = TransferStatus.ACTIVE
+            )
+        )
         chunks.forEachIndexed { index, chunk ->
             val chunkPayload = ByteBuffer.allocate(4 + 16 + 4 + 4 + chunk.size)
                 .put(FILE_CHUNK_MAGIC)
@@ -250,7 +284,20 @@ class MeshManager(
             if (!sendFilePacket(PacketType.FILE_CHUNK, target, chunkPayload)) {
                 return SendResult.Failed("Failed to send file chunk ${index + 1}/${chunks.size}")
             }
-            onProgress?.invoke(index + 1, chunks.size)
+            onProgress?.invoke(
+                FileTransferProgress(
+                    transferId = transferId,
+                    sentChunks = index + 1,
+                    totalChunks = chunks.size,
+                    totalBytes = bytes.size,
+                    fileName = safeName,
+                    mimeType = safeMime,
+                    recipientId = target,
+                    isBroadcast = target == MeshPacket.BROADCAST_ID,
+                    direction = TransferDirection.OUTGOING,
+                    status = if (index + 1 >= chunks.size) TransferStatus.COMPLETED else TransferStatus.ACTIVE
+                )
+            )
         }
         return SendResult.Sent(transferId)
     }
@@ -400,6 +447,7 @@ class MeshManager(
             PacketType.MESSAGE -> handleIncomingMessage(packet)
             PacketType.FILE_META -> handleIncomingFileMeta(packet)
             PacketType.FILE_CHUNK -> handleIncomingFileChunk(packet)
+            PacketType.FILE_CHUNK_REQUEST -> handleIncomingFileChunkRequest(packet)
             else -> true /* Handled by router */
         }
     }
@@ -430,15 +478,19 @@ class MeshManager(
                 timestamp = packet.timestamp,
                 isBroadcast = packet.isBroadcast()
             )
+            persistIncomingFileMeta(transferId, incomingFiles[transferId]!!)
             orphanFileChunks.remove(transferId)?.let { orphan ->
                 val transfer = incomingFiles[transferId] ?: return@let
                 orphan.chunks.forEachIndexed { index, chunk ->
                     if (index in transfer.chunks.indices && chunk != null) {
                         transfer.chunks[index] = chunk
+                        persistIncomingFileChunk(transferId, index, chunk)
                     }
                 }
                 completeFileTransferIfReady(transferId, transfer)
             }
+            notifyIncomingFileProgress(transferId, incomingFiles[transferId] ?: return@runCatching true)
+            requestMissingFileChunks(transferId)
             true
         }.getOrDefault(false)
 
@@ -461,8 +513,13 @@ class MeshManager(
             require(index in transfer.chunks.indices)
             require(chunk.size <= FILE_CHUNK_SIZE)
             transfer.chunks[index] = chunk
+            persistIncomingFileChunk(transferId, index, chunk)
 
+            notifyIncomingFileProgress(transferId, transfer)
             completeFileTransferIfReady(transferId, transfer)
+            if (incomingFiles.containsKey(transferId)) {
+                requestMissingFileChunks(transferId)
+            }
             true
         }.getOrDefault(false)
 
@@ -481,6 +538,43 @@ class MeshManager(
         orphan.chunks[index] = chunk
     }
 
+    private fun handleIncomingFileChunkRequest(packet: MeshPacket): Boolean =
+        runCatching {
+            val payload = decodeChunkRequestPayload(packet) ?: return@runCatching false
+            val buffer = ByteBuffer.wrap(payload)
+            val magic = ByteArray(4).also { buffer.get(it) }
+            require(magic.contentEquals(FILE_CHUNK_REQUEST_MAGIC))
+            val transferId = UUID(buffer.long, buffer.long)
+            val totalChunks = buffer.int
+            val requestedCount = buffer.short.toInt() and 0xFFFF
+            require(requestedCount in 1..MAX_CHUNK_REQUEST_INDEXES)
+            val outgoing = outgoingFiles[transferId] ?: return@runCatching true
+            require(totalChunks == outgoing.chunks.size)
+            if (!outgoing.isBroadcast && packet.senderId != outgoing.recipientId) {
+                return@runCatching false
+            }
+            repeat(requestedCount) {
+                val index = buffer.int
+                if (index in outgoing.chunks.indices) {
+                    resendFileChunk(transferId, index, outgoing)
+                }
+            }
+            true
+        }.getOrDefault(false)
+
+    private fun resendFileChunk(transferId: UUID, index: Int, outgoing: OutgoingFileTransfer) {
+        val chunk = outgoing.chunks[index]
+        val chunkPayload = ByteBuffer.allocate(4 + 16 + 4 + 4 + chunk.size)
+            .put(FILE_CHUNK_MAGIC)
+            .putLong(transferId.mostSignificantBits)
+            .putLong(transferId.leastSignificantBits)
+            .putInt(index)
+            .putInt(outgoing.chunks.size)
+            .put(chunk)
+            .array()
+        sendFilePacket(PacketType.FILE_CHUNK, outgoing.recipientId, chunkPayload)
+    }
+
     private fun completeFileTransferIfReady(transferId: UUID, transfer: IncomingFileTransfer) {
         if (transfer.chunks.any { it == null }) return
         val bytes = ByteArray(transfer.totalBytes)
@@ -496,6 +590,21 @@ class MeshManager(
         }
         if (offset == transfer.totalBytes) {
             incomingFiles.remove(transferId)
+            deleteTransferDirectory("incoming", transferId)
+            notifyFileProgress(
+                FileTransferProgress(
+                    transferId = transferId,
+                    sentChunks = transfer.chunks.size,
+                    totalChunks = transfer.chunks.size,
+                    totalBytes = transfer.totalBytes,
+                    fileName = transfer.fileName,
+                    mimeType = transfer.mimeType,
+                    recipientId = transfer.senderId,
+                    isBroadcast = transfer.isBroadcast,
+                    direction = TransferDirection.INCOMING,
+                    status = TransferStatus.COMPLETED
+                )
+            )
             fileListener?.invoke(
                 transfer.senderId,
                 transfer.fileName,
@@ -512,9 +621,226 @@ class MeshManager(
         orphanFileChunks.entries.removeIf { now - it.value.createdAt > FILE_TRANSFER_TIMEOUT_MS }
     }
 
+    private fun cleanupOutgoingFiles() {
+        val now = System.currentTimeMillis()
+        outgoingFiles.entries.removeIf { now - it.value.createdAt > FILE_TRANSFER_TIMEOUT_MS }
+        transferStorageDir?.resolve("outgoing")?.listFiles()?.forEach { dir ->
+            if (now - dir.lastModified() > FILE_TRANSFER_TIMEOUT_MS) {
+                dir.deleteRecursively()
+            }
+        }
+    }
+
+    private fun requestMissingFileChunks() {
+        incomingFiles.keys.forEach(::requestMissingFileChunks)
+        cleanupOrphanFileChunks()
+        cleanupOutgoingFiles()
+    }
+
+    private fun requestMissingFileChunks(transferId: UUID) {
+        val transfer = incomingFiles[transferId] ?: return
+        val now = System.currentTimeMillis()
+        if (now - transfer.lastChunkRequestAt < FILE_CHUNK_REQUEST_INTERVAL_MS) return
+        val missing = transfer.chunks
+            .mapIndexedNotNull { index, chunk -> if (chunk == null) index else null }
+            .take(MAX_CHUNK_REQUEST_INDEXES)
+        if (missing.isEmpty()) return
+        if (sendFileChunkRequest(transferId, transfer, missing)) {
+            transfer.lastChunkRequestAt = now
+        }
+    }
+
+    private fun sendFileChunkRequest(
+        transferId: UUID,
+        transfer: IncomingFileTransfer,
+        missingIndexes: List<Int>
+    ): Boolean {
+        val payload = ByteBuffer.allocate(4 + 16 + 4 + 2 + missingIndexes.size * 4)
+            .put(FILE_CHUNK_REQUEST_MAGIC)
+            .putLong(transferId.mostSignificantBits)
+            .putLong(transferId.leastSignificantBits)
+            .putInt(transfer.chunks.size)
+            .putShort(missingIndexes.size.toShort())
+            .also { buffer -> missingIndexes.forEach(buffer::putInt) }
+            .array()
+
+        if (transfer.isBroadcast) {
+            val packet = MeshPacket(
+                type = PacketType.FILE_CHUNK_REQUEST,
+                flags = PacketFlags(isEncrypted = false),
+                ttl = maxRelayHops.toByte(),
+                messageId = UUID.randomUUID(),
+                senderId = localNodeId,
+                recipientId = transfer.senderId,
+                timestamp = System.currentTimeMillis(),
+                payload = payload,
+                signature = crypto.sign(payload)
+            )
+            combinedTransmitter.sendTo(transfer.senderId, packet)
+            return true
+        } else {
+            return sendFilePacket(PacketType.FILE_CHUNK_REQUEST, transfer.senderId, payload)
+        }
+    }
+
+    private fun notifyIncomingFileProgress(transferId: UUID, transfer: IncomingFileTransfer) {
+        val receivedChunks = transfer.chunks.count { it != null }
+        notifyFileProgress(
+            FileTransferProgress(
+                transferId = transferId,
+                sentChunks = receivedChunks,
+                totalChunks = transfer.chunks.size,
+                totalBytes = transfer.totalBytes,
+                fileName = transfer.fileName,
+                mimeType = transfer.mimeType,
+                recipientId = transfer.senderId,
+                isBroadcast = transfer.isBroadcast,
+                direction = TransferDirection.INCOMING,
+                status = TransferStatus.ACTIVE
+            )
+        )
+    }
+
+    private fun notifyFileProgress(progress: FileTransferProgress) {
+        fileTransferProgressListener?.invoke(progress)
+    }
+
+    private fun restorePersistedFileTransfers() {
+        restoreIncomingFileTransfers()
+        restoreOutgoingFileTransfers()
+    }
+
+    private fun restoreIncomingFileTransfers() {
+        val root = transferStorageDir?.resolve("incoming") ?: return
+        root.listFiles()?.filter { it.isDirectory }?.forEach { dir ->
+            val meta = loadTransferMeta(dir) ?: return@forEach
+            val transferId = runCatching { UUID.fromString(dir.name) }.getOrNull() ?: return@forEach
+            val senderId = runCatching { UUID.fromString(meta.getProperty("senderId")) }.getOrNull() ?: return@forEach
+            val chunkCount = meta.getProperty("chunkCount")?.toIntOrNull() ?: return@forEach
+            val chunks = arrayOfNulls<ByteArray>(chunkCount)
+            dir.resolve("chunks").listFiles()?.forEach { file ->
+                val index = file.name.toIntOrNull() ?: return@forEach
+                if (index in chunks.indices) {
+                    chunks[index] = runCatching { file.readBytes() }.getOrNull()
+                }
+            }
+            val transfer = IncomingFileTransfer(
+                senderId = senderId,
+                fileName = meta.getProperty("fileName", "file.bin"),
+                mimeType = meta.getProperty("mimeType", "application/octet-stream"),
+                totalBytes = meta.getProperty("totalBytes")?.toIntOrNull() ?: return@forEach,
+                chunks = chunks,
+                timestamp = meta.getProperty("timestamp")?.toLongOrNull() ?: System.currentTimeMillis(),
+                isBroadcast = meta.getProperty("isBroadcast").toBoolean()
+            )
+            incomingFiles[transferId] = transfer
+            notifyIncomingFileProgress(transferId, transfer)
+            completeFileTransferIfReady(transferId, transfer)
+            if (incomingFiles.containsKey(transferId)) {
+                requestMissingFileChunks(transferId)
+            }
+        }
+    }
+
+    private fun restoreOutgoingFileTransfers() {
+        val root = transferStorageDir?.resolve("outgoing") ?: return
+        root.listFiles()?.filter { it.isDirectory }?.forEach { dir ->
+            val meta = loadTransferMeta(dir) ?: return@forEach
+            val transferId = runCatching { UUID.fromString(dir.name) }.getOrNull() ?: return@forEach
+            val recipientId = runCatching { UUID.fromString(meta.getProperty("recipientId")) }.getOrNull() ?: return@forEach
+            val chunkCount = meta.getProperty("chunkCount")?.toIntOrNull() ?: return@forEach
+            val chunks = (0 until chunkCount).map { index ->
+                val chunk = dir.resolve("chunks").resolve(index.toString())
+                if (!chunk.exists()) return@forEach
+                chunk.readBytes()
+            }
+            outgoingFiles[transferId] = OutgoingFileTransfer(
+                recipientId = recipientId,
+                fileName = meta.getProperty("fileName", "file.bin"),
+                mimeType = meta.getProperty("mimeType", "application/octet-stream"),
+                totalBytes = meta.getProperty("totalBytes")?.toIntOrNull() ?: return@forEach,
+                chunks = chunks,
+                createdAt = meta.getProperty("createdAt")?.toLongOrNull() ?: System.currentTimeMillis(),
+                isBroadcast = meta.getProperty("isBroadcast").toBoolean()
+            )
+        }
+    }
+
+    private fun persistIncomingFileMeta(transferId: UUID, transfer: IncomingFileTransfer) {
+        val dir = transferDirectory("incoming", transferId) ?: return
+        saveTransferMeta(
+            dir,
+            Properties().apply {
+                setProperty("senderId", transfer.senderId.toString())
+                setProperty("fileName", transfer.fileName)
+                setProperty("mimeType", transfer.mimeType)
+                setProperty("totalBytes", transfer.totalBytes.toString())
+                setProperty("chunkCount", transfer.chunks.size.toString())
+                setProperty("timestamp", transfer.timestamp.toString())
+                setProperty("isBroadcast", transfer.isBroadcast.toString())
+            }
+        )
+    }
+
+    private fun persistIncomingFileChunk(transferId: UUID, index: Int, chunk: ByteArray) {
+        val dir = transferDirectory("incoming", transferId)?.resolve("chunks") ?: return
+        dir.mkdirs()
+        dir.resolve(index.toString()).writeBytes(chunk)
+    }
+
+    private fun persistOutgoingFileTransfer(transferId: UUID, transfer: OutgoingFileTransfer) {
+        val dir = transferDirectory("outgoing", transferId) ?: return
+        saveTransferMeta(
+            dir,
+            Properties().apply {
+                setProperty("recipientId", transfer.recipientId.toString())
+                setProperty("fileName", transfer.fileName)
+                setProperty("mimeType", transfer.mimeType)
+                setProperty("totalBytes", transfer.totalBytes.toString())
+                setProperty("chunkCount", transfer.chunks.size.toString())
+                setProperty("createdAt", transfer.createdAt.toString())
+                setProperty("isBroadcast", transfer.isBroadcast.toString())
+            }
+        )
+        val chunksDir = dir.resolve("chunks").apply { mkdirs() }
+        transfer.chunks.forEachIndexed { index, chunk ->
+            chunksDir.resolve(index.toString()).writeBytes(chunk)
+        }
+    }
+
+    private fun transferDirectory(kind: String, transferId: UUID): File? =
+        transferStorageDir?.resolve(kind)?.resolve(transferId.toString())?.apply { mkdirs() }
+
+    private fun deleteTransferDirectory(kind: String, transferId: UUID) {
+        transferStorageDir?.resolve(kind)?.resolve(transferId.toString())?.deleteRecursively()
+    }
+
+    private fun saveTransferMeta(dir: File, properties: Properties) {
+        dir.mkdirs()
+        dir.resolve("meta.properties").outputStream().use { properties.store(it, null) }
+    }
+
+    private fun loadTransferMeta(dir: File): Properties? {
+        val file = dir.resolve("meta.properties")
+        if (!file.exists()) return null
+        return runCatching {
+            Properties().apply {
+                file.inputStream().use(::load)
+            }
+        }.getOrNull()
+    }
+
     private fun decodeFilePayload(packet: MeshPacket): ByteArray? {
         if (!packet.isBroadcast() && !packet.flags.isEncrypted) {
             return null
+        }
+        return decodeMessagePayload(packet)
+    }
+
+    private fun decodeChunkRequestPayload(packet: MeshPacket): ByteArray? {
+        if (!packet.flags.isEncrypted) {
+            if (!verifyOptionalPublicSignature(packet)) return null
+            return packet.payload
         }
         return decodeMessagePayload(packet)
     }
@@ -634,6 +960,7 @@ class MeshManager(
 
                 // Notify peer listener
                 peerListener?.invoke(nodeId, PeerEvent.SESSION_ESTABLISHED)
+                requestMissingFileChunks()
             }
             is HandshakeResult.Failed -> {
                 // Log failure
@@ -652,6 +979,7 @@ class MeshManager(
                 val snapshot = if (queued != null) synchronized(queued) { queued.toList() } else emptyList()
                 snapshot.forEach { pending -> sendEncryptedMessage(nodeId, pending.payload) }
                 pendingOutbox.remove(nodeId)
+                requestMissingFileChunks()
             }
             is HandshakeResult.Failed -> {
                 // Log failure
@@ -729,6 +1057,10 @@ class MeshManager(
         this.fileListener = listener
     }
 
+    fun setFileTransferProgressListener(listener: (FileTransferProgress) -> Unit) {
+        this.fileTransferProgressListener = listener
+    }
+
     fun setPeerListener(listener: (nodeId: UUID, event: PeerEvent) -> Unit) {
         this.peerListener = listener
     }
@@ -763,6 +1095,7 @@ class MeshManager(
                 retryReadyCount = 0,
                 seenMessageCount = 0,
                 routeCount = 0,
+                cachedPacketCount = 0,
                 maxRelayHops = maxRelayHops
             )
         }
@@ -789,6 +1122,10 @@ class MeshManager(
         ?: "@${nodeId.toString().take(8)}"
 
     fun getLocalFingerprint(): String = crypto.getIdentityFingerprint()
+
+    fun getPeerFingerprint(nodeId: UUID): String? = crypto.getSessionInfo(nodeId)?.peerFingerprint
+
+    fun getPeerSafetyNumber(nodeId: UUID): String? = crypto.getSafetyNumber(nodeId)
 
     fun markPeerAsVerified(nodeId: UUID) {
         crypto.getSessionInfo(nodeId)?.peerFingerprint?.let {
@@ -851,12 +1188,23 @@ data class IncomingFileTransfer(
     val totalBytes: Int,
     val chunks: Array<ByteArray?>,
     val timestamp: Long,
-    val isBroadcast: Boolean
+    val isBroadcast: Boolean,
+    var lastChunkRequestAt: Long = 0L
 )
 
 data class OrphanFileChunks(
     val chunks: Array<ByteArray?>,
     val createdAt: Long
+)
+
+data class OutgoingFileTransfer(
+    val recipientId: UUID,
+    val fileName: String,
+    val mimeType: String,
+    val totalBytes: Int,
+    val chunks: List<ByteArray>,
+    val createdAt: Long,
+    val isBroadcast: Boolean
 )
 
 data class MeshDiagnostics(
@@ -868,6 +1216,30 @@ data class MeshDiagnostics(
     val maxRelayHops: Int,
     val router: RouterDiagnostics
 )
+
+data class FileTransferProgress(
+    val transferId: UUID,
+    val sentChunks: Int,
+    val totalChunks: Int,
+    val totalBytes: Int,
+    val fileName: String,
+    val mimeType: String,
+    val recipientId: UUID,
+    val isBroadcast: Boolean,
+    val direction: TransferDirection = TransferDirection.OUTGOING,
+    val status: TransferStatus = TransferStatus.ACTIVE
+)
+
+enum class TransferDirection {
+    OUTGOING,
+    INCOMING
+}
+
+enum class TransferStatus {
+    ACTIVE,
+    COMPLETED,
+    FAILED
+}
 
 enum class PeerEvent {
     DISCOVERED,
@@ -890,10 +1262,13 @@ sealed class SendResult {
 
 private val FILE_META_MAGIC = byteArrayOf('I'.code.toByte(), 'M'.code.toByte(), 'G'.code.toByte(), '1'.code.toByte())
 private val FILE_CHUNK_MAGIC = byteArrayOf('I'.code.toByte(), 'M'.code.toByte(), 'C'.code.toByte(), '1'.code.toByte())
+private val FILE_CHUNK_REQUEST_MAGIC = byteArrayOf('I'.code.toByte(), 'M'.code.toByte(), 'R'.code.toByte(), '1'.code.toByte())
 private const val FILE_CHUNK_SIZE = 384
 private const val MAX_IMAGE_BYTES = 2 * 1024 * 1024
 private const val MAX_IMAGE_CHUNKS = 6000
 private const val FILE_TRANSFER_TIMEOUT_MS = 10 * 60 * 1000L
+private const val FILE_CHUNK_REQUEST_INTERVAL_MS = 2_500L
+private const val MAX_CHUNK_REQUEST_INDEXES = 96
 private const val KNOWN_PEER_MAX_AGE_MS = 60_000L
 private const val MAX_PENDING_OUTBOX_PER_PEER = 96
 

@@ -288,6 +288,41 @@ class MeshRouterTest {
         assertEquals(emptyList(), handler.readReceipts)
     }
 
+    @Test
+    fun `epidemic sync requests and replays cached packets`() {
+        val nodeA = UUID.randomUUID()
+        val nodeB = UUID.randomUUID()
+        val transmitterA = RecordingTransmitter()
+        val transmitterB = RecordingTransmitter()
+        val routerA = MeshRouter(nodeA, RecordingHandler(authentic = true), transmitterA)
+        val routerB = MeshRouter(nodeB, RecordingHandler(authentic = true), transmitterB)
+
+        val messageId = routerA.sendMessage(
+            recipientId = UUID.randomUUID(),
+            payload = byteArrayOf(7, 8, 9),
+            signature = byteArrayOf(4),
+            requiresAck = true
+        )
+
+        routerA.onNeighborDiscovered(nodeB)
+        val summary = transmitterA.directSends
+            .map { it.second }
+            .single { it.type == PacketType.SYNC_SUMMARY }
+
+        routerB.onPacketReceived(summary, rssi = -35, sourceInterface = TransportType.WIFI_DIRECT)
+        val request = transmitterB.directSends
+            .map { it.second }
+            .single { it.type == PacketType.SYNC_REQUEST }
+
+        routerA.onPacketReceived(request, rssi = -35, sourceInterface = TransportType.WIFI_DIRECT)
+
+        assertTrue(
+            transmitterA.directSends.any { (_, packet) ->
+                packet.messageId == messageId && packet.type == PacketType.MESSAGE
+            }
+        )
+    }
+
     private class RecordingHandler(
         private val authentic: Boolean
     ) : MessageHandler {

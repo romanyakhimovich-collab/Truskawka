@@ -150,9 +150,12 @@ enum class PacketType(val value: Byte) {
     READ_RECEIPT(0x12),    // Message read receipt
     FILE_META(0x20),       // File transfer metadata
     FILE_CHUNK(0x21),      // File data chunk
+    FILE_CHUNK_REQUEST(0x22), // Request missing chunks for a transfer
     ROUTE_REQ(0x30),       // Route request (AODV)
     ROUTE_REP(0x31),       // Route reply (AODV)
     ROUTE_ERR(0x32),       // Route error
+    SYNC_SUMMARY(0x33),    // Epidemic sync summary of cached packet IDs
+    SYNC_REQUEST(0x34),    // Epidemic sync request for missing cached packets
     HEARTBEAT(0x40);       // Keep-alive ping
 
     companion object {

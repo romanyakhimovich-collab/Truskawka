@@ -48,8 +48,11 @@ import java.util.Calendar
                     })
                 }
                 if (item.imagePath != null) {
-                    val bitmap = BitmapFactory.decodeFile(item.imagePath)
-                    val imageSize = delegate.calculateChatImageSize(bitmap)
+                    val bounds = imageBounds(item.imagePath)
+                    val imageSize = bounds
+                        ?.let { delegate.calculateChatImageSize(it.first, it.second) }
+                        ?: delegate.calculateChatImageSize(null)
+                    val bitmap = decodeSampledFile(item.imagePath, imageSize.first, imageSize.second)
                     val image = BorderedImageView(context, IMAGE_BORDER).apply {
                         setImageBitmap(bitmap)
                         adjustViewBounds = false
@@ -309,6 +312,30 @@ import java.util.Calendar
             }
         }
     }
+
+private fun imageBounds(path: String): Pair<Int, Int>? {
+    val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, options)
+    return if (options.outWidth > 0 && options.outHeight > 0) {
+        options.outWidth to options.outHeight
+    } else {
+        null
+    }
+}
+
+private fun decodeSampledFile(path: String, targetWidth: Int, targetHeight: Int): android.graphics.Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return BitmapFactory.decodeFile(path)
+
+    var sample = 1
+    while (bounds.outWidth / (sample * 2) >= targetWidth && bounds.outHeight / (sample * 2) >= targetHeight) {
+        sample *= 2
+    }
+    return BitmapFactory.decodeFile(path, BitmapFactory.Options().apply {
+        inSampleSize = sample.coerceAtLeast(1)
+    })
+}
 
 private fun Calendar.isSameDay(other: Calendar): Boolean =
     get(Calendar.YEAR) == other.get(Calendar.YEAR) &&
