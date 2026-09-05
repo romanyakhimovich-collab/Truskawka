@@ -249,7 +249,7 @@ class MainActivity : Activity() {
             syncKnownPeers()
             refreshHeader()
             addMessage("system", "service connected", false)
-            if (meshService?.hasStoredNickname() == false) {
+            if (!AppProfileStore.hasCompletedProfile(this@MainActivity)) {
                 showInitialNicknameDialog()
             }
         }
@@ -422,7 +422,7 @@ class MainActivity : Activity() {
                 setHintTextColor(BERRY_TEXT_DIM)
                 setBackgroundColor(Color.TRANSPARENT)
                 inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
-                filters = arrayOf(InputFilter.LengthFilter(MAX_NICKNAME_LENGTH))
+                filters = arrayOf(InputFilter.LengthFilter(24))
                 minWidth = dp(130)
                 setPadding(dp(2), dp(4), dp(4), dp(4))
                 isFocusable = false
@@ -579,8 +579,22 @@ class MainActivity : Activity() {
             setCanceledOnTouchOutside(false)
         }
 
+        val displayInput = EditText(this).apply {
+            setText(AppProfileStore.displayName(this@MainActivity).trim().take(24))
+            setSingleLine(true)
+            typeface = Typeface.DEFAULT
+            textSize = 18f
+            setTextColor(BERRY_TEXT)
+            setHintTextColor(BERRY_TEXT_DIM)
+            hint = tr("display_name")
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
+            filters = arrayOf(InputFilter.LengthFilter(24))
+            background = roundedDrawable(INPUT_SURFACE, dp(22), PINK_SHADOW_STROKE)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+        }
+
         val input = EditText(this).apply {
-            setText("@")
+            setText(currentNickname.prefixAt().take(MAX_NICKNAME_LENGTH))
             setSingleLine(true)
             typeface = Typeface.MONOSPACE
             textSize = 18f
@@ -617,15 +631,23 @@ class MainActivity : Activity() {
             setPadding(dp(18), dp(12), dp(18), dp(12))
             setOnClickListener {
                 val requested = input.text.toString().trim().prefixAt().take(MAX_NICKNAME_LENGTH)
+                val displayName = displayInput.text?.toString().orEmpty().trim().take(24)
                 if (requested.length < 2) {
                     Toast.makeText(this@MainActivity, tr("choose_nickname"), Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                if (displayName.isBlank()) {
+                    Toast.makeText(this@MainActivity, tr("choose_display_name"), Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
 
                 val previous = currentNickname
                 val display = service.setNickname(requested).take(MAX_NICKNAME_LENGTH)
                 currentNickname = display
-                usernameField.setText(display)
+                AppProfileStore.setDisplayName(this@MainActivity, displayName)
+                AppProfileStore.markProfileComplete(this@MainActivity)
+                meshService?.refreshPublicDisplayName()
+                usernameField.setText(contactDisplayName())
                 usernameField.setSelection(usernameField.text.length)
                 if (previous != display) {
                     renameLocalMessages(previous, display)
@@ -662,7 +684,14 @@ class MainActivity : Activity() {
                 setPadding(dp(6), 0, dp(6), dp(18))
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-            addView(input, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(displayInput, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+            addView(input, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(10)
+            })
 
             addView(terminalText(tr("nickname_rules")).apply {
                 textSize = 12f
@@ -689,11 +718,11 @@ class MainActivity : Activity() {
         dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
         dialog.show()
         dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
-        input.post {
-            input.requestFocus()
-            input.setSelection(input.text.length)
+        displayInput.post {
+            displayInput.requestFocus()
+            displayInput.setSelection(displayInput.text.length)
             (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
-                .showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+                .showSoftInput(displayInput, InputMethodManager.SHOW_IMPLICIT)
         }
     }
 
@@ -2777,6 +2806,11 @@ class MainActivity : Activity() {
                     .ifBlank { originalNickname }
                     .prefixAt()
                     .take(MAX_NICKNAME_LENGTH)
+                val requestedDisplayName = displayInput.text?.toString().orEmpty().trim().take(24)
+                if (requestedDisplayName.isBlank()) {
+                    Toast.makeText(this@MainActivity, tr("choose_display_name"), Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
                 val nicknameChanged = requestedNickname != originalNickname
                 val service = meshService
                 val appliedNickname = if (!nicknameChanged) {
@@ -2795,7 +2829,8 @@ class MainActivity : Activity() {
                     currentNickname = appliedNickname
                     renameLocalMessages(previousNickname, appliedNickname)
                 }
-                AppProfileStore.setDisplayName(this@MainActivity, displayInput.text?.toString().orEmpty())
+                AppProfileStore.setDisplayName(this@MainActivity, requestedDisplayName)
+                AppProfileStore.markProfileComplete(this@MainActivity)
                 meshService?.refreshPublicDisplayName()
                 usernameField.setText(contactDisplayName())
                 Toast.makeText(this@MainActivity, tr("profile_updated"), Toast.LENGTH_SHORT).show()

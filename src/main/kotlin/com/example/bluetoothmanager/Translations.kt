@@ -10,6 +10,7 @@ object Translations {
     )
 
     private val entries = listOf(
+        Entry("choose_display_name", "Choose a display name", "Choose a display name", "Choose a display name", "Choose a display name"),
         Entry("chats", "Chats", "Чаты", "Czaty", "Chats"),
         Entry("new_contacts", "New contacts", "Новые контакты", "Nowe kontakty", "Contactos nuevos"),
         Entry("contacts", "Contacts", "Контакты", "Kontakty", "Contactos"),

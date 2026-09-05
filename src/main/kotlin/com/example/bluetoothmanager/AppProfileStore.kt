@@ -7,8 +7,10 @@ import java.io.File
 
 object AppProfileStore {
     private const val PREFS = "bitchat_profile"
+    private const val KEY_NICKNAME = "nickname"
     private const val KEY_DISPLAY_NAME = "display_name"
     private const val KEY_AVATAR_PATH = "avatar_path"
+    private const val KEY_PROFILE_COMPLETE = "profile_complete"
 
     fun displayName(context: Context): String =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -19,6 +21,20 @@ object AppProfileStore {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_DISPLAY_NAME, value.trim().take(24))
+            .apply()
+    }
+
+    fun hasCompletedProfile(context: Context): Boolean {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        return prefs.getBoolean(KEY_PROFILE_COMPLETE, false) &&
+            prefs.getString(KEY_NICKNAME, "").orEmpty().isNotBlank() &&
+            prefs.getString(KEY_DISPLAY_NAME, "").orEmpty().isNotBlank()
+    }
+
+    fun markProfileComplete(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_PROFILE_COMPLETE, true)
             .apply()
     }
 
