@@ -140,11 +140,17 @@ class MeshNetworkService : Service() {
         }
         meshManager.setFileTransferProgressListener(::persistTransferProgress)
         meshManager.setPeerListener { nodeId, event ->
+            if (event == PeerEvent.KEY_CHANGED) {
+                // Parsed by MainActivity: "key changed: <alias>|<nodeId>"
+                publish("key changed: ${meshManager.getAlias(nodeId)}|$nodeId")
+                return@setPeerListener
+            }
             val label = when (event) {
                 PeerEvent.DISCOVERED -> "discovered"
                 PeerEvent.SESSION_ESTABLISHED -> "secure session"
                 PeerEvent.DISCONNECTED -> "disconnected"
                 PeerEvent.VERIFIED -> "verified"
+                PeerEvent.KEY_CHANGED -> "key changed"
             }
             publish("$label: ${meshManager.getAlias(nodeId)}")
             publish("peer counter: ${peerCount()}")
@@ -205,6 +211,13 @@ class MeshNetworkService : Service() {
     fun markPeerVerified(peerId: UUID) {
         meshManager.markPeerAsVerified(peerId)
     }
+
+    fun hasPendingKeyChange(peerId: UUID): Boolean = meshManager.hasPendingKeyChange(peerId)
+
+    fun acceptKeyChange(peerId: UUID, verified: Boolean = false): Boolean =
+        meshManager.acceptKeyChange(peerId, verified)
+
+    fun getPendingKeyFingerprint(peerId: UUID): String? = meshManager.getPendingKeyFingerprint(peerId)
 
     fun recentTransfers(): List<StoredTransfer> = chatStore.listRecentTransfers()
 

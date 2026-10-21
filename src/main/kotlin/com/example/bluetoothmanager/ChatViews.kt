@@ -125,7 +125,7 @@ class AvatarView(
     private val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         textAlign = Paint.Align.CENTER
-        isFakeBoldText = true
+        typeface = AppFonts.bold
     }
     private val bitmap: Bitmap? by lazy {
         imagePath

@@ -57,6 +57,8 @@ import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.BaseAdapter
 import android.widget.CheckBox
+import android.widget.CompoundButton
+import android.widget.Switch
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.FrameLayout
@@ -267,6 +269,8 @@ class MainActivity : Activity() {
             } else if (line.startsWith("message failed:")) {
                 failedCounter += 1
                 updateMessageStatus(line.substringAfter(":").trim(), MessageStatus.FAILED)
+            } else if (line.startsWith("key changed:")) {
+                handlePeerKeyChanged(line.substringAfter("key changed:").trim())
             } else if (!line.isScanNoise()) {
                 if (line.contains("relay", ignoreCase = true) || line.contains("wifi-direct", ignoreCase = true)) {
                     lastRelayInfo = line
@@ -309,6 +313,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AppFonts.init(this)
         loadUiSettings()
         applyDateTimeFormat()
         applyThemePalette()
@@ -438,7 +443,7 @@ class MainActivity : Activity() {
             ))
             addView(terminalAction("X").apply {
                 textSize = 14f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setOnClickListener { clearReplyTarget() }
             })
         }
@@ -455,7 +460,7 @@ class MainActivity : Activity() {
             }
             topRow.addView(terminalAction("←").apply {
                 textSize = 24f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 gravity = Gravity.CENTER
                 setTextColor(BERRY_TEXT)
                 includeFontPadding = false
@@ -471,7 +476,7 @@ class MainActivity : Activity() {
             chatHeaderAvatarSlot = FrameLayout(this@MainActivity)
             chatTitleView = terminalText(selectedRecipientLabel.toDisplayTitle()).apply {
                 textSize = 18f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT)
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.END
@@ -526,7 +531,7 @@ class MainActivity : Activity() {
                 visibility = View.GONE
                 setText(contactDisplayName())
                 setSingleLine(true)
-                typeface = Typeface.DEFAULT
+                typeface = AppFonts.regular
                 textSize = 14f
                 setTextColor(BERRY_TEXT_DIM)
                 setHintTextColor(BERRY_TEXT_DIM)
@@ -576,7 +581,7 @@ class MainActivity : Activity() {
             })
             selectionCountView = terminalText("").apply {
                 textSize = 18f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT)
                 gravity = Gravity.CENTER_VERTICAL
                 maxLines = 1
@@ -718,7 +723,7 @@ class MainActivity : Activity() {
                 setSingleLine(false)
                 maxLines = 4
                 setHorizontallyScrolling(false)
-                typeface = Typeface.DEFAULT
+                typeface = AppFonts.regular
                 textSize = 16f
                 setTextColor(BERRY_TEXT)
                 setHintTextColor(BERRY_TEXT_DIM)
@@ -758,7 +763,7 @@ class MainActivity : Activity() {
             }
             recordingTimerView = terminalText("0:00,0").apply {
                 textSize = 17f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT)
                 maxLines = 1
             }
@@ -918,7 +923,7 @@ class MainActivity : Activity() {
         val displayInput = EditText(this).apply {
             setText(AppProfileStore.displayName(this@MainActivity).trim().take(24))
             setSingleLine(true)
-            typeface = Typeface.DEFAULT
+            typeface = AppFonts.regular
             textSize = 18f
             setTextColor(BERRY_TEXT)
             setHintTextColor(BERRY_TEXT_DIM)
@@ -932,7 +937,7 @@ class MainActivity : Activity() {
         val input = EditText(this).apply {
             setText(currentNickname.prefixAt().take(MAX_NICKNAME_LENGTH))
             setSingleLine(true)
-            typeface = Typeface.MONOSPACE
+            typeface = AppFonts.regular
             textSize = 18f
             setTextColor(BERRY_TEXT)
             setHintTextColor(BERRY_TEXT_DIM)
@@ -1007,7 +1012,7 @@ class MainActivity : Activity() {
 
             addView(terminalText(tr("welcome_truskawka")).apply {
                 textSize = 22f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 gravity = Gravity.CENTER
                 setTextColor(BERRY_TEXT)
                 setPadding(0, dp(16), 0, dp(6))
@@ -1167,7 +1172,7 @@ class MainActivity : Activity() {
             setBackgroundColor(CREAM_BACKGROUND)
             addView(terminalText(tr("adjust_profile_photo")).apply {
                 textSize = 22f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT)
             })
             addView(terminalText(tr("adjust_profile_photo_desc")).apply {
@@ -1262,7 +1267,7 @@ class MainActivity : Activity() {
             hint = tr("add_caption")
             setSingleLine(false)
             maxLines = 3
-            typeface = Typeface.DEFAULT
+            typeface = AppFonts.regular
             textSize = 15f
             setTextColor(BERRY_TEXT)
             setHintTextColor(BERRY_TEXT_DIM)
@@ -1275,7 +1280,7 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(18), dp(12), dp(12))
             addView(terminalText(tr("preview_image")).apply {
                 textSize = 16f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT)
             })
             // The frame draws the border; the photo inside fills it (CENTER_CROP) and is clipped
@@ -1696,7 +1701,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             addView(terminalText(tr("chats")).apply {
                 textSize = 22f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT)
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
@@ -1755,7 +1760,7 @@ class MainActivity : Activity() {
                 setPadding(dp(14), dp(14), dp(14), dp(14))
                 addView(terminalText(tr("quick_start_title")).apply {
                     textSize = 15f
-                    typeface = Typeface.DEFAULT_BOLD
+                    typeface = AppFonts.bold
                     setTextColor(BERRY_TEXT)
                 })
                 addView(terminalText("1. ${tr("quick_start_step_1")}").apply {
@@ -1806,7 +1811,7 @@ class MainActivity : Activity() {
                 setPadding(dp(18), dp(18), dp(18), dp(18))
                 addView(terminalText(tr("empty_chats_title")).apply {
                     textSize = 17f
-                    typeface = Typeface.DEFAULT_BOLD
+                    typeface = AppFonts.bold
                     setTextColor(BERRY_TEXT)
                     gravity = Gravity.CENTER
                 })
@@ -1818,7 +1823,7 @@ class MainActivity : Activity() {
                 })
                 addView(terminalAction(tr("find_people_nearby")).apply {
                     textSize = 14f
-                    typeface = Typeface.DEFAULT_BOLD
+                    typeface = AppFonts.bold
                     gravity = Gravity.CENTER
                     setTextColor(Color.WHITE)
                     background = roundedDrawable(STRAWBERRY_RED, dp(18))
@@ -1878,7 +1883,7 @@ class MainActivity : Activity() {
         terminalText(title).apply {
             gravity = Gravity.CENTER
             textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = AppFonts.bold
             setTextColor(if (selected) Color.WHITE else BERRY_TEXT_DIM)
             background = roundedDrawable(if (selected) STRAWBERRY_RED else Color.TRANSPARENT, dp(12))
             setOnClickListener { onClick() }
@@ -1958,14 +1963,14 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.VERTICAL
                 addView(terminalText(displayTitle).apply {
                     textSize = if (compact) 15f else 16f
-                    typeface = Typeface.DEFAULT_BOLD
+                    typeface = AppFonts.bold
                     setTextColor(BERRY_TEXT)
                     maxLines = 1
                 })
                 if (summary.pinned) {
                     addView(terminalText(tr("pinned")).apply {
                         textSize = if (compact) 10f else 11f
-                        typeface = Typeface.DEFAULT_BOLD
+                        typeface = AppFonts.bold
                         setTextColor(STRAWBERRY_RED)
                         setPadding(0, dp(2), 0, 0)
                     })
@@ -1979,7 +1984,7 @@ class MainActivity : Activity() {
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(terminalText(presence.first).apply {
                 textSize = if (compact) 10f else 11f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(if (presence.second) LEAF_GREEN else BERRY_TEXT_DIM)
                 background = roundedDrawable(if (presence.second) 0x1F14947A else SERVICE_BUBBLE, dp(10), SERVICE_BUBBLE_STROKE)
                 setPadding(dp(8), dp(3), dp(8), dp(3))
@@ -2005,7 +2010,7 @@ class MainActivity : Activity() {
     private fun nearbyCountCell(label: String, count: String, accent: Int): TextView =
         terminalText("$label\n$count").apply {
             textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = AppFonts.bold
             gravity = Gravity.CENTER
             setTextColor(accent)
             minHeight = dp(58)
@@ -2026,6 +2031,9 @@ class MainActivity : Activity() {
         return palette[index]
     }
 
+    private enum class NearbyFilter { ALL, DIRECT, RELAY }
+
+    /** Find people: status of the radio, search by @tag, filter by distance, person cards. */
     private fun showMeshPanel(scanFirst: Boolean) {
         val count = if (scanFirst) {
             meshService?.searchPeople() ?: 0
@@ -2038,178 +2046,262 @@ class MainActivity : Activity() {
         val dialog = Dialog(this).apply {
             requestWindowFeature(Window.FEATURE_NO_TITLE)
         }
+        var filter = NearbyFilter.ALL
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(18), dp(18), dp(18))
-            setBackgroundColor(SOFT_PINK_PANEL)
+            setPadding(dp(16), dp(18), dp(16), dp(16))
+            setBackgroundColor(CREAM_BACKGROUND)
         }
 
-        val nearbyTitle = terminalText(tr("nearby_people")).apply {
-            textSize = 20f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(BERRY_TEXT)
-        }
-        val transportStatus = terminalText(meshService?.meshTransportStatus() ?: tr("mesh_starting")).apply {
-            textSize = 12f
-            setTextColor(BERRY_TEXT_DIM)
-            setPadding(0, 0, 0, dp(10))
-        }
-        lateinit var directCountView: TextView
-        lateinit var relayCountView: TextView
-        val nearbyStatusPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            addView(LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                directCountView = nearbyCountCell(tr("nearby_direct_count"), "0", LEAF_GREEN)
-                relayCountView = nearbyCountCell(tr("nearby_relay_count"), "0", STRAWBERRY_RED)
-                addView(directCountView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    marginEnd = dp(6)
-                })
-                addView(relayCountView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    marginStart = dp(6)
-                })
-            })
-            addView(terminalText(tr("nearby_status_desc")).apply {
-                textSize = 12f
-                setTextColor(BERRY_TEXT_DIM)
-                setPadding(0, dp(10), 0, 0)
-            })
-        }
-        val peopleContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        val searchInput = EditText(this).apply {
-            hint = tr("search_in_patch")
-            setSingleLine(true)
-            typeface = Typeface.DEFAULT
-            textSize = 14f
-            setTextColor(BERRY_TEXT)
-            setHintTextColor(BERRY_TEXT_DIM)
-            background = roundedDrawable(INPUT_SURFACE, dp(20), SOFT_PINK_STROKE)
-            setPadding(dp(14), dp(9), dp(14), dp(9))
-        }
-        fun refreshPeopleRows() {
-            val peerCount = meshService?.peerCount() ?: 0
-            transportStatus.text = meshService?.meshTransportStatus() ?: tr("mesh_starting")
-            counterView.text = peerCount.toString()
-            peopleContainer.removeAllViews()
-
-            val query = searchInput.text?.toString().orEmpty().trim().lowercase(Locale.getDefault())
-            val existingPeerIds = chatStore.listChats()
-                .filter { it.kind == ChatKind.PEER.name && it.messageCount > 0 }
-                .mapNotNull { it.peerId?.let { id -> runCatching { UUID.fromString(id) }.getOrNull() } }
-                .toSet()
-            val peers = meshService?.knownPeers().orEmpty().filter { peer ->
-                val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
-                (query.isBlank() || label.lowercase(Locale.getDefault()).contains(query)) &&
-                    !existingPeerIds.contains(peer.nodeId)
-            }
-            val directPeers = peers.filter { it.isDirect || it.hopCount <= 1 }
-            val meshPeers = peers.filterNot { it.isDirect || it.hopCount <= 1 }
-                .filter { it.hopCount <= meshMaxHops }
-            directCountView.text = "${tr("nearby_direct_count")}\n${directPeers.size}"
-            relayCountView.text = "${tr("nearby_relay_count")}\n${meshPeers.size}"
-
-            peopleContainer.addView(terminalText("${tr("direct_in_range")} (${directPeers.size})").apply {
-                textSize = 13f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(BERRY_TEXT)
-                setPadding(0, 0, 0, dp(8))
-            })
-            if (directPeers.isEmpty()) {
-                peopleContainer.addView(terminalText(if (query.isBlank()) tr("no_direct_peers") else tr("no_direct_matches")).apply {
-                    textSize = 14f
-                    setTextColor(BERRY_TEXT_DIM)
-                    setPadding(0, 0, 0, dp(8))
-                })
-            } else {
-                directPeers.forEach { peer ->
-                    val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
-                    val stored = chatStore.getPeer(peer.nodeId.toString())
-                    val verified = stored?.verified == true
-                    val subtitle = listOfNotNull(
-                        tr("direct_ble"),
-                        if (verified) tr("verified") else null,
-                        stored?.let { formatPeerPresence(it.lastSeen) } ?: tr("online_now")
-                    ).joinToString(" / ")
-                    peopleContainer.addView(patchPeerRow(label, subtitle, !savedMessagesSelected && selectedRecipientId == peer.nodeId) {
-                        rememberPeer(peer.nodeId, label)
-                        meshService?.prepareChatWith(peer.nodeId.toString())
-                        selectChat(peerChatKey(peer.nodeId), label, peer.nodeId)
-                        dialog.dismiss()
-                    }, LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT
-                    ).apply { bottomMargin = dp(8) })
-                }
-            }
-
-            peopleContainer.addView(terminalText("${tr("reachable_via_hops")} (${meshPeers.size})").apply {
-                textSize = 13f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(BERRY_TEXT)
-                setPadding(0, dp(6), 0, dp(8))
-            })
-            if (meshPeers.isEmpty()) {
-                peopleContainer.addView(terminalText(if (query.isBlank()) tr("no_multihop_routes") else tr("no_hop_matches")).apply {
-                    textSize = 14f
-                    setTextColor(BERRY_TEXT_DIM)
-                })
-            } else {
-                meshPeers.forEach { peer ->
-                    val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
-                    val hops = peer.hopCount.coerceAtLeast(2)
-                    val subtitle = "${tr("via")} $hops ${tr("hops")} / ${formatPeerPresence(peer.lastSeen)}"
-                    peopleContainer.addView(patchPeerRow(label, subtitle, !savedMessagesSelected && selectedRecipientId == peer.nodeId) {
-                        rememberPeer(peer.nodeId, label)
-                        meshService?.prepareChatWith(peer.nodeId.toString())
-                        selectChat(peerChatKey(peer.nodeId), label, peer.nodeId)
-                        dialog.dismiss()
-                    })
-                }
-            }
-        }
-
-        val header = LinearLayout(this).apply {
+        // --- Header: title + rescan button -------------------------------------------------
+        root.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(nearbyTitle, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(terminalText(tr("nearby_people")).apply {
+                textSize = 26f
+                typeface = AppFonts.bold
+                setTextColor(BERRY_TEXT)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(View(this@MainActivity).apply {
+                background = circleDrawable(INPUT_SURFACE).apply { setStroke(dp(1), SOFT_PINK_STROKE) }
+                foreground = ChatIconDrawable(ChatIcon.REFRESH, BERRY_TEXT, resources.displayMetrics.density)
+                elevation = dp(2).toFloat()
+                contentDescription = tr("nearby_scan_again")
+                isClickable = true
+                setOnClickListener {
+                    triggerMeshScan()
+                    Toast.makeText(this@MainActivity, tr("status_searching_nearby"), Toast.LENGTH_SHORT).show()
+                }
+            }, LinearLayout.LayoutParams(dp(46), dp(46)))
+        })
+
+        // --- Radio status line ----------------------------------------------------------------
+        val statusDot = PulseDotView(this, LEAF_GREEN)
+        val statusText = terminalText("").apply {
+            textSize = 14f
+            setTextColor(BERRY_TEXT_DIM)
+            maxLines = 2
         }
-        root.addView(header)
-        root.addView(transportStatus)
-        root.addView(nearbyStatusPanel, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply {
+        val statusAction = terminalAction(tr("nearby_turn_on")).apply {
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            background = roundedDrawable(STRAWBERRY_RED, dp(14))
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            visibility = View.GONE
+            setOnClickListener {
+                runCatching { startActivity(Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)) }
+            }
+        }
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(2), dp(4), 0, dp(12))
+            addView(statusDot, LinearLayout.LayoutParams(dp(9), dp(9)).apply { marginEnd = dp(8) })
+            addView(statusText, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(statusAction)
+        })
+
+        // --- Search by @tag ---------------------------------------------------------------------
+        val searchInput = EditText(this).apply {
+            hint = tr("nearby_search_hint")
+            setSingleLine(true)
+            typeface = AppFonts.regular
+            textSize = 16f
+            setTextColor(BERRY_TEXT)
+            setHintTextColor(BERRY_TEXT_DIM)
+            background = null
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            setPadding(dp(4), dp(12), dp(12), dp(12))
+        }
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = roundedDrawable(INPUT_SURFACE, dp(26), SOFT_PINK_STROKE)
+            elevation = dp(2).toFloat()
+            setPadding(dp(18), 0, dp(6), 0)
+            // Fixed "@" prefix makes it obvious that people are found by their tag.
+            addView(terminalText("@").apply {
+                textSize = 18f
+                typeface = AppFonts.bold
+                setTextColor(STRAWBERRY_RED)
+            })
+            addView(searchInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             bottomMargin = dp(12)
         })
 
-        val contentScroll = ScrollView(this).apply {
-            isFillViewport = true
+        // --- Distance filter chips -----------------------------------------------------------
+        val chipViews = mutableMapOf<NearbyFilter, TextView>()
+        lateinit var refreshPeopleRows: () -> Unit
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            NearbyFilter.entries.forEach { option ->
+                val chip = terminalAction("").apply {
+                    textSize = 14f
+                    gravity = Gravity.CENTER
+                    setPadding(dp(14), dp(8), dp(14), dp(8))
+                    setOnClickListener {
+                        filter = option
+                        refreshPeopleRows()
+                    }
+                }
+                chipViews[option] = chip
+                addView(chip, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { marginEnd = dp(8) })
+            }
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(12)
+        })
+
+        // --- Results --------------------------------------------------------------------------
+        val peopleContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        // Kept alive and only shown/hidden, so the radar animation isn't restarted by the
+        // periodic refresh below.
+        val emptyTitle = terminalText("")
+        val emptyState = nearbyEmptyState(emptyTitle) {
+            triggerMeshScan()
+            Toast.makeText(this@MainActivity, tr("status_searching_nearby"), Toast.LENGTH_SHORT).show()
         }
-        val contentContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(searchInput, LinearLayout.LayoutParams(
+        root.addView(ScrollView(this).apply {
+            isFillViewport = true
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(emptyState)
+                addView(peopleContainer)
+            }, ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                bottomMargin = dp(10)
-            })
-            addView(peopleContainer)
+            ))
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        fun openChatWith(peerId: UUID, label: String) {
+            rememberPeer(peerId, label)
+            meshService?.prepareChatWith(peerId.toString())
+            selectChat(peerChatKey(peerId), label, peerId)
+            dialog.dismiss()
         }
-        contentScroll.addView(contentContainer, ViewGroup.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ))
-        root.addView(contentScroll, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            0,
-            1f
-        ))
+
+        fun sectionTitle(text: String): TextView = terminalText(text).apply {
+            textSize = 13f
+            typeface = AppFonts.bold
+            setTextColor(BERRY_TEXT_DIM)
+            setPadding(dp(4), dp(4), 0, dp(8))
+        }
+
+        refreshPeopleRows = refresh@{
+            transportStatus(statusDot, statusText, statusAction)
+            counterView.text = (meshService?.peerCount() ?: 0).toString()
+            peopleContainer.removeAllViews()
+
+            val query = searchInput.text?.toString().orEmpty().trim()
+                .removePrefix("@").lowercase(Locale.getDefault())
+            val chatPeerIds = chatStore.listChats()
+                .filter { it.kind == ChatKind.PEER.name && it.messageCount > 0 }
+                .mapNotNull { it.peerId?.let { id -> runCatching { UUID.fromString(id) }.getOrNull() } }
+                .toSet()
+            fun matches(tag: String, nodeId: UUID?) = query.isBlank() ||
+                tag.removePrefix("@").lowercase(Locale.getDefault()).contains(query) ||
+                (nodeId != null && nodeId.toString().startsWith(query))
+
+            val nearby = meshService?.knownPeers().orEmpty()
+                .filter { it.hopCount <= meshMaxHops || it.isDirect }
+                .filter { matches(it.displayName ?: "", it.nodeId) }
+            val isDirect = { peer: mesh.PeerInfo -> peer.isDirect || peer.hopCount <= 1 }
+            val directCount = nearby.count(isDirect)
+            val relayCount = nearby.size - directCount
+            chipViews.forEach { (option, chip) ->
+                val (label, value) = when (option) {
+                    NearbyFilter.ALL -> tr("nearby_filter_all") to nearby.size
+                    NearbyFilter.DIRECT -> tr("nearby_filter_direct") to directCount
+                    NearbyFilter.RELAY -> tr("nearby_filter_relay") to relayCount
+                }
+                val active = option == filter
+                chip.text = "$label  $value"
+                chip.setTextColor(if (active) Color.WHITE else BERRY_TEXT)
+                chip.background = if (active) {
+                    roundedDrawable(STRAWBERRY_RED, dp(18))
+                } else {
+                    roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                }
+            }
+
+            // Closest first: direct Bluetooth, then by hop count, then most recently seen.
+            val shown = nearby
+                .filter {
+                    when (filter) {
+                        NearbyFilter.ALL -> true
+                        NearbyFilter.DIRECT -> isDirect(it)
+                        NearbyFilter.RELAY -> !isDirect(it)
+                    }
+                }
+                .sortedWith(compareBy<mesh.PeerInfo>({ if (isDirect(it)) 0 else 1 }, { it.hopCount }).thenByDescending { it.lastSeen })
+
+            // Saved contacts that match the tag but aren't in range right now.
+            val nearbyIds = nearby.map { it.nodeId }.toSet()
+            val offlineContacts = if (query.isBlank()) emptyList() else chatStore.listChats()
+                .filter { it.kind == ChatKind.PEER.name }
+                .mapNotNull { summary ->
+                    val id = summary.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() } ?: return@mapNotNull null
+                    if (id in nearbyIds) return@mapNotNull null
+                    val title = summaryDisplayTitle(summary)
+                    if (!matches(title, id)) null else id to title
+                }
+
+            val nothingFound = shown.isEmpty() && offlineContacts.isEmpty()
+            emptyState.visibility = if (nothingFound) View.VISIBLE else View.GONE
+            if (nothingFound) {
+                emptyTitle.text = if (query.isBlank()) tr("nearby_empty_title") else tr("nearby_no_matches").format(query)
+                return@refresh
+            }
+            if (shown.isNotEmpty()) {
+                peopleContainer.addView(sectionTitle(tr("nearby_people").uppercase(Locale.getDefault())))
+                shown.forEach { peer ->
+                    val tag = (peer.displayName ?: "@${peer.nodeId.toString().take(8)}").prefixAt()
+                    val signal = if (isDirect(peer)) {
+                        tr("nearby_signal_direct")
+                    } else {
+                        tr("nearby_signal_relay").format(peer.hopCount.coerceAtLeast(2) - 1)
+                    }
+                    val subtitle = listOfNotNull(
+                        signal,
+                        tr("nearby_has_chat").takeIf { peer.nodeId in chatPeerIds }
+                    ).joinToString(" · ")
+                    peopleContainer.addView(
+                        nearbyPersonRow(
+                            tag = tag,
+                            subtitle = subtitle,
+                            dotColor = if (isDirect(peer)) LEAF_GREEN else STRAWBERRY_RED,
+                            verified = chatStore.getPeer(peer.nodeId.toString())?.verified == true
+                        ) { openChatWith(peer.nodeId, tag) },
+                        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                            bottomMargin = dp(8)
+                        }
+                    )
+                }
+            }
+            if (offlineContacts.isNotEmpty()) {
+                peopleContainer.addView(sectionTitle(tr("nearby_section_contacts").uppercase(Locale.getDefault())).apply {
+                    setPadding(dp(4), dp(10), 0, dp(8))
+                })
+                offlineContacts.forEach { (id, title) ->
+                    val stored = chatStore.getPeer(id.toString())
+                    peopleContainer.addView(
+                        nearbyPersonRow(
+                            tag = title.prefixAt(),
+                            subtitle = "${tr("last_seen_prefix")} ${formatPeerPresence(stored?.lastSeen ?: 0L)}",
+                            dotColor = BERRY_TEXT_DIM,
+                            verified = stored?.verified == true
+                        ) { openChatWith(id, title) },
+                        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                            bottomMargin = dp(8)
+                        }
+                    )
+                }
+            }
+        }
 
         searchInput.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
@@ -2266,6 +2358,121 @@ class MainActivity : Activity() {
         mainHandler.postDelayed(panelRefresh, 1_200)
     }
 
+    /** Updates the radio status line: Bluetooth off / mesh starting / searching / found N. */
+    private fun transportStatus(dot: PulseDotView, text: TextView, action: TextView) {
+        val bluetoothOn = runCatching {
+            getSystemService(BluetoothManager::class.java)?.adapter?.isEnabled == true
+        }.getOrDefault(false)
+        val found = meshService?.peerCount() ?: 0
+        when {
+            !bluetoothOn -> {
+                dot.setColor(STRAWBERRY_RED)
+                dot.pulsing = false
+                text.text = tr("nearby_bt_off")
+                action.visibility = View.VISIBLE
+            }
+            meshService == null -> {
+                dot.setColor(BERRY_TEXT_DIM)
+                dot.pulsing = true
+                text.text = tr("mesh_starting")
+                action.visibility = View.GONE
+            }
+            else -> {
+                dot.setColor(LEAF_GREEN)
+                dot.pulsing = true
+                text.text = if (found > 0) {
+                    "${tr("nearby_searching")} · ${tr("nearby_found_count").format(found)}"
+                } else {
+                    tr("nearby_searching")
+                }
+                action.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun nearbyPersonRow(
+        tag: String,
+        subtitle: String,
+        dotColor: Int,
+        verified: Boolean,
+        onClick: () -> Unit
+    ): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        background = roundedDrawable(INPUT_SURFACE, dp(22), SOFT_PINK_STROKE)
+        setPadding(dp(12), dp(10), dp(10), dp(10))
+        addView(AvatarView(
+            context = this@MainActivity,
+            label = tag,
+            imagePath = null,
+            accentColor = avatarAccent(tag),
+            verified = verified
+        ), LinearLayout.LayoutParams(dp(46), dp(46)).apply { marginEnd = dp(12) })
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(terminalText(tag).apply {
+                textSize = 16f
+                typeface = AppFonts.bold
+                setTextColor(BERRY_TEXT)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(3), 0, 0)
+                addView(View(this@MainActivity).apply {
+                    background = circleDrawable(dotColor)
+                }, LinearLayout.LayoutParams(dp(7), dp(7)).apply { marginEnd = dp(6) })
+                addView(terminalText(subtitle).apply {
+                    textSize = 13f
+                    setTextColor(BERRY_TEXT_DIM)
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                })
+            })
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        addView(terminalAction(tr("nearby_write")).apply {
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            background = roundedDrawable(STRAWBERRY_RED, dp(16))
+            setPadding(dp(14), dp(7), dp(14), dp(7))
+            setOnClickListener { onClick() }
+        })
+        setOnClickListener { onClick() }
+    }
+
+    /** Empty state: animated radar + what to check; [title] is updated by the caller. */
+    private fun nearbyEmptyState(title: TextView, onRescan: () -> Unit): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER_HORIZONTAL
+        visibility = View.GONE
+        setPadding(dp(16), dp(12), dp(16), dp(12))
+        addView(NearbyRadarView(this@MainActivity, STRAWBERRY_RED), LinearLayout.LayoutParams(dp(170), dp(170)).apply {
+            bottomMargin = dp(12)
+        })
+        addView(title.apply {
+            textSize = 18f
+            typeface = AppFonts.bold
+            setTextColor(BERRY_TEXT)
+            gravity = Gravity.CENTER
+        })
+        addView(terminalText(tr("nearby_empty_tips")).apply {
+            textSize = 14f
+            setTextColor(BERRY_TEXT_DIM)
+            gravity = Gravity.CENTER
+            setLineSpacing(dp(2).toFloat(), 1f)
+            setPadding(0, dp(8), 0, dp(14))
+        })
+        addView(terminalAction(tr("nearby_scan_again")).apply {
+            textSize = 14f
+            setTextColor(STRAWBERRY_RED)
+            background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+            setPadding(dp(18), dp(9), dp(18), dp(9))
+            setOnClickListener { onRescan() }
+        })
+    }
+
     private fun patchPeerRow(
         title: String,
         subtitle: String,
@@ -2289,7 +2496,7 @@ class MainActivity : Activity() {
             background = roundedDrawable(SOFT_PINK_PANEL, dp(24), SOFT_PINK_STROKE)
             addView(terminalText(tr("grow")).apply {
                 textSize = 24f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT)
             })
             addView(terminalText(tr("grow_desc")).apply {
@@ -2759,9 +2966,10 @@ class MainActivity : Activity() {
 
     private fun rememberPeer(peerId: UUID, label: String) {
         val existing = chatStore.getPeer(peerId.toString())
+        // Only real key fingerprints are stored; empty until a secure session exists.
         val fingerprint = meshService?.getPeerFingerprint(peerId)
-            ?: existing?.fingerprint
-            ?: peerFingerprint(peerId)
+            ?: existing?.fingerprint?.takeIf { it != peerFingerprint(peerId) }
+            ?: ""
         chatStore.upsertPeer(
             StoredPeer(
                 nodeId = peerId.toString(),
@@ -3053,7 +3261,7 @@ class MainActivity : Activity() {
             background = roundedDrawable(SOFT_PINK_PANEL, dp(22), SOFT_PINK_STROKE)
             addView(terminalText(tr("identity_qr")).apply {
                 textSize = 21f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 gravity = Gravity.CENTER
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             if (qrBitmap != null) {
@@ -3116,11 +3324,21 @@ class MainActivity : Activity() {
             Toast.makeText(this, tr("identity_qr_wrong_peer"), Toast.LENGTH_SHORT).show()
             return
         }
-        // Compare only against a real key fingerprint. Never fall back to peerFingerprint():
-        // it is derived from the public node id, so anyone could forge a matching QR.
-        val expected = (meshService?.getPeerFingerprint(targetPeerId)
-            ?: chatStore.getPeer(targetPeerId.toString())?.fingerprint)
-            ?.filter { it.isLetterOrDigit() }
+        fun normalized(value: String) = value.filter { it.isLetterOrDigit() }
+        // The contact's key changed and is waiting for approval: a matching QR proves the
+        // new key really is theirs, so accept it as verified.
+        val pendingNewKey = meshService?.getPendingKeyFingerprint(targetPeerId)
+        if (pendingNewKey != null) {
+            if (!scanned.fingerprint.equals(normalized(pendingNewKey), ignoreCase = true)) {
+                Toast.makeText(this, tr("identity_qr_mismatch"), Toast.LENGTH_SHORT).show()
+                return
+            }
+            acceptPeerKeyChange(targetPeerId, verified = true)
+            return
+        }
+        // Compare only against the live session key. Never fall back to a stored or
+        // id-derived value: those aren't the peer's key, so anyone could forge a matching QR.
+        val expected = meshService?.getPeerFingerprint(targetPeerId)?.let(::normalized)
         if (expected.isNullOrEmpty()) {
             Toast.makeText(this, tr("identity_qr_no_session"), Toast.LENGTH_SHORT).show()
             return
@@ -3169,6 +3387,35 @@ class MainActivity : Activity() {
         }
     }
 
+    /** "key changed: <alias>|<nodeId>" from the service: warn, drop the verified mark, ask. */
+    private fun handlePeerKeyChanged(payload: String) {
+        val peerId = runCatching { UUID.fromString(payload.substringAfterLast('|').trim()) }.getOrNull() ?: return
+        val alias = payload.substringBeforeLast('|').trim().ifBlank { "@${peerId.toString().take(8)}" }
+        // The old verification was for the old key; it no longer proves anything.
+        chatStore.getPeer(peerId.toString())?.let { chatStore.setPeerVerified(peerId.toString(), false) }
+        addMessage("mesh", tr("key_changed_system").format(alias), false, chatKey = peerChatKey(peerId))
+        updateChatTitle()
+        if (isFinishing) return
+        AlertDialog.Builder(this)
+            .setTitle(tr("key_changed_title"))
+            .setMessage(tr("key_changed_body").format(alias))
+            .setPositiveButton(tr("key_changed_scan")) { _, _ -> launchIdentityScanner(peerId) }
+            .setNeutralButton(tr("key_changed_accept")) { _, _ -> acceptPeerKeyChange(peerId, verified = false) }
+            .setNegativeButton(tr("key_changed_later"), null)
+            .show()
+    }
+
+    private fun acceptPeerKeyChange(peerId: UUID, verified: Boolean) {
+        if (meshService?.acceptKeyChange(peerId, verified) != true) return
+        val existing = chatStore.getPeer(peerId.toString())
+        if (existing != null) {
+            // Stored fingerprint belonged to the old key; it is refreshed after the new session.
+            chatStore.upsertPeer(existing.copy(fingerprint = "", verified = verified))
+        }
+        Toast.makeText(this, tr(if (verified) "contact_verified" else "key_changed_accepted"), Toast.LENGTH_SHORT).show()
+        updateChatTitle()
+    }
+
     private fun showCurrentChatProfile() {
         val title = if (selectedRecipientId != null) {
             selectedRecipientLabel.toDisplayTitle().removePrefix("@")
@@ -3179,8 +3426,11 @@ class MainActivity : Activity() {
         val storedPeer = peerId?.let { chatStore.getPeer(it.toString()) }
         val cryptoFingerprint = peerId?.let { meshService?.getPeerFingerprint(it) }
         val safetyNumber = peerId?.let { meshService?.getPeerSafetyNumber(it) }
-        val fingerprint = peerId?.let { cryptoFingerprint ?: storedPeer?.fingerprint ?: peerFingerprint(it) }
-        val verified = storedPeer?.verified == true
+        val fingerprint = peerId?.let { id ->
+            cryptoFingerprint ?: storedPeer?.fingerprint?.takeIf { it.isNotBlank() && it != peerFingerprint(id) }
+        }
+        val keyChangePending = peerId?.let { meshService?.hasPendingKeyChange(it) } == true
+        val verified = storedPeer?.verified == true && !keyChangePending
         val subtitle = when {
             savedMessagesSelected -> tr("private_local_chat_desc")
             selectedRecipientId == null -> tr("broadcast_chat_desc")
@@ -3200,7 +3450,7 @@ class MainActivity : Activity() {
             background = roundedDrawable(SOFT_PINK_PANEL, dp(24), SOFT_PINK_STROKE)
             addView(terminalText(title).apply {
                 textSize = 22f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT)
                 gravity = Gravity.CENTER
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -3227,7 +3477,40 @@ class MainActivity : Activity() {
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 bottomMargin = dp(10)
             })
-            if (peerId != null && fingerprint != null) {
+            if (peerId != null && keyChangePending) {
+                // The contact presented a new security key: messages wait for a decision.
+                addView(terminalText(tr("key_changed_body").format(title)).apply {
+                    textSize = 14f
+                    setTextColor(BERRY_TEXT)
+                    gravity = Gravity.CENTER
+                    background = roundedDrawable((STRAWBERRY_RED and 0x00FFFFFF) or 0x22000000, dp(18), STRAWBERRY_RED)
+                    setPadding(dp(14), dp(12), dp(14), dp(12))
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    bottomMargin = dp(10)
+                })
+                addView(terminalAction(tr("key_changed_scan")).apply {
+                    textSize = 16f
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.WHITE)
+                    background = roundedDrawable(STRAWBERRY_RED, dp(18))
+                    setOnClickListener {
+                        dialog.dismiss()
+                        launchIdentityScanner(peerId)
+                    }
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    bottomMargin = dp(10)
+                })
+                addView(terminalAction(tr("key_changed_accept")).apply {
+                    textSize = 16f
+                    gravity = Gravity.CENTER
+                    background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                    setOnClickListener {
+                        dialog.dismiss()
+                        acceptPeerKeyChange(peerId, verified = false)
+                    }
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            }
+            if (peerId != null && fingerprint != null && !keyChangePending) {
                 safetyNumber?.let { safety ->
                     addView(terminalText(safety).apply {
                         textSize = 17f
@@ -3306,7 +3589,7 @@ class MainActivity : Activity() {
         val originalInput = EditText(this).apply {
             setText(originalName)
             setSingleLine(true)
-            typeface = Typeface.DEFAULT
+            typeface = AppFonts.regular
             textSize = 16f
             setTextColor(BERRY_TEXT)
             setHintTextColor(BERRY_TEXT_DIM)
@@ -3333,7 +3616,7 @@ class MainActivity : Activity() {
         val displayInput = EditText(this).apply {
             setText(originalDisplayName)
             setSingleLine(true)
-            typeface = Typeface.DEFAULT
+            typeface = AppFonts.regular
             textSize = 16f
             setTextColor(BERRY_TEXT)
             setHintTextColor(BERRY_TEXT_DIM)
@@ -3439,7 +3722,7 @@ class MainActivity : Activity() {
                 })
                 addView(terminalText(contactDisplayName()).apply {
                     textSize = 22f
-                    typeface = Typeface.DEFAULT_BOLD
+                    typeface = AppFonts.bold
                     setTextColor(BERRY_TEXT)
                     gravity = Gravity.CENTER
                 })
@@ -3587,88 +3870,135 @@ class MainActivity : Activity() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(44), dp(20), dp(20))
+            setPadding(dp(16), dp(40), dp(16), dp(16))
             setBackgroundColor(CREAM_BACKGROUND)
-
-            if (group != null) {
-                addView(terminalAction("< ${tr("settings")}").apply {
-                    textSize = 13f
-                    setTextColor(BERRY_TEXT)
-                    background = roundedDrawable(INPUT_SURFACE, dp(10), SOFT_PINK_STROKE)
-                    setPadding(dp(10), dp(7), dp(10), dp(7))
+            // Top bar: a plain back arrow (section -> settings list, settings list -> chat).
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(View(this@MainActivity).apply {
+                    background = ChatIconDrawable(ChatIcon.BACK, BERRY_TEXT, resources.displayMetrics.density)
+                    contentDescription = tr(if (group == null) "back_to_chats" else "settings")
+                    isClickable = true
                     setOnClickListener {
                         dialog.dismiss()
-                        showSettingsPage()
+                        if (group != null) showSettingsPage()
                     }
-                }, LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    bottomMargin = dp(14)
-                })
-            }
-            addView(terminalText(tr(group?.titleKey ?: "settings")).apply {
-                textSize = 24f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(BERRY_TEXT)
-            })
-            addView(terminalText(tr(group?.descriptionKey ?: "settings_subtitle")).apply {
-                textSize = 13f
-                setTextColor(BERRY_TEXT_DIM)
-                setPadding(0, dp(4), 0, dp(10))
-            })
+                }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginEnd = dp(6) })
+                // A section page shows its title in the hero below, so the bar keeps only the arrow.
+                if (group == null) {
+                    addView(terminalText(tr("settings")).apply {
+                        textSize = 24f
+                        typeface = AppFonts.bold
+                        setTextColor(BERRY_TEXT)
+                    }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                }
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(6) })
         }
 
         val settingsContent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, dp(12))
         }
         val settingsScroll = ScrollView(this).apply {
             isFillViewport = true
+            isVerticalScrollBarEnabled = false
             addView(settingsContent, ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ))
         }
+
+        // Section page hero: big colored icon, title and a one-line hint.
+        if (group != null) {
+            val (glyph, color) = settingsGroupStyle(group)
+            settingsContent.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(dp(16), dp(4), dp(16), dp(18))
+                addView(View(this@MainActivity).apply {
+                    background = SettingsTileDrawable(glyph, color, resources.displayMetrics.density)
+                    elevation = dp(3).toFloat()
+                }, LinearLayout.LayoutParams(dp(72), dp(72)).apply { bottomMargin = dp(14) })
+                addView(terminalText(tr(group.titleKey)).apply {
+                    textSize = 24f
+                    typeface = AppFonts.bold
+                    setTextColor(BERRY_TEXT)
+                    gravity = Gravity.CENTER
+                })
+                addView(terminalText(tr(group.descriptionKey)).apply {
+                    textSize = 14f
+                    setTextColor(BERRY_TEXT_DIM)
+                    gravity = Gravity.CENTER
+                    setPadding(0, dp(6), 0, 0)
+                })
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        } else {
+            settingsContent.addView(terminalText(tr("settings_subtitle")).apply {
+                textSize = 14f
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(dp(4), 0, 0, dp(10))
+            })
+        }
         var currentSectionCard: LinearLayout? = null
 
         fun sectionHost(): LinearLayout = currentSectionCard ?: settingsContent
 
+        /** Thin inset divider between rows of one card. */
         fun addCardSpacing(host: LinearLayout) {
-            if (host.childCount > 0) {
-                host.addView(View(this), LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    dp(8)
-                ))
-            }
+            if (host.childCount == 0) return
+            host.addView(View(this).apply {
+                setBackgroundColor(SOFT_PINK_STROKE)
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, maxOf(1, dp(1) / 2)).apply {
+                marginStart = dp(16)
+                marginEnd = dp(16)
+            })
         }
 
-        fun addSection(titleKey: String, descriptionKey: String) {
-            settingsContent.addView(terminalText(tr(titleKey)).apply {
-                textSize = 13f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(BERRY_TEXT_DIM)
-                setPadding(0, dp(16), 0, dp(4))
-            }, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                if (settingsContent.childCount > 0) topMargin = dp(8)
-            })
-            settingsContent.addView(terminalText(tr(descriptionKey)).apply {
-                textSize = 12f
-                setTextColor(BERRY_TEXT_DIM)
-                setPadding(0, 0, 0, dp(10))
-            })
+        /** Starts a new rounded card; an optional small caption goes above it. */
+        fun addSection(titleKey: String? = null) {
+            if (titleKey != null) {
+                settingsContent.addView(terminalText(tr(titleKey).uppercase(Locale.getDefault())).apply {
+                    textSize = 12f
+                    typeface = AppFonts.bold
+                    letterSpacing = 0.06f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setPadding(dp(16), dp(18), dp(16), dp(8))
+                })
+            } else if (currentSectionCard != null) {
+                settingsContent.addView(View(this), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(14)))
+            }
             currentSectionCard = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
-                setPadding(dp(12), dp(10), dp(12), dp(10))
+                background = roundedDrawable(INPUT_SURFACE, dp(22), SOFT_PINK_STROKE)
+                setPadding(0, dp(4), 0, dp(4))
             }
             settingsContent.addView(currentSectionCard, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ))
         }
+
+        fun rowTexts(titleKey: String, descriptionKey: String): LinearLayout =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(terminalText(tr(titleKey)).apply {
+                    textSize = 16f
+                    setTextColor(BERRY_TEXT)
+                })
+                addView(terminalText(tr(descriptionKey)).apply {
+                    textSize = 13f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setLineSpacing(dp(1).toFloat(), 1f)
+                    setPadding(0, dp(3), 0, 0)
+                })
+            }
 
         fun addToolAction(
             titleKey: String,
@@ -3678,19 +4008,16 @@ class MainActivity : Activity() {
             val host = sectionHost()
             addCardSpacing(host)
             host.addView(LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                background = roundedDrawable(Color.TRANSPARENT, dp(14))
-                setPadding(dp(8), dp(8), dp(8), dp(8))
-                addView(terminalText(tr(titleKey)).apply {
-                    textSize = 15f
-                    typeface = Typeface.DEFAULT_BOLD
-                    setTextColor(BERRY_TEXT)
-                })
-                addView(terminalText(tr(descriptionKey)).apply {
-                    textSize = 12f
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), dp(13), dp(10), dp(13))
+                isClickable = true
+                addView(rowTexts(titleKey, descriptionKey), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(terminalText("›").apply {
+                    textSize = 26f
                     setTextColor(BERRY_TEXT_DIM)
-                    setPadding(0, dp(2), 0, 0)
-                })
+                    gravity = Gravity.CENTER
+                }, LinearLayout.LayoutParams(dp(24), ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(8) })
                 setOnClickListener { onClick() }
             }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -3703,40 +4030,39 @@ class MainActivity : Activity() {
             descriptionKey: String,
             checked: Boolean,
             onChanged: (Boolean) -> Unit
-        ): CheckBox {
-            lateinit var checkbox: CheckBox
+        ): CompoundButton {
             val host = sectionHost()
             addCardSpacing(host)
+            val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
+            val switch = Switch(this).apply {
+                isChecked = checked
+                thumbTintList = android.content.res.ColorStateList(states, intArrayOf(Color.WHITE, Color.WHITE))
+                trackTintList = android.content.res.ColorStateList(
+                    states,
+                    intArrayOf(STRAWBERRY_RED, (BERRY_TEXT_DIM and 0x00FFFFFF) or 0x66000000)
+                )
+                setOnCheckedChangeListener { _, value -> onChanged(value) }
+            }
             host.addView(LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                background = roundedDrawable(Color.TRANSPARENT, dp(14))
-                setPadding(dp(8), dp(8), dp(8), dp(8))
-                addView(LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    addView(terminalText(tr(titleKey)).apply {
-                        textSize = 15f
-                        typeface = Typeface.DEFAULT_BOLD
-                        setTextColor(BERRY_TEXT)
-                    }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                    checkbox = CheckBox(this@MainActivity).apply {
-                        isChecked = checked
-                        setOnCheckedChangeListener { _, value -> onChanged(value) }
-                    }
-                    addView(checkbox)
-                })
-                addView(terminalText(tr(descriptionKey)).apply {
-                    textSize = 12f
-                    setTextColor(BERRY_TEXT_DIM)
-                    setPadding(0, dp(2), 0, 0)
-                })
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), dp(12), dp(12), dp(12))
+                isClickable = true
+                addView(rowTexts(titleKey, descriptionKey), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(switch, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(10) })
+                // The whole row toggles, not just the small switch.
+                setOnClickListener { switch.toggle() }
             }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ))
-            return checkbox
+            return switch
         }
 
+        /** Labelled segmented control (one option selected). */
         fun addChoiceChips(
             titleKey: String,
             values: List<Pair<String, String>>,
@@ -3746,76 +4072,128 @@ class MainActivity : Activity() {
             val host = sectionHost()
             addCardSpacing(host)
             host.addView(terminalText(tr(titleKey)).apply {
-                textSize = 12f
-                setTextColor(BERRY_TEXT_DIM)
-                setPadding(dp(8), 0, dp(8), dp(6))
+                textSize = 16f
+                setTextColor(BERRY_TEXT)
+                setPadding(dp(16), dp(13), dp(16), dp(10))
             })
-            val row = LinearLayout(this).apply {
+            val track = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
+                background = roundedDrawable(CREAM_BACKGROUND, dp(16))
+                setPadding(dp(3), dp(3), dp(3), dp(3))
             }
-            val map = linkedMapOf<String, TextView>()
-            values.forEachIndexed { index, pair ->
-                val button = chatListBottomItem(pair.second, pair.first == selectedKey) { }
-                button.setOnClickListener {
-                    onSelected(pair.first)
-                    map.forEach { (key, view) ->
-                        val isSelected = key == pair.first
-                        view.background = roundedDrawable(if (isSelected) STRAWBERRY_RED else Color.TRANSPARENT, dp(20))
-                        view.setTextColor(if (isSelected) Color.WHITE else BERRY_TEXT_DIM)
+            val segments = linkedMapOf<String, TextView>()
+            fun paint(selected: String) {
+                segments.forEach { (key, view) ->
+                    val active = key == selected
+                    view.background = if (active) roundedDrawable(STRAWBERRY_RED, dp(13)) else null
+                    view.setTextColor(if (active) Color.WHITE else BERRY_TEXT_DIM)
+                    view.typeface = if (active) AppFonts.bold else AppFonts.regular
+                }
+            }
+            values.forEach { (key, label) ->
+                val segment = terminalText(label).apply {
+                    textSize = 14f
+                    gravity = Gravity.CENTER
+                    maxLines = 1
+                    isClickable = true
+                    setOnClickListener {
+                        paint(key)
+                        onSelected(key)
                     }
                 }
-                map[pair.first] = button
-                row.addView(button, LinearLayout.LayoutParams(0, dp(42), 1f).apply {
-                    if (index > 0) marginStart = dp(4)
-                    if (index < values.lastIndex) marginEnd = dp(4)
-                })
+                segments[key] = segment
+                track.addView(segment, LinearLayout.LayoutParams(0, dp(36), 1f))
             }
-            host.addView(row)
-        }
-
-        fun addSettingsGroupRow(settingsGroup: SettingsGroup) {
-            addCardSpacing(settingsContent)
-            settingsContent.addView(LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                background = roundedDrawable(INPUT_SURFACE, dp(14), SOFT_PINK_STROKE)
-                setPadding(dp(14), dp(13), dp(14), dp(13))
-                addView(LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    addView(terminalText(tr(settingsGroup.titleKey)).apply {
-                        textSize = 16f
-                        typeface = Typeface.DEFAULT_BOLD
-                        setTextColor(BERRY_TEXT)
-                    })
-                    addView(terminalText(tr(settingsGroup.descriptionKey)).apply {
-                        textSize = 12f
-                        setTextColor(BERRY_TEXT_DIM)
-                        setPadding(0, dp(4), 0, 0)
-                    })
-                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                addView(terminalText(">").apply {
-                    textSize = 20f
-                    typeface = Typeface.DEFAULT_BOLD
-                    gravity = Gravity.CENTER
-                    setTextColor(BERRY_TEXT_DIM)
-                }, LinearLayout.LayoutParams(dp(28), ViewGroup.LayoutParams.WRAP_CONTENT))
-                setOnClickListener {
-                    dialog.dismiss()
-                    showSettingsPage(settingsGroup)
-                }
-            }, LinearLayout.LayoutParams(
+            paint(selectedKey)
+            host.addView(track, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ))
+            ).apply {
+                marginStart = dp(12)
+                marginEnd = dp(12)
+                bottomMargin = dp(12)
+            })
+        }
+
+        // Main settings list: one card, each row = colored icon tile + title + short hint.
+        fun settingsMenuRow(
+            glyph: SettingsGlyph,
+            tileColor: Int,
+            title: String,
+            subtitle: String,
+            onClick: () -> Unit
+        ): LinearLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(11), dp(16), dp(11))
+            isClickable = true
+            addView(View(this@MainActivity).apply {
+                background = SettingsTileDrawable(glyph, tileColor, resources.displayMetrics.density)
+            }, LinearLayout.LayoutParams(dp(38), dp(38)).apply { marginEnd = dp(18) })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(terminalText(title).apply {
+                    textSize = 17f
+                    setTextColor(BERRY_TEXT)
+                })
+                addView(terminalText(subtitle).apply {
+                    textSize = 14f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setLineSpacing(dp(1).toFloat(), 1f)
+                    setPadding(0, dp(4), 0, 0)
+                })
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            setOnClickListener { onClick() }
         }
 
         if (group == null) {
-            SettingsGroup.entries.forEach(::addSettingsGroupRow)
+            val menuCard = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = roundedDrawable(INPUT_SURFACE, dp(24), SOFT_PINK_STROKE)
+                setPadding(0, dp(6), 0, dp(6))
+            }
+            // Messenger-style order: account first, then everyday settings, then technical ones.
+            val menu = listOf(
+                SettingsGroup.ACCOUNT,
+                SettingsGroup.CHAT,
+                SettingsGroup.APPEARANCE,
+                SettingsGroup.PRIVACY,
+                SettingsGroup.NOTIFICATIONS,
+                SettingsGroup.MESH,
+                SettingsGroup.MEDIA,
+                SettingsGroup.DATA,
+                SettingsGroup.REGION
+            )
+            menu.forEach { settingsGroup ->
+                val (glyph, color) = settingsGroupStyle(settingsGroup)
+                menuCard.addView(settingsMenuRow(glyph, color, tr(settingsGroup.titleKey), tr(settingsGroup.descriptionKey)) {
+                    dialog.dismiss()
+                    showSettingsPage(settingsGroup)
+                })
+            }
+            menuCard.addView(settingsMenuRow(SettingsGlyph.GLOBE, 0xFFB45CE6.toInt(), tr("language"), selectedLanguage.label) {
+                showStyledActionDialog(actions = AppLanguage.entries.map { lang ->
+                    StyledActionItem(if (lang == selectedLanguage) "✓  ${lang.label}" else lang.label) {
+                        if (lang == selectedLanguage) return@StyledActionItem
+                        selectedLanguage = lang
+                        applySettingsNow(recreateUi = true)
+                        rebuildCurrentScreenText()
+                        dialog.dismiss()
+                        showSettingsPage()
+                    }
+                })
+            })
+            settingsContent.addView(menuCard, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) })
         }
 
+        // Each setting lives in exactly one section (no duplicates between sections or with
+        // the main list; language is only in the main list).
         if (group == SettingsGroup.ACCOUNT) {
-            addSection("settings_account", "settings_account_desc")
+            addSection()
             addToolAction("settings_edit_profile", "settings_edit_profile_desc") {
                 dialog.dismiss()
                 showOwnProfilePage()
@@ -3830,71 +4208,33 @@ class MainActivity : Activity() {
         }
 
         if (group == SettingsGroup.APPEARANCE) {
-            addSection("settings_appearance", "settings_appearance_desc")
-
-            val themeRow = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            val lightButton = chatListBottomItem(tr("theme_light"), !darkThemeEnabled) { }
-            val darkButton = chatListBottomItem(tr("theme_dark"), darkThemeEnabled) { }
-            lightButton.setOnClickListener {
-                darkThemeEnabled = false
-                lightButton.background = roundedDrawable(STRAWBERRY_RED, dp(20))
-                lightButton.setTextColor(Color.WHITE)
-                darkButton.background = roundedDrawable(Color.TRANSPARENT, dp(20))
-                darkButton.setTextColor(BERRY_TEXT_DIM)
+            addSection()
+            addChoiceChips(
+                "theme",
+                listOf("light" to tr("theme_light"), "dark" to tr("theme_dark")),
+                if (darkThemeEnabled) "dark" else "light"
+            ) { selected ->
+                val dark = selected == "dark"
+                if (dark == darkThemeEnabled) return@addChoiceChips
+                darkThemeEnabled = dark
                 applySettingsNow(recreateUi = true)
+                // Reopen so this page is redrawn in the new palette too.
+                rebuildCurrentScreenText()
+                dialog.dismiss()
+                showSettingsPage(group)
             }
-            darkButton.setOnClickListener {
-                darkThemeEnabled = true
-                darkButton.background = roundedDrawable(STRAWBERRY_RED, dp(20))
-                darkButton.setTextColor(Color.WHITE)
-                lightButton.background = roundedDrawable(Color.TRANSPARENT, dp(20))
-                lightButton.setTextColor(BERRY_TEXT_DIM)
-                applySettingsNow(recreateUi = true)
+            addChoiceChips(
+                "settings_chat_font",
+                listOf("0.9" to tr("small"), "1.0" to tr("normal"), "1.15" to tr("large")),
+                "%.1f".format(Locale.US, messageTextScale)
+            ) { selected ->
+                messageTextScale = selected.toFloatOrNull()?.coerceIn(0.9f, 1.3f) ?: 1.0f
+                applySettingsNow(refreshMessages = true)
             }
-            themeRow.addView(lightButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(6) })
-            themeRow.addView(darkButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(6) })
-            sectionHost().addView(themeRow)
-
-            addSection("language", "settings_language_desc")
-
-            val langButtons = linkedMapOf<AppLanguage, TextView>()
-            val langRow = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            AppLanguage.entries.forEachIndexed { index, lang ->
-                val button = chatListBottomItem(lang.label, selectedLanguage == lang) { }
-                button.setOnClickListener {
-                    if (selectedLanguage == lang) return@setOnClickListener
-                    selectedLanguage = lang
-                    langButtons.forEach { (candidate, view) ->
-                        if (candidate == lang) {
-                            view.background = roundedDrawable(STRAWBERRY_RED, dp(20))
-                            view.setTextColor(Color.WHITE)
-                        } else {
-                            view.background = roundedDrawable(Color.TRANSPARENT, dp(20))
-                            view.setTextColor(BERRY_TEXT_DIM)
-                        }
-                    }
-                    applySettingsNow(recreateUi = true)
-                    rebuildCurrentScreenText()
-                    dialog.dismiss()
-                    showSettingsPage(group)
-                }
-                langButtons[lang] = button
-                langRow.addView(button, LinearLayout.LayoutParams(0, dp(44), 1f).apply {
-                    if (index > 0) marginStart = dp(4)
-                    if (index < AppLanguage.entries.lastIndex) marginEnd = dp(4)
-                })
-            }
-            sectionHost().addView(langRow)
         }
 
         if (group == SettingsGroup.PRIVACY) {
-            addSection("settings_security", "settings_security_desc")
+            addSection()
             addToggle("settings_lock_enable", "settings_lock_enable_desc", appLockEnabled) {
                 appLockEnabled = it
                 applySettingsNow()
@@ -3915,7 +4255,7 @@ class MainActivity : Activity() {
         }
 
         if (group == SettingsGroup.MESH) {
-            addSection("settings_mesh_section", "settings_mesh_desc")
+            addSection()
             addChoiceChips(
                 "settings_mesh_mode",
                 listOf("balanced" to tr("mesh_mode_balanced"), "aggressive" to tr("mesh_mode_aggressive")),
@@ -3932,6 +4272,7 @@ class MainActivity : Activity() {
                 meshMaxHops = selected.toIntOrNull()?.coerceIn(1, 8) ?: 8
                 applySettingsNow()
             }
+            addSection("settings_tools")
             addToolAction("settings_restart_mesh", "settings_restart_mesh_desc") {
                 meshService?.startNearbyDiscovery(silent = false)
                 Toast.makeText(this, tr("status_searching_nearby"), Toast.LENGTH_SHORT).show()
@@ -3942,13 +4283,15 @@ class MainActivity : Activity() {
             addToolAction("settings_delivery_queue", "settings_delivery_queue_desc") {
                 showDeliveryQueue()
             }
-            addToolAction("settings_radio_health", "settings_radio_health_desc") {
-                showRadioHealth()
+            // Full report (Bluetooth, permissions, service, routing); replaces the shorter
+            // "radio health" dialog that showed a subset of the same data.
+            addToolAction("settings_connection_diag", "settings_connection_diag_desc") {
+                showConnectionDiagnostics()
             }
         }
 
         if (group == SettingsGroup.NOTIFICATIONS) {
-            addSection("settings_notifications", "settings_notifications_desc")
+            addSection()
             addToggle("settings_notify_enable", "settings_notify_enable_desc", notificationEnabled) {
                 notificationEnabled = it
                 applySettingsNow()
@@ -3964,11 +4307,7 @@ class MainActivity : Activity() {
         }
 
         if (group == SettingsGroup.MEDIA) {
-            addSection("settings_media", "settings_media_desc")
-            addToggle("settings_crop_images", "settings_crop_images_desc", cropChatImagesEnabled) {
-                cropChatImagesEnabled = it
-                applySettingsNow(refreshMessages = true)
-            }
+            addSection()
             addChoiceChips(
                 "settings_media_quality",
                 listOf(
@@ -3981,25 +4320,20 @@ class MainActivity : Activity() {
                 mediaQuality = MediaQuality.fromStorageKey(selected)
                 applySettingsNow()
             }
-            addToolAction("settings_cleanup_cache", "settings_cleanup_cache_desc") {
-                cleanupMediaCache()
-                Toast.makeText(this@MainActivity, tr("cleanup_done"), Toast.LENGTH_SHORT).show()
+            addToggle("settings_crop_images", "settings_crop_images_desc", cropChatImagesEnabled) {
+                cropChatImagesEnabled = it
+                applySettingsNow(refreshMessages = true)
             }
         }
 
         if (group == SettingsGroup.CHAT) {
-            addSection("settings_chat_behavior", "settings_chat_behavior_desc")
+            addSection()
             addToggle("settings_chat_compact", "settings_chat_compact_desc", compactChatListEnabled) {
                 compactChatListEnabled = it
                 applySettingsNow(refreshMessages = true)
             }
-            addChoiceChips(
-                "settings_chat_font",
-                listOf("0.9" to tr("small"), "1.0" to tr("normal"), "1.15" to tr("large")),
-                "%.1f".format(Locale.US, messageTextScale)
-            ) { selected ->
-                messageTextScale = selected.toFloatOrNull()?.coerceIn(0.9f, 1.3f) ?: 1.0f
-                applySettingsNow(refreshMessages = true)
+            addToolAction("settings_global_search", "settings_global_search_desc") {
+                showGlobalSearchDialog()
             }
             addToolAction("settings_show_onboarding", "settings_show_onboarding_desc") {
                 getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
@@ -4008,13 +4342,10 @@ class MainActivity : Activity() {
                     .apply()
                 Toast.makeText(this@MainActivity, tr("quick_start_title"), Toast.LENGTH_SHORT).show()
             }
-            addToolAction("settings_global_search", "settings_global_search_desc") {
-                showGlobalSearchDialog()
-            }
         }
 
         if (group == SettingsGroup.REGION) {
-            addSection("settings_region", "settings_region_desc")
+            addSection()
             addChoiceChips(
                 "settings_time_format",
                 listOf("24" to "24h", "12" to "12h"),
@@ -4034,19 +4365,17 @@ class MainActivity : Activity() {
         }
 
         if (group == SettingsGroup.DATA) {
-            addSection("settings_data_storage", "settings_data_storage_desc")
+            addSection("settings_backup_section")
             addToolAction("settings_export_backup", "settings_export_backup_desc") {
                 openBackupCreateDocument()
             }
             addToolAction("settings_import_backup", "settings_import_backup_desc") {
                 openBackupPicker()
             }
+            addSection("settings_storage_section")
             addToolAction("settings_cleanup_cache", "settings_cleanup_cache_desc") {
                 cleanupMediaCache()
                 Toast.makeText(this@MainActivity, tr("cleanup_done"), Toast.LENGTH_SHORT).show()
-            }
-            addToolAction("settings_connection_diag", "settings_connection_diag_desc") {
-                showConnectionDiagnostics()
             }
         }
 
@@ -4085,6 +4414,19 @@ class MainActivity : Activity() {
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT
         )
+    }
+
+    /** Icon and tile color of a settings section (main list and the section page hero). */
+    private fun settingsGroupStyle(group: SettingsGroup): Pair<SettingsGlyph, Int> = when (group) {
+        SettingsGroup.ACCOUNT -> SettingsGlyph.PERSON to 0xFF3D8EF0.toInt()
+        SettingsGroup.CHAT -> SettingsGlyph.CHAT to 0xFFF2A33A.toInt()
+        SettingsGroup.APPEARANCE -> SettingsGlyph.THEME to 0xFF8E6CF0.toInt()
+        SettingsGroup.PRIVACY -> SettingsGlyph.KEY to 0xFF34B85A.toInt()
+        SettingsGroup.NOTIFICATIONS -> SettingsGlyph.SPEAKER to 0xFFEF4A5E.toInt()
+        SettingsGroup.MESH -> SettingsGlyph.RADIO to 0xFF22A9B8.toInt()
+        SettingsGroup.MEDIA -> SettingsGlyph.IMAGE to 0xFFE2589A.toInt()
+        SettingsGroup.DATA -> SettingsGlyph.PIE to 0xFF5B7CFA.toInt()
+        SettingsGroup.REGION -> SettingsGlyph.CLOCK to 0xFFF07B3F.toInt()
     }
 
     private fun openBackupPicker() {
@@ -4502,7 +4844,7 @@ class MainActivity : Activity() {
             setBackgroundColor(CREAM_BACKGROUND)
             addView(terminalText(tr("network_map")).apply {
                 textSize = 24f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
             })
             addView(PatchRadarView(this@MainActivity) { key -> tr(key) }.apply {
                 setPeerCounts(direct, routed)
@@ -4605,7 +4947,7 @@ class MainActivity : Activity() {
         val input = EditText(this).apply {
             hint = tr("global_search_hint")
             setSingleLine(true)
-            typeface = Typeface.MONOSPACE
+            typeface = AppFonts.regular
             textSize = 15f
             setTextColor(BERRY_TEXT)
             setHintTextColor(BERRY_TEXT_DIM)
@@ -4658,7 +5000,7 @@ class MainActivity : Activity() {
         }
         root.addView(terminalText(tr("global_search")).apply {
             textSize = 22f
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = AppFonts.bold
         })
         root.addView(input, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             topMargin = dp(16)
@@ -4982,7 +5324,7 @@ class MainActivity : Activity() {
         val input = EditText(this).apply {
             hint = tr("search_messages_hint")
             setSingleLine(true)
-            typeface = Typeface.MONOSPACE
+            typeface = AppFonts.regular
             textSize = 15f
             setTextColor(BERRY_TEXT)
             setHintTextColor(BERRY_TEXT_DIM)
@@ -5036,7 +5378,7 @@ class MainActivity : Activity() {
 
         root.addView(terminalText(tr("search")).apply {
             textSize = 22f
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = AppFonts.bold
         })
         root.addView(input, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -5239,7 +5581,7 @@ class MainActivity : Activity() {
             background = roundedDrawable(INPUT_SURFACE, dp(20), SOFT_PINK_STROKE)
             addView(terminalText(tr("delete_for_myself_q")).apply {
                 textSize = 16f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT)
                 setPadding(0, 0, 0, dp(12))
             })
@@ -5470,7 +5812,7 @@ class MainActivity : Activity() {
             background = roundedDrawable(INPUT_SURFACE, dp(20), SOFT_PINK_STROKE)
             addView(terminalText(tr("edit")).apply {
                 textSize = 16f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT)
                 setPadding(0, 0, 0, dp(10))
             })
@@ -5684,7 +6026,7 @@ class MainActivity : Activity() {
             background = roundedDrawable(SOFT_PINK_PANEL, dp(26), SOFT_PINK_STROKE)
             addView(terminalText(tr("enable_nearby_chat")).apply {
                 textSize = 22f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT)
                 gravity = Gravity.CENTER
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -5863,7 +6205,7 @@ class MainActivity : Activity() {
     private fun terminalText(value: String): TextView =
         TextView(this).apply {
             text = value
-            typeface = Typeface.DEFAULT
+            typeface = AppFonts.regular
             setTextColor(BERRY_TEXT)
             includeFontPadding = false
         }
@@ -5871,7 +6213,7 @@ class MainActivity : Activity() {
     private fun terminalAction(value: String): TextView =
         TextView(this).apply {
             text = value
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = AppFonts.bold
             setTextColor(BERRY_TEXT)
             setBackgroundColor(Color.TRANSPARENT)
             setPadding(dp(6), dp(4), dp(6), dp(4))

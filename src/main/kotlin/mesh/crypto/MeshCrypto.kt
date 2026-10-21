@@ -85,6 +85,10 @@ class MeshCrypto(private val secureStorage: SecureKeyStorage) {
 
     private val nonceRandom = SecureRandom()
 
+    // nodeId -> new identity the peer presented that differs from the pinned one; a session
+    // with it is only allowed after the user accepts the change (acceptKeyChange).
+    private val pendingKeyChanges = ConcurrentHashMap<UUID, PendingKeyChange>()
+
     companion object {
         const val NONCE_SIZE = 12
         const val KEY_SIZE = 32
@@ -190,6 +194,7 @@ class MeshCrypto(private val secureStorage: SecureKeyStorage) {
 
         // Check TOFU - is this a known peer?
         val fingerprint = computeFingerprint(identityPubKey)
+        checkPinnedIdentity(senderNodeId, identityPubKey, fingerprint)?.let { return it }
         val trustInfo = trustedPeers[fingerprint]
         val trustStatus = when {
             trustInfo == null -> TrustStatus.NEW_PEER
@@ -216,16 +221,8 @@ class MeshCrypto(private val secureStorage: SecureKeyStorage) {
             messageCounter = AtomicLong(0)
         )
 
-        // Update trusted peers (TOFU)
-        if (trustInfo == null) {
-            trustedPeers[fingerprint] = TrustInfo(
-                fingerprint = fingerprint,
-                identityKey = identityPubKey,
-                firstSeen = System.currentTimeMillis(),
-                verified = false
-            )
-            saveTrustedPeers()
-        }
+        // Update trusted peers (TOFU) and pin this identity to the node id
+        pinIdentity(senderNodeId, identityPubKey, fingerprint)
 
         // Create verification token (proves we have the shared secret)
         val verificationPlaintext = "MESH_HANDSHAKE_VERIFY".toByteArray()
@@ -267,6 +264,7 @@ class MeshCrypto(private val secureStorage: SecureKeyStorage) {
         if (!verifySignature(ephemeralPubKey, signature, identityPubKey)) {
             return HandshakeResult.Failed("Invalid signature")
         }
+        checkPinnedIdentity(senderNodeId, identityPubKey, computeFingerprint(identityPubKey))?.let { return it }
 
         // Compute shared secret
         val sharedSecret = performECDH(pending.ephemeralKeyPair.private, ephemeralPubKey)
@@ -296,16 +294,7 @@ class MeshCrypto(private val secureStorage: SecureKeyStorage) {
             trustInfo.verified -> TrustStatus.TRUSTED
             else -> TrustStatus.KNOWN_UNVERIFIED
         }
-
-        if (trustInfo == null) {
-            trustedPeers[fingerprint] = TrustInfo(
-                fingerprint = fingerprint,
-                identityKey = identityPubKey,
-                firstSeen = System.currentTimeMillis(),
-                verified = false
-            )
-            saveTrustedPeers()
-        }
+        pinIdentity(senderNodeId, identityPubKey, fingerprint)
 
         return HandshakeResult.Success(
             ackPayload = ByteArray(0), // No further payload needed
@@ -494,6 +483,79 @@ class MeshCrypto(private val secureStorage: SecureKeyStorage) {
         }
     }
 
+    // ==================== IDENTITY PINNING ====================
+
+    /**
+     * A node id is bound to the first identity key seen for it (TOFU). Anyone can claim any
+     * node id on the mesh, so a different key for a known id is refused until the user
+     * accepts it: otherwise an impostor would silently take over the conversation.
+     */
+    private fun checkPinnedIdentity(
+        nodeId: UUID,
+        identityPubKey: ByteArray,
+        fingerprint: String
+    ): HandshakeResult.KeyChanged? {
+        val pinned = pinnedFingerprint(nodeId) ?: return null
+        if (pinned == fingerprint) return null
+        val firstNotice = pendingKeyChanges[nodeId]?.fingerprint != fingerprint
+        pendingKeyChanges[nodeId] = PendingKeyChange(identityPubKey, fingerprint)
+        return HandshakeResult.KeyChanged(
+            previousFingerprint = pinned,
+            newFingerprint = fingerprint,
+            firstNotice = firstNotice
+        )
+    }
+
+    private fun pinnedFingerprint(nodeId: UUID): String? {
+        val id = nodeId.toString()
+        return trustedPeers.values.firstOrNull { it.nodeId == id }?.fingerprint
+    }
+
+    private fun pinIdentity(nodeId: UUID, identityPubKey: ByteArray, fingerprint: String) {
+        val id = nodeId.toString()
+        val existing = trustedPeers[fingerprint]
+        if (existing != null && existing.nodeId == id) return
+        trustedPeers[fingerprint] = existing?.copy(nodeId = id) ?: TrustInfo(
+            fingerprint = fingerprint,
+            identityKey = identityPubKey,
+            firstSeen = System.currentTimeMillis(),
+            verified = false,
+            nodeId = id
+        )
+        saveTrustedPeers()
+    }
+
+    fun hasPendingKeyChange(nodeId: UUID): Boolean = pendingKeyChanges.containsKey(nodeId)
+
+    fun pendingKeyFingerprint(nodeId: UUID): String? = pendingKeyChanges[nodeId]?.fingerprint
+
+    /**
+     * User confirmed the new key (e.g. the contact reinstalled the app): re-pin the node id
+     * to it, unverified, and drop the old session so the next handshake can succeed.
+     */
+    fun acceptKeyChange(nodeId: UUID, verified: Boolean = false): Boolean {
+        val change = pendingKeyChanges.remove(nodeId) ?: return false
+        val id = nodeId.toString()
+        trustedPeers.entries.forEach { entry ->
+            if (entry.value.nodeId == id) entry.setValue(entry.value.copy(nodeId = null))
+        }
+        trustedPeers[change.fingerprint] = (trustedPeers[change.fingerprint] ?: TrustInfo(
+            fingerprint = change.fingerprint,
+            identityKey = change.identityKey,
+            firstSeen = System.currentTimeMillis(),
+            verified = false
+        )).copy(nodeId = id, verified = verified)
+        sessions.remove(nodeId)
+        saveTrustedPeers()
+        return true
+    }
+
+    fun hasPendingHandshake(nodeId: UUID): Boolean = pendingHandshakes.containsKey(nodeId)
+
+    fun cancelPendingHandshake(nodeId: UUID) {
+        pendingHandshakes.remove(nodeId)
+    }
+
     fun hasSessionWith(nodeId: UUID): Boolean = sessions.containsKey(nodeId)
 
     fun getSessionInfo(nodeId: UUID): SessionInfo? = sessions[nodeId]
@@ -536,7 +598,14 @@ data class TrustInfo(
     val fingerprint: String,
     val identityKey: ByteArray,
     val firstSeen: Long,
-    val verified: Boolean
+    val verified: Boolean,
+    /** Node id this identity is pinned to (null for entries saved before pinning existed). */
+    val nodeId: String? = null
+)
+
+data class PendingKeyChange(
+    val identityKey: ByteArray,
+    val fingerprint: String
 )
 
 data class HandshakeState(
@@ -557,6 +626,13 @@ sealed class HandshakeResult {
     ) : HandshakeResult()
 
     data class Failed(val reason: String) : HandshakeResult()
+
+    /** The node id is pinned to another identity key; no session was created. */
+    data class KeyChanged(
+        val previousFingerprint: String,
+        val newFingerprint: String,
+        val firstNotice: Boolean
+    ) : HandshakeResult()
 }
 
 enum class TrustStatus {

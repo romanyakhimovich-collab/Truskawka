@@ -37,7 +37,8 @@ class AndroidSecureKeyStorage(context: Context) : SecureKeyStorage {
                 peer.fingerprint,
                 encode(peer.identityKey),
                 peer.firstSeen.toString(),
-                peer.verified.toString()
+                peer.verified.toString(),
+                peer.nodeId.orEmpty()
             ).joinToString("|")
         }
         prefs.edit().putString("trusted_peers", encoded).apply()
@@ -49,12 +50,14 @@ class AndroidSecureKeyStorage(context: Context) : SecureKeyStorage {
 
         return encoded.lineSequence().mapNotNull { line ->
             val parts = line.split("|")
-            if (parts.size != 4) return@mapNotNull null
+            // 4 fields: saved before node-id pinning; 5th field is the pinned node id.
+            if (parts.size != 4 && parts.size != 5) return@mapNotNull null
             TrustInfo(
                 fingerprint = parts[0],
                 identityKey = decode(parts[1]),
                 firstSeen = parts[2].toLongOrNull() ?: return@mapNotNull null,
-                verified = parts[3].toBoolean()
+                verified = parts[3].toBoolean(),
+                nodeId = parts.getOrNull(4)?.takeIf { it.isNotBlank() }
             )
         }.toList()
     }

@@ -86,6 +86,11 @@ class MeshManager(
     // Pending messages awaiting session establishment
     private val pendingOutbox = ConcurrentHashMap<UUID, MutableList<PendingOutboxMessage>>()
 
+    // Every private message not yet confirmed by the recipient, mirrored to disk
+    // (transferStorageDir/outbox) so a restart or a failed delivery doesn't lose it.
+    private val outbox = ConcurrentHashMap<UUID, OutboxEntry>()
+    private val sessionRepairRequestedAt = ConcurrentHashMap<UUID, Long>()
+
     // Message listeners
     private var messageListener: ((senderId: UUID, message: String, timestamp: Long, isBroadcast: Boolean) -> Unit)? = null
     private var fileListener: ((senderId: UUID, fileName: String, mimeType: String, bytes: ByteArray, timestamp: Long, isBroadcast: Boolean) -> Unit)? = null
@@ -113,6 +118,7 @@ class MeshManager(
         bleTransport.setCallback(this)
         bleTransport.initialize()
         restorePersistedFileTransfers()
+        restoreOutbox()
     }
 
     fun onWifiDirectPacketReceived(packet: MeshPacket) {
@@ -176,7 +182,9 @@ class MeshManager(
             return SendResult.Queued("No session, handshake initiated", messageId)
         }
 
-        return sendEncryptedMessage(recipientId, messageBytes)
+        val messageId = UUID.randomUUID()
+        rememberOutboxEntry(messageId, recipientId, messageBytes, System.currentTimeMillis())
+        return sendEncryptedMessage(recipientId, messageBytes, messageId)
     }
 
     /**
@@ -237,8 +245,11 @@ class MeshManager(
         persistOutgoingFileTransfer(transferId, outgoingFiles[transferId]!!)
         cleanupOutgoingFiles()
 
+        // SHA-256 of the whole file goes last: older receivers stop reading after the name and
+        // ignore it; newer ones verify the reassembled file against it.
+        val sha256 = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
         val metaPayload = ByteBuffer.allocate(
-            4 + 16 + 4 + 4 + 4 + 2 + 2 + mimeBytes.size + nameBytes.size
+            4 + 16 + 4 + 4 + 4 + 2 + 2 + mimeBytes.size + nameBytes.size + sha256.size
         )
             .put(FILE_META_MAGIC)
             .putLong(transferId.mostSignificantBits)
@@ -250,6 +261,7 @@ class MeshManager(
             .putShort(nameBytes.size.toShort())
             .put(mimeBytes)
             .put(nameBytes)
+            .put(sha256)
             .array()
 
         if (!sendFilePacket(PacketType.FILE_META, target, metaPayload)) {
@@ -353,12 +365,17 @@ class MeshManager(
 
         // Track before sending: a direct-link ACK can arrive before sendMessage returns.
         trackedMessageDeliveries.add(messageId)
+        outbox[messageId]?.lastAttemptAt = System.currentTimeMillis()
         router.sendMessage(recipientId, payload, signature, requiresAck = true, messageId = messageId)
         return SendResult.Sent(messageId)
     }
 
-    private fun queuePendingMessage(recipientId: UUID, message: ByteArray): UUID {
-        val pending = PendingOutboxMessage(message, System.currentTimeMillis())
+    private fun queuePendingMessage(
+        recipientId: UUID,
+        message: ByteArray,
+        pending: PendingOutboxMessage = PendingOutboxMessage(message, System.currentTimeMillis())
+    ): UUID {
+        rememberOutboxEntry(pending.messageId, recipientId, message, pending.queuedAt)
         while (true) {
             val queue = pendingOutbox.computeIfAbsent(recipientId) {
                 Collections.synchronizedList(mutableListOf())
@@ -374,8 +391,86 @@ class MeshManager(
                 true
             }
             if (added) {
-                evicted?.let { messageStatusListener?.invoke(it.messageId, MessageDeliveryStatus.FAILED) }
+                evicted?.let {
+                    forgetOutboxEntry(it.messageId)
+                    messageStatusListener?.invoke(it.messageId, MessageDeliveryStatus.FAILED)
+                }
                 return pending.messageId
+            }
+        }
+    }
+
+    // ==================== Persistent outbox ====================
+
+    private fun rememberOutboxEntry(messageId: UUID, recipientId: UUID, payload: ByteArray, queuedAt: Long) {
+        if (outbox.containsKey(messageId)) return
+        outbox[messageId] = OutboxEntry(recipientId, payload, queuedAt)
+        val dir = outboxDirectory() ?: return
+        runCatching {
+            java.io.DataOutputStream(dir.resolve("$messageId.msg").outputStream().buffered()).use { out ->
+                out.writeLong(recipientId.mostSignificantBits)
+                out.writeLong(recipientId.leastSignificantBits)
+                out.writeLong(queuedAt)
+                out.writeInt(payload.size)
+                out.write(payload)
+            }
+        }
+    }
+
+    private fun forgetOutboxEntry(messageId: UUID) {
+        outbox.remove(messageId)
+        transferStorageDir?.resolve("outbox")?.resolve("$messageId.msg")?.delete()
+    }
+
+    private fun outboxDirectory(): File? =
+        transferStorageDir?.resolve("outbox")?.apply { mkdirs() }
+
+    /** After a restart sessions are gone, so restored messages wait for a new handshake. */
+    private fun restoreOutbox() {
+        val now = System.currentTimeMillis()
+        outboxDirectory()?.listFiles { file -> file.name.endsWith(".msg") }?.forEach { file ->
+            val messageId = runCatching { UUID.fromString(file.name.removeSuffix(".msg")) }.getOrNull()
+            val entry = messageId?.let {
+                runCatching {
+                    java.io.DataInputStream(file.inputStream().buffered()).use { input ->
+                        val recipient = UUID(input.readLong(), input.readLong())
+                        val queuedAt = input.readLong()
+                        val size = input.readInt()
+                        require(size in 0..MAX_OUTBOX_MESSAGE_BYTES)
+                        OutboxEntry(recipient, ByteArray(size).also(input::readFully), queuedAt)
+                    }
+                }.getOrNull()
+            }
+            if (messageId == null || entry == null || now - entry.queuedAt > PENDING_OUTBOX_MAX_AGE_MS) {
+                file.delete()
+                return@forEach
+            }
+            queuePendingMessage(entry.recipientId, entry.payload, PendingOutboxMessage(entry.payload, entry.queuedAt, messageId))
+        }
+    }
+
+    /**
+     * Messages the router gave up on (peer out of range for a while) stay in the outbox and
+     * are re-sent with the same id once the peer is around again. Called periodically.
+     */
+    private fun resendUndeliveredOutbox() {
+        val now = System.currentTimeMillis()
+        val queuedIds = pendingOutbox.values.flatMap { queue -> synchronized(queue) { queue.map { it.messageId } } }.toSet()
+        outbox.entries.toList().forEach { (messageId, entry) ->
+            if (now - entry.queuedAt > PENDING_OUTBOX_MAX_AGE_MS) {
+                forgetOutboxEntry(messageId)
+                if (messageId !in queuedIds) messageStatusListener?.invoke(messageId, MessageDeliveryStatus.FAILED)
+                return@forEach
+            }
+            if (messageId in trackedMessageDeliveries || messageId in queuedIds) return@forEach
+            if (now - entry.lastAttemptAt < OUTBOX_RESEND_INTERVAL_MS) return@forEach
+            if (!knownPeers.containsKey(entry.recipientId)) return@forEach
+            entry.lastAttemptAt = now
+            if (crypto.hasSessionWith(entry.recipientId)) {
+                sendEncryptedMessage(entry.recipientId, entry.payload, messageId)
+            } else {
+                queuePendingMessage(entry.recipientId, entry.payload, PendingOutboxMessage(entry.payload, entry.queuedAt, messageId))
+                initiateHandshake(entry.recipientId)
             }
         }
     }
@@ -411,13 +506,17 @@ class MeshManager(
                 if (messages.isEmpty()) pendingOutbox.remove(recipientId, messages)
                 messages.isNotEmpty()
             }
-            expired.forEach { messageStatusListener?.invoke(it.messageId, MessageDeliveryStatus.FAILED) }
+            expired.forEach {
+                forgetOutboxEntry(it.messageId)
+                messageStatusListener?.invoke(it.messageId, MessageDeliveryStatus.FAILED)
+            }
 
             // Retry handshake
             if (hasPending) {
                 initiateHandshake(recipientId)
             }
         }
+        resendUndeliveredOutbox()
     }
 
     private fun announcePresence(localAlias: String) {
@@ -495,6 +594,12 @@ class MeshManager(
             require(chunkCount.toLong() * chunkSize >= totalBytes)
             val mimeType = ByteArray(mimeLength).also { buffer.get(it) }.toString(Charsets.UTF_8)
             val fileName = ByteArray(nameLength).also { buffer.get(it) }.toString(Charsets.UTF_8)
+            // Absent when the sender runs an older version.
+            val sha256 = if (buffer.remaining() >= FILE_SHA256_BYTES) {
+                ByteArray(FILE_SHA256_BYTES).also { buffer.get(it) }
+            } else {
+                null
+            }
             val existing = incomingFiles[transferId]
             if (existing != null) {
                 // A replayed/re-sent META must not wipe chunks that already arrived.
@@ -511,7 +616,8 @@ class MeshManager(
                 totalBytes = totalBytes,
                 chunks = arrayOfNulls(chunkCount),
                 timestamp = packet.timestamp,
-                isBroadcast = packet.isBroadcast()
+                isBroadcast = packet.isBroadcast(),
+                sha256 = sha256
             )
             persistIncomingFileMeta(transferId, incomingFiles[transferId]!!)
             orphanFileChunks.remove(transferId)?.let { orphan ->
@@ -634,6 +740,31 @@ class MeshManager(
         if (offset == transfer.totalBytes) {
             incomingFiles.remove(transferId)
             deleteTransferDirectory("incoming", transferId)
+            val expectedHash = transfer.sha256
+            if (expectedHash != null &&
+                !java.security.MessageDigest.isEqual(
+                    expectedHash,
+                    java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+                )
+            ) {
+                // Corrupted or tampered chunks: never hand a broken file to the app.
+                transportLogListener?.invoke("file ${transfer.fileName} failed integrity check; discarded")
+                notifyFileProgress(
+                    FileTransferProgress(
+                        transferId = transferId,
+                        sentChunks = transfer.chunks.size,
+                        totalChunks = transfer.chunks.size,
+                        totalBytes = transfer.totalBytes,
+                        fileName = transfer.fileName,
+                        mimeType = transfer.mimeType,
+                        recipientId = transfer.senderId,
+                        isBroadcast = transfer.isBroadcast,
+                        direction = TransferDirection.INCOMING,
+                        status = TransferStatus.FAILED
+                    )
+                )
+                return
+            }
             notifyFileProgress(
                 FileTransferProgress(
                     transferId = transferId,
@@ -804,7 +935,10 @@ class MeshManager(
                 chunks = chunks,
                 timestamp = meta.getProperty("timestamp")?.toLongOrNull() ?: System.currentTimeMillis(),
                 isBroadcast = meta.getProperty("isBroadcast").toBoolean(),
-                updatedAt = dir.walkTopDown().maxOfOrNull { it.lastModified() } ?: dir.lastModified()
+                updatedAt = dir.walkTopDown().maxOfOrNull { it.lastModified() } ?: dir.lastModified(),
+                sha256 = meta.getProperty("sha256")?.let { hex ->
+                    runCatching { hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray() }.getOrNull()
+                }?.takeIf { it.size == FILE_SHA256_BYTES }
             )
             incomingFiles[transferId] = transfer
             notifyIncomingFileProgress(transferId, transfer)
@@ -851,6 +985,9 @@ class MeshManager(
                 setProperty("chunkCount", transfer.chunks.size.toString())
                 setProperty("timestamp", transfer.timestamp.toString())
                 setProperty("isBroadcast", transfer.isBroadcast.toString())
+                transfer.sha256?.let { hash ->
+                    setProperty("sha256", hash.joinToString("") { "%02x".format(it) })
+                }
             }
         )
     }
@@ -930,7 +1067,22 @@ class MeshManager(
         }
 
         val encrypted = decodeEncryptedPayload(packet.payload) ?: return null
-        return crypto.decryptMessage(packet.senderId, encrypted)
+        val plaintext = crypto.decryptMessage(packet.senderId, encrypted)
+        if (plaintext == null) {
+            // Authentic sender (signature checked above) but our session keys differ, e.g.
+            // after a handshake race or a restart on one side: negotiate a fresh session.
+            requestSessionRepair(packet.senderId)
+        }
+        return plaintext
+    }
+
+    private fun requestSessionRepair(nodeId: UUID) {
+        val now = System.currentTimeMillis()
+        val last = sessionRepairRequestedAt[nodeId] ?: 0L
+        if (now - last < SESSION_REPAIR_INTERVAL_MS) return
+        sessionRepairRequestedAt[nodeId] = now
+        transportLogListener?.invoke("session mismatch with ${nodeId.toString().take(8)}; re-handshaking")
+        initiateHandshake(nodeId)
     }
 
     private fun verifyOptionalPublicSignature(packet: MeshPacket): Boolean {
@@ -1018,6 +1170,13 @@ class MeshManager(
 
     override fun onHandshakeReceived(nodeId: UUID, publicKey: ByteArray) {
         onNeighborDiscovered(nodeId, ByteArray(0))
+        if (crypto.hasPendingHandshake(nodeId)) {
+            // Both sides started a handshake at once. If each answered the other, the two
+            // phones would end up with different session keys. Deterministic tie-break: the
+            // smaller node id keeps its own handshake; the other side drops its and answers.
+            if (localNodeId < nodeId) return
+            crypto.cancelPendingHandshake(nodeId)
+        }
         // Process handshake and send ACK
         when (val result = crypto.handleHandshakeAndCreateAck(nodeId, publicKey)) {
             is HandshakeResult.Success -> {
@@ -1039,9 +1198,17 @@ class MeshManager(
                 flushPendingOutbox(nodeId)
                 requestMissingFileChunks()
             }
+            is HandshakeResult.KeyChanged -> onPeerKeyChanged(nodeId, result)
             is HandshakeResult.Failed -> {
                 // Log failure
             }
+        }
+    }
+
+    private fun onPeerKeyChanged(nodeId: UUID, result: HandshakeResult.KeyChanged) {
+        transportLogListener?.invoke("identity key changed for ${nodeId.toString().take(8)}; session refused")
+        if (result.firstNotice) {
+            peerListener?.invoke(nodeId, PeerEvent.KEY_CHANGED)
         }
     }
 
@@ -1055,6 +1222,7 @@ class MeshManager(
                 flushPendingOutbox(nodeId)
                 requestMissingFileChunks()
             }
+            is HandshakeResult.KeyChanged -> onPeerKeyChanged(nodeId, result)
             is HandshakeResult.Failed -> {
                 // Log failure
             }
@@ -1062,12 +1230,14 @@ class MeshManager(
     }
 
     override fun onAckReceived(messageId: UUID) {
+        forgetOutboxEntry(messageId)
         if (trackedMessageDeliveries.remove(messageId)) {
             messageStatusListener?.invoke(messageId, MessageDeliveryStatus.DELIVERED)
         }
     }
 
     override fun onReadReceiptReceived(senderId: UUID, messageId: UUID) {
+        forgetOutboxEntry(messageId)
         if (trackedMessageDeliveries.remove(messageId)) {
             messageStatusListener?.invoke(messageId, MessageDeliveryStatus.READ)
         }
@@ -1201,6 +1371,22 @@ class MeshManager(
 
     fun getPeerSafetyNumber(nodeId: UUID): String? = crypto.getSafetyNumber(nodeId)
 
+    /** True when [nodeId] presented a different identity key and the user hasn't decided yet. */
+    fun hasPendingKeyChange(nodeId: UUID): Boolean = crypto.hasPendingKeyChange(nodeId)
+
+    /** Fingerprint of the not-yet-accepted new key, e.g. to compare with the contact's QR. */
+    fun getPendingKeyFingerprint(nodeId: UUID): String? = crypto.pendingKeyFingerprint(nodeId)
+
+    /**
+     * Accept the contact's new identity key and reconnect with it. [verified] when the user
+     * confirmed it out of band (scanned the contact's QR code).
+     */
+    fun acceptKeyChange(nodeId: UUID, verified: Boolean = false): Boolean {
+        if (!crypto.acceptKeyChange(nodeId, verified)) return false
+        initiateHandshake(nodeId)
+        return true
+    }
+
     fun markPeerAsVerified(nodeId: UUID) {
         crypto.getSessionInfo(nodeId)?.peerFingerprint?.let {
             crypto.markPeerAsVerified(it)
@@ -1250,6 +1436,13 @@ data class PeerInfo(
     var hopCount: Int = 2
 )
 
+class OutboxEntry(
+    val recipientId: UUID,
+    val payload: ByteArray,
+    val queuedAt: Long,
+    @Volatile var lastAttemptAt: Long = 0L
+)
+
 data class PendingOutboxMessage(
     val payload: ByteArray,
     val queuedAt: Long,
@@ -1265,7 +1458,9 @@ data class IncomingFileTransfer(
     val timestamp: Long,
     val isBroadcast: Boolean,
     var lastChunkRequestAt: Long = 0L,
-    var updatedAt: Long = System.currentTimeMillis()
+    var updatedAt: Long = System.currentTimeMillis(),
+    /** SHA-256 announced by the sender; null for senders on older versions. */
+    val sha256: ByteArray? = null
 )
 
 data class OrphanFileChunks(
@@ -1322,7 +1517,9 @@ enum class PeerEvent {
     DISCOVERED,
     SESSION_ESTABLISHED,
     DISCONNECTED,
-    VERIFIED
+    VERIFIED,
+    /** The peer's identity key differs from the pinned one; the session was refused. */
+    KEY_CHANGED
 }
 
 enum class MessageDeliveryStatus {
@@ -1351,6 +1548,10 @@ private const val KNOWN_PEER_MAX_AGE_MS = 60_000L
 private const val MAX_PENDING_OUTBOX_PER_PEER = 96
 private const val PENDING_OUTBOX_MAX_AGE_MS = 24 * 3600 * 1000L
 private const val MAX_CONCURRENT_INCOMING_TRANSFERS = 16
+private const val MAX_OUTBOX_MESSAGE_BYTES = 256 * 1024
+private const val OUTBOX_RESEND_INTERVAL_MS = 60_000L
+private const val SESSION_REPAIR_INTERVAL_MS = 20_000L
+private const val FILE_SHA256_BYTES = 32
 
 private fun ByteArray.asIterableChunks(size: Int): List<ByteArray> =
     indices.step(size).map { start ->

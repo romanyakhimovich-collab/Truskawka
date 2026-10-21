@@ -37,12 +37,13 @@ class PatchRadarView(
         color = BERRY_TEXT_DIM
         textSize = dp(11).toFloat()
         textAlign = Paint.Align.CENTER
+        typeface = AppFonts.regular
     }
     private val centerTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         textSize = dp(10).toFloat()
         textAlign = Paint.Align.CENTER
-        isFakeBoldText = true
+        typeface = AppFonts.bold
     }
 
     private var directCount: Int = 0

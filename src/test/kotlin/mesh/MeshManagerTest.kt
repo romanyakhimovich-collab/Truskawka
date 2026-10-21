@@ -13,6 +13,7 @@ import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -276,6 +277,150 @@ class MeshManagerTest {
         transportA.takeAll().filter { it.type == PacketType.MESSAGE }.forEach(managerB::onWifiDirectPacketReceived)
 
         assertEquals(listOf("genuine"), received)
+    }
+
+    @Test
+    fun `different key for a known node id is refused until the user accepts it`() {
+        // Fixed ids so the handshake tie-break is deterministic (A < B).
+        val nodeA = UUID(0, 1)
+        val nodeB = UUID(0, 2)
+        val transportA = CapturingTransport()
+        val transportB = CapturingTransport()
+        val transportImpostor = CapturingTransport()
+        val managerA = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeA), transportA, nodeA)
+        val realB = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeB), transportB, nodeB)
+        val impostor = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeB), transportImpostor, nodeB)
+        val events = mutableListOf<PeerEvent>()
+        managerA.setPeerListener { _, event -> events += event }
+        managerA.initialize()
+        realB.initialize()
+        impostor.initialize()
+
+        realB.initiateHandshakeWith(nodeA)
+        transportB.takeSingle(PacketType.HANDSHAKE).let(managerA::onWifiDirectPacketReceived)
+        transportA.takeSingle(PacketType.HANDSHAKE_ACK).let(realB::onWifiDirectPacketReceived)
+        val pinned = assertNotNull(managerA.getPeerFingerprint(nodeB))
+
+        impostor.initiateHandshakeWith(nodeA)
+        transportImpostor.takeSingle(PacketType.HANDSHAKE).let(managerA::onWifiDirectPacketReceived)
+
+        assertTrue(transportA.takeAll().none { it.type == PacketType.HANDSHAKE_ACK })
+        assertEquals(pinned, managerA.getPeerFingerprint(nodeB))
+        assertTrue(PeerEvent.KEY_CHANGED in events)
+        assertTrue(managerA.hasPendingKeyChange(nodeB))
+
+        assertTrue(managerA.acceptKeyChange(nodeB))
+        transportA.takeSingle(PacketType.HANDSHAKE).let(impostor::onWifiDirectPacketReceived)
+        transportImpostor.takeSingle(PacketType.HANDSHAKE_ACK).let(managerA::onWifiDirectPacketReceived)
+
+        assertFalse(managerA.hasPendingKeyChange(nodeB))
+        assertTrue(assertNotNull(managerA.getPeerFingerprint(nodeB)) != pinned)
+    }
+
+    @Test
+    fun `simultaneous handshakes end with one shared session`() {
+        val nodeA = UUID(0, 1)
+        val nodeB = UUID(0, 2)
+        val transportA = CapturingTransport()
+        val transportB = CapturingTransport()
+        val managerA = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeA), transportA, nodeA)
+        val managerB = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeB), transportB, nodeB)
+        val receivedByA = mutableListOf<String>()
+        val receivedByB = mutableListOf<String>()
+        managerA.setMessageListener { _, message, _, _ -> receivedByA += message }
+        managerB.setMessageListener { _, message, _, _ -> receivedByB += message }
+        managerA.initialize()
+        managerB.initialize()
+
+        managerA.initiateHandshakeWith(nodeB)
+        managerB.initiateHandshakeWith(nodeA)
+        val handshakeFromA = transportA.takeSingle(PacketType.HANDSHAKE)
+        val handshakeFromB = transportB.takeSingle(PacketType.HANDSHAKE)
+        managerB.onWifiDirectPacketReceived(handshakeFromA)
+        managerA.onWifiDirectPacketReceived(handshakeFromB)
+        transportB.takeAll().filter { it.type == PacketType.HANDSHAKE_ACK }.forEach(managerA::onWifiDirectPacketReceived)
+        transportA.takeAll().filter { it.type == PacketType.HANDSHAKE_ACK }.forEach(managerB::onWifiDirectPacketReceived)
+
+        assertTrue(managerA.sendMessage(nodeB, "hi") is SendResult.Sent)
+        transportA.takeAll().filter { it.type == PacketType.MESSAGE }.forEach(managerB::onWifiDirectPacketReceived)
+        assertTrue(managerB.sendMessage(nodeA, "yo") is SendResult.Sent)
+        transportB.takeAll().filter { it.type == PacketType.MESSAGE }.forEach(managerA::onWifiDirectPacketReceived)
+
+        assertEquals(listOf("hi"), receivedByB)
+        assertEquals(listOf("yo"), receivedByA)
+    }
+
+    @Test
+    fun `unconfirmed messages survive a restart and are sent with the same id`() {
+        val nodeA = UUID.randomUUID()
+        val nodeB = UUID.randomUUID()
+        val storageDir = Files.createTempDirectory("mesh-outbox-test").toFile()
+        val storageA = InMemorySecureKeyStorage()
+        try {
+            val firstA = MeshManager(storageA, FakeBleTransport(nodeA), CapturingTransport(), nodeA, storageDir.resolve("a"))
+            firstA.initialize()
+            val queuedId = assertNotNull((firstA.sendMessage(nodeB, "later") as SendResult.Queued).messageId)
+
+            // "Restart": a new manager over the same storage.
+            val transportA = CapturingTransport()
+            val transportB = CapturingTransport()
+            val secondA = MeshManager(storageA, FakeBleTransport(nodeA), transportA, nodeA, storageDir.resolve("a"))
+            val managerB = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeB), transportB, nodeB)
+            val received = mutableListOf<String>()
+            managerB.setMessageListener { _, message, _, _ -> received += message }
+            secondA.initialize()
+            managerB.initialize()
+            assertEquals(1, secondA.getDiagnostics().pendingHandshakeMessages)
+
+            secondA.initiateHandshakeWith(nodeB)
+            transportA.takeAll().last { it.type == PacketType.HANDSHAKE }.let(managerB::onWifiDirectPacketReceived)
+            transportB.takeSingle(PacketType.HANDSHAKE_ACK).let(secondA::onWifiDirectPacketReceived)
+            val sent = transportA.takeAll().single { it.type == PacketType.MESSAGE }
+            assertEquals(queuedId, sent.messageId)
+            managerB.onWifiDirectPacketReceived(sent)
+            assertEquals(listOf("later"), received)
+
+            // Recipient's ACK removes it from disk.
+            transportB.takeAll().filter { it.type == PacketType.ACK }.forEach(secondA::onWifiDirectPacketReceived)
+            assertTrue(storageDir.resolve("a/outbox").listFiles().orEmpty().none { it.name.endsWith(".msg") })
+        } finally {
+            storageDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `tampered file chunks fail the integrity check`() {
+        val nodeA = UUID.randomUUID()
+        val transportA = CapturingTransport()
+        val managerA = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeA), transportA, nodeA)
+        managerA.initialize()
+        val imageBytes = ByteArray(1_000) { (it % 211).toByte() }
+        assertTrue(managerA.sendImage(null, "public.jpg", "image/jpeg", imageBytes) is SendResult.Sent)
+        val packets = transportA.takeAll().filter {
+            it.type == PacketType.FILE_META || it.type == PacketType.FILE_CHUNK
+        }
+
+        fun receiver(): Pair<MeshManager, MutableList<ByteArray>> {
+            val node = UUID.randomUUID()
+            val files = mutableListOf<ByteArray>()
+            val manager = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(node), CapturingTransport(), node)
+            manager.initialize()
+            manager.setFileListener { _, _, _, bytes, _, _ -> files += bytes }
+            return manager to files
+        }
+
+        val (honest, honestFiles) = receiver()
+        packets.forEach(honest::onWifiDirectPacketReceived)
+        assertContentEquals(imageBytes, assertNotNull(honestFiles.singleOrNull()))
+
+        val (victim, victimFiles) = receiver()
+        val tamperedIndex = packets.indexOfLast { it.type == PacketType.FILE_CHUNK }
+        packets.mapIndexed { index, packet ->
+            if (index != tamperedIndex) packet else packet.copy(
+                payload = packet.payload.copyOf().also { it[it.lastIndex] = (it[it.lastIndex] + 1).toByte() }
+            )
+        }.forEach(victim::onWifiDirectPacketReceived)
+        assertTrue(victimFiles.isEmpty())
     }
 
     private class CapturingTransport : OpportunisticPacketTransmitter {

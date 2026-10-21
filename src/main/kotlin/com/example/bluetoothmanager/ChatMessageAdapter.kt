@@ -174,7 +174,7 @@ import java.util.Calendar
         private fun senderLabel(item: ChatMessage): TextView =
             delegate.terminalText(delegate.displayAuthor(item)).apply {
                 textSize = 12f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT_DIM)
                 setPadding(delegate.dp(6), 0, delegate.dp(6), 0)
             }
@@ -190,7 +190,7 @@ import java.util.Calendar
             TextView(context).apply {
                 text = delegate.displayDate(item)
                 textSize = 12f
-                typeface = Typeface.DEFAULT_BOLD
+                typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT_DIM)
                 gravity = Gravity.CENTER
                 background = delegate.roundedDrawable(SERVICE_BUBBLE, delegate.dp(12), SERVICE_BUBBLE_STROKE)
@@ -200,7 +200,7 @@ import java.util.Calendar
         private fun serviceBubble(item: ChatMessage): TextView =
             TextView(context).apply {
                 text = item.body
-                typeface = Typeface.DEFAULT
+                typeface = AppFonts.regular
                 textSize = 13f
                 setLineSpacing(delegate.dp(2).toFloat(), 1f)
                 gravity = Gravity.CENTER
@@ -228,7 +228,7 @@ import java.util.Calendar
 
                 addView(TextView(context).apply {
                     text = item.body.wrapForChatBubble()
-                    typeface = Typeface.DEFAULT
+                    typeface = AppFonts.regular
                     textSize = scaledText
                     setLineSpacing(delegate.dp(2).toFloat(), 1f)
                     setTextColor(if (item.mine) Color.WHITE else INCOMING_TEXT)
@@ -347,7 +347,7 @@ import java.util.Calendar
                         .filter { it.isNotBlank() }
                         .joinToString("  ")
                     this.textSize = textSize
-                    typeface = Typeface.DEFAULT
+                    typeface = AppFonts.regular
                     gravity = Gravity.END
                     setTextColor(tint)
                 }
@@ -361,7 +361,7 @@ import java.util.Calendar
                         .filter { it.isNotBlank() }
                         .joinToString("  ")
                     this.textSize = textSize
-                    typeface = Typeface.DEFAULT
+                    typeface = AppFonts.regular
                     gravity = Gravity.END
                     setTextColor(tint)
                 })
