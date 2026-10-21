@@ -35,6 +35,10 @@ import java.util.Calendar
                 })
             }
             if (!delegate.selectionMode || isServiceLog) {
+                // Briefly highlighted after jumping here from a reply quote.
+                if (delegate.isMessageHighlighted(item)) {
+                    content.setBackgroundColor((STRAWBERRY_RED and 0x00FFFFFF) or 0x33000000)
+                }
                 outer.addView(content, LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
@@ -226,8 +230,35 @@ import java.util.Calendar
                 }
                 setPadding(delegate.dp(16), delegate.dp(10), delegate.dp(14), delegate.dp(8))
 
+                // Replies are sent as "↪ author: preview\ntext"; show the quote as a tappable
+                // block that jumps to the original message.
+                val quote = item.body.takeIf { it.startsWith(REPLY_MARK) && it.contains('\n') }
+                    ?.substringBefore('\n')
+                val text = if (quote != null) item.body.substringAfter('\n') else item.body
+                if (quote != null) {
+                    addView(TextView(context).apply {
+                        this.text = quote.removePrefix(REPLY_MARK)
+                        typeface = AppFonts.regular
+                        textSize = 13f * delegate.messageTextScale
+                        maxLines = 2
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                        setTextColor(if (item.mine) 0xE6FFFFFF.toInt() else BERRY_TEXT_DIM)
+                        background = delegate.roundedDrawable(
+                            if (item.mine) 0x33FFFFFF else (STRAWBERRY_RED and 0x00FFFFFF) or 0x1A000000,
+                            delegate.dp(10)
+                        )
+                        setPadding(delegate.dp(10), delegate.dp(6), delegate.dp(10), delegate.dp(6))
+                        maxWidth = (context.resources.displayMetrics.widthPixels * 0.70f).toInt()
+                        contentDescription = delegate.tr("reply_jump").format(this.text)
+                        setOnClickListener { delegate.scrollToReplyOriginal(item, quote) }
+                    }, LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { bottomMargin = delegate.dp(6) })
+                }
+
                 addView(TextView(context).apply {
-                    text = item.body.wrapForChatBubble()
+                    this.text = text.wrapForChatBubble()
                     typeface = AppFonts.regular
                     textSize = scaledText
                     setLineSpacing(delegate.dp(2).toFloat(), 1f)
@@ -278,6 +309,7 @@ import java.util.Calendar
                         VoiceWaveforms.load(path) { peaks = it }
                     }
                     onSeek = { fraction -> delegate.seekAudio(item.audioPath, fraction) }
+                    contentDescription = delegate.tr("a11y_voice_seek")
                 }
                 val timeLabel = delegate.terminalText(delegate.audioDurationLabel(item.audioPath)).apply {
                     textSize = 13f
@@ -292,7 +324,23 @@ import java.util.Calendar
                     addView(LinearLayout(context).apply {
                         orientation = LinearLayout.VERTICAL
                         addView(waveform, LinearLayout.LayoutParams(delegate.dp(170), delegate.dp(30)))
-                        addView(timeLabel, LinearLayout.LayoutParams(
+                        addView(LinearLayout(context).apply {
+                            orientation = LinearLayout.HORIZONTAL
+                            gravity = Gravity.CENTER_VERTICAL
+                            addView(timeLabel)
+                            // "Not listened yet" dot for incoming voice notes.
+                            if (!item.mine && !item.listened) {
+                                addView(View(context).apply {
+                                    background = android.graphics.drawable.GradientDrawable().apply {
+                                        shape = android.graphics.drawable.GradientDrawable.OVAL
+                                        setColor(STRAWBERRY_RED)
+                                    }
+                                    contentDescription = delegate.tr("voice_not_listened")
+                                }, LinearLayout.LayoutParams(delegate.dp(7), delegate.dp(7)).apply {
+                                    marginStart = delegate.dp(6)
+                                })
+                            }
+                        }, LinearLayout.LayoutParams(
                             ViewGroup.LayoutParams.WRAP_CONTENT,
                             ViewGroup.LayoutParams.WRAP_CONTENT
                         ).apply {
@@ -339,7 +387,7 @@ import java.util.Calendar
                 MessageStatus.DELIVERED -> delegate.tr("status_ripe")
                 MessageStatus.READ -> delegate.tr("status_ripe")
                 MessageStatus.FAILED -> delegate.tr("status_failed")
-                null -> if (delegate.selectedRecipientId == null) delegate.tr("broadcast") else ""
+                null -> if (delegate.broadcastChat) delegate.tr("broadcast") else ""
             }
             if (!item.mine || item.status == null) {
                 return TextView(context).apply {

@@ -9,6 +9,8 @@ import java.util.UUID
 interface ChatMessageAdapterDelegate {
     val messageTextScale: Float
     val selectedRecipientId: UUID?
+    /** True in the public "Everyone" chat (messages there have no delivery status). */
+    val broadcastChat: Boolean
     val activePlayingPath: String?
     val cropChatImages: Boolean
     val selectionMode: Boolean
@@ -31,5 +33,7 @@ interface ChatMessageAdapterDelegate {
     fun bindVoicePlayback(path: String, views: VoicePlaybackViews)
     fun audioDurationLabel(path: String?): String
     fun isMessageSelected(message: ChatMessage): Boolean
+    fun isMessageHighlighted(message: ChatMessage): Boolean
+    fun scrollToReplyOriginal(reply: ChatMessage, quoteLine: String)
     fun toggleMessageSelection(message: ChatMessage)
 }

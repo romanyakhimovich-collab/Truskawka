@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The strawberry must fit the 66dp safe zone of the 108dp adaptive canvas, otherwise
+     launcher masks (circle, squircle) cut off the leaves. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/truskawka_logo"
+    android:inset="16%" />

@@ -94,6 +94,8 @@ class MainActivity : Activity() {
     private var serviceBound = false
     private var selectedRecipientId: UUID? = null
     private var selectedRecipientLabel: String = "everyone"
+    // "group:<id>" while a group chat is open (selectedRecipientId is null then).
+    private var selectedGroupKey: String? = null
     private var savedMessagesSelected = false
     private var normalizingNickname = false
     private var nicknameDialogShowing = false
@@ -117,6 +119,7 @@ class MainActivity : Activity() {
     private var use24HourFormat = true
     private var shortDateFormatEnabled = false
     private var meshAggressiveMode = true
+    private var technicalLogEnabled = false
     private var meshMaxHops = 8
     private var isRecordingVoice = false
     private var recorder: MediaRecorder? = null
@@ -158,6 +161,8 @@ class MainActivity : Activity() {
     private val chatAdapterDelegate = object : ChatMessageAdapterDelegate {
         override val messageTextScale: Float
             get() = this@MainActivity.messageTextScale
+        override val broadcastChat: Boolean
+            get() = !savedMessagesSelected && selectedGroupKey == null && selectedRecipientId == null
         override val selectedRecipientId: UUID?
             get() = this@MainActivity.selectedRecipientId
         override val activePlayingPath: String?
@@ -167,6 +172,9 @@ class MainActivity : Activity() {
         override val selectionMode: Boolean
             get() = selectedChatMessages.isNotEmpty()
         override fun isMessageSelected(message: ChatMessage): Boolean = message in selectedChatMessages
+        override fun isMessageHighlighted(message: ChatMessage): Boolean = message === highlightedMessage
+        override fun scrollToReplyOriginal(reply: ChatMessage, quoteLine: String) =
+            this@MainActivity.scrollToReplyOriginal(reply, quoteLine)
         override fun toggleMessageSelection(message: ChatMessage) =
             this@MainActivity.toggleMessageSelection(message)
 
@@ -214,6 +222,7 @@ class MainActivity : Activity() {
     private lateinit var selectionHeaderRow: LinearLayout
     private lateinit var selectionCountView: TextView
     private lateinit var selectionMoreButton: View
+    private var highlightedMessage: ChatMessage? = null
     private var voiceGestureActive = false
     private var voiceGestureCanceled = false
     private var voiceGestureDownX = 0f
@@ -271,11 +280,16 @@ class MainActivity : Activity() {
                 updateMessageStatus(line.substringAfter(":").trim(), MessageStatus.FAILED)
             } else if (line.startsWith("key changed:")) {
                 handlePeerKeyChanged(line.substringAfter("key changed:").trim())
+            } else if (line.startsWith("avatar updated:")) {
+                // A contact's profile photo arrived: redraw the header and rows that show it.
+                updateChatHeaderAvatar()
+                chatAdapter.notifyDataSetChanged()
             } else if (!line.isScanNoise()) {
                 if (line.contains("relay", ignoreCase = true) || line.contains("wifi-direct", ignoreCase = true)) {
                     lastRelayInfo = line
                 }
-                addMessage("mesh", line, false)
+                // Raw radio/transport log: only for users who turned on the technical log.
+                if (technicalLogEnabled) addMessage("mesh", line, false)
             }
             refreshHeader()
         }
@@ -323,6 +337,7 @@ class MainActivity : Activity() {
         cleanupMediaCache()
         buildUi()
         val openedFromIntent = handleOpenChatIntent(intent)
+        showCommunityRulesIfNeeded()
         if (!openedFromIntent && !chatListShownAtStartup) {
             chatListShownAtStartup = true
             mainHandler.post { showChatList() }
@@ -499,7 +514,9 @@ class MainActivity : Activity() {
                     setStroke(dp(1), SOFT_PINK_STROKE)
                 }
                 elevation = dp(2).toFloat()
+                minimumHeight = dp(56)
                 setPadding(dp(6), dp(5), dp(16), dp(5))
+                contentDescription = tr("chat_profile")
                 setOnClickListener { showCurrentChatProfile() }
                 addView(chatHeaderAvatarSlot, LinearLayout.LayoutParams(dp(44), dp(44)).apply {
                     marginEnd = dp(10)
@@ -509,7 +526,7 @@ class MainActivity : Activity() {
                     addView(chatTitleView)
                     addView(networkStatusView)
                 }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            }, LinearLayout.LayoutParams(0, dp(56), 1f))
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
             statusGroup = LinearLayout(this@MainActivity).apply { visibility = View.GONE }
             counterView = terminalText("0")
@@ -588,9 +605,10 @@ class MainActivity : Activity() {
                 ellipsize = TextUtils.TruncateAt.END
                 background = pillBackground()
                 elevation = dp(2).toFloat()
-                setPadding(dp(18), 0, dp(12), 0)
+                minHeight = dp(52)
+                setPadding(dp(18), dp(6), dp(12), dp(6))
             }
-            addView(selectionCountView, LinearLayout.LayoutParams(0, dp(52), 1f).apply {
+            addView(selectionCountView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 marginEnd = dp(8)
             })
             selectionMoreButton = iconButton(ChatIcon.MORE, tr("react")) {
@@ -602,9 +620,9 @@ class MainActivity : Activity() {
                 background = pillBackground()
                 elevation = dp(2).toFloat()
                 setPadding(dp(6), 0, dp(6), 0)
-                val size = LinearLayout.LayoutParams(dp(42), dp(42))
+                val size = LinearLayout.LayoutParams(dp(48), dp(48))
                 addView(iconButton(ChatIcon.COPY, tr("copy")) { copySelectedMessages() }, LinearLayout.LayoutParams(size))
-                addView(iconButton(ChatIcon.FORWARD, tr("forward_saved")) { forwardSelectedMessages() }, LinearLayout.LayoutParams(size))
+                addView(iconButton(ChatIcon.FORWARD, tr("forward")) { forwardSelectedMessages() }, LinearLayout.LayoutParams(size))
                 addView(iconButton(ChatIcon.DELETE, tr("delete")) { confirmDeleteMessages(selectedMessagesInOrder()) }, LinearLayout.LayoutParams(size))
                 addView(selectionMoreButton, LinearLayout.LayoutParams(size))
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)))
@@ -657,12 +675,42 @@ class MainActivity : Activity() {
         exitMessageSelection()
     }
 
+    /** Forward the selection to a chat the user picks (any contact, group, Everyone, Saved). */
     private fun forwardSelectedMessages() {
         val targets = selectedMessagesInOrder()
+        if (targets.isEmpty()) return
         exitMessageSelection()
-        targets.forEach { forwardMessageToSaved(it, notify = false) }
-        if (savedMessagesSelected) showSavedMessages()
-        Toast.makeText(this, tr("forwarded_to_saved"), Toast.LENGTH_SHORT).show()
+        val chats = chatStore.listChats().filter { it.kind != ChatKind.PEER.name || it.peerId != null }
+        showStyledActionDialog(actions = chats.map { summary ->
+            StyledActionItem(summaryDisplayTitle(summary)) { forwardMessages(targets, summary) }
+        })
+    }
+
+    /**
+     * Re-sends the messages from the target chat through the normal send paths, so they are
+     * encrypted / fanned out to group members exactly like freshly written ones.
+     */
+    private fun forwardMessages(targets: List<ChatMessage>, destination: ChatSummary) {
+        if (destination.kind == ChatKind.SAVED.name) {
+            targets.forEach { forwardMessageToSaved(it, notify = false) }
+            if (savedMessagesSelected) showSavedMessages()
+        } else {
+            val peerId = destination.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+            selectChat(destination.chatKey, summaryDisplayTitle(destination), peerId)
+            targets.forEach { message ->
+                when {
+                    message.imagePath != null -> File(message.imagePath).takeIf { it.isFile }
+                        ?.let { sendSelectedImage(Uri.fromFile(it), "") }
+                    // Copy: sending must not depend on (or later delete) the original note.
+                    message.audioPath != null -> File(message.audioPath).takeIf { it.isFile }?.let { original ->
+                        val copy = File(original.parentFile, "fwd_${System.currentTimeMillis()}_${original.name}")
+                        runCatching { original.copyTo(copy) }.onSuccess { sendPreparedVoice(it) }
+                    }
+                    else -> sendTextMessage(message.body)
+                }
+            }
+        }
+        Toast.makeText(this, tr("forwarded_to").format(summaryDisplayTitle(destination)), Toast.LENGTH_SHORT).show()
     }
 
     @Deprecated("Deprecated in Java")
@@ -686,7 +734,7 @@ class MainActivity : Activity() {
             AvatarView(
                 context = this,
                 label = title,
-                imagePath = null,
+                imagePath = PeerAvatars.pathFor(this, selectedRecipientId?.toString()),
                 accentColor = avatarAccent(title),
                 verified = verified
             )
@@ -748,10 +796,10 @@ class MainActivity : Activity() {
                 addView(messageInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                 addView(View(this@MainActivity).apply {
                     background = paperclipIconDrawable(BERRY_TEXT_DIM)
-                    contentDescription = tr("photo")
+                    contentDescription = tr("a11y_attach_photo")
                     isClickable = true
                     setOnClickListener { openImagePicker() }
-                }, LinearLayout.LayoutParams(dp(44), dp(44)).apply {
+                }, LinearLayout.LayoutParams(dp(48), dp(48)).apply {
                     marginEnd = dp(4)
                 })
             }
@@ -1195,6 +1243,7 @@ class MainActivity : Activity() {
                 setOnClickListener {
                     val cropped = cropView.crop(512)
                     AppProfileStore.setAvatarBitmap(this@MainActivity, cropped)
+                    meshService?.shareAvatarWithNearbyPeers()
                     cropped.recycle()
                     runCatching { chatAdapter.notifyDataSetChanged() }
                     dialog.dismiss()
@@ -1343,12 +1392,17 @@ class MainActivity : Activity() {
     }
 
     private fun sendSelectedImage(uri: Uri, caption: String) {
+        if (blockedChatGuard()) return
         if (!isRecipientWithinHopLimit(selectedRecipientId)) {
             addMessage("mesh", tr("mesh_hop_limit_reached"), false)
             return
         }
         val fileName = ImageTransferPreparer.queryDisplayName(contentResolver, uri)
         showImageProgress(tr("preparing_image"))
+        // Captured now: the user may switch chats while the image is being compressed.
+        val groupKey = selectedGroupKey
+        val recipientId = selectedRecipientId
+        val tracksDelivery = groupKey != null || recipientId != null
 
         thread(name = "image-compress-send") {
             val prepared = ImageTransferPreparer.prepareForTransfer(contentResolver, uri, fileName, mediaQuality)
@@ -1384,7 +1438,7 @@ class MainActivity : Activity() {
                         author = author,
                         imagePath = localPath,
                         mine = true,
-                        status = if (selectedRecipientId == null) null else MessageStatus.SENDING
+                        status = if (tracksDelivery) MessageStatus.SENDING else null
                     )
                     showImageProgress(tr("sending_image"))
                 }
@@ -1393,12 +1447,20 @@ class MainActivity : Activity() {
             if (savedMessagesSelected) return@thread
 
             sentCounter += 1
-            val result = meshService?.sendImage(
-                selectedRecipientId?.toString(),
-                prepared.fileName,
-                prepared.mimeType,
-                prepared.bytes
-            ) ?: SendResult.Failed("service offline")
+            val result = if (groupKey != null) {
+                if (sendGroupFile(groupKey, prepared.fileName, prepared.mimeType, prepared.bytes)) {
+                    SendResult.Sent(UUID.randomUUID())
+                } else {
+                    SendResult.Failed(tr("group_nobody_reachable"))
+                }
+            } else {
+                meshService?.sendImage(
+                    recipientId?.toString(),
+                    prepared.fileName,
+                    prepared.mimeType,
+                    prepared.bytes
+                ) ?: SendResult.Failed("service offline")
+            }
             runOnUiThread {
                 if (result is SendResult.Failed) {
                     localImageHolder[0]?.let {
@@ -1407,10 +1469,10 @@ class MainActivity : Activity() {
                     }
                     failedCounter += 1
                     hideImageProgress()
-                    addMessage("mesh", result.toUiText(), false)
+                    addMessage("mesh", sendFailureText(result), false)
                 } else {
                     localImageHolder[0]?.let {
-                        it.status = if (selectedRecipientId == null) null else MessageStatus.DELIVERED
+                        it.status = if (tracksDelivery) MessageStatus.DELIVERED else null
                         persistChatMessageIdentity(it)
                     }
                     if (caption.isNotBlank()) {
@@ -1425,6 +1487,7 @@ class MainActivity : Activity() {
 
     private fun sendTextMessage(text: String) {
         if (text.isBlank()) return
+        if (blockedChatGuard()) return
         val payloadText = applyReplyToBody(text)
         val author = usernameField.text.toString().prefixAt()
         val targetId = selectedRecipientId
@@ -1434,6 +1497,14 @@ class MainActivity : Activity() {
         }
         if (savedMessagesSelected) {
             saveLocalMessage(ChatMessage(author, payloadText, true, status = MessageStatus.READ))
+            return
+        }
+        selectedGroupKey?.let { groupKey ->
+            val groupMessage = addMessage(author = author, body = payloadText, mine = true, status = MessageStatus.SENDING)
+            sentCounter += 1
+            groupMessage.messageId = sendGroupText(groupKey, payloadText)
+            if (groupMessage.messageId == null) groupMessage.status = MessageStatus.FAILED
+            persistChatMessageIdentity(groupMessage)
             return
         }
         val localMessage = addMessage(
@@ -1463,7 +1534,7 @@ class MainActivity : Activity() {
                     persistChatMessageIdentity(localMessage)
                     clearSendTimeout(localMessage.localId)
                     failedCounter += 1
-                    addMessage("mesh", result.toUiText(), false)
+                    addMessage("mesh", sendFailureText(result), false)
                 }
             }
             is SendResult.Queued -> {
@@ -1484,6 +1555,7 @@ class MainActivity : Activity() {
     }
 
     private fun startVoiceRecording() {
+        if (blockedChatGuard()) return
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), RECORD_AUDIO_REQUEST_CODE)
             Toast.makeText(this, tr("mic_permission_needed"), Toast.LENGTH_SHORT).show()
@@ -1588,6 +1660,7 @@ class MainActivity : Activity() {
 
     private fun sendPreparedVoice(file: File) {
         val targetId = selectedRecipientId
+        val groupKey = selectedGroupKey
         if (!isRecipientWithinHopLimit(targetId)) {
             addMessage("mesh", tr("mesh_hop_limit_reached"), false)
             return
@@ -1620,10 +1693,23 @@ class MainActivity : Activity() {
             audioPath = file.absolutePath,
             mine = true,
             timestamp = timestamp,
-            status = if (targetId == null) null else MessageStatus.SENDING
+            status = if (targetId == null && groupKey == null) null else MessageStatus.SENDING
         )
         showImageProgress(tr("sending_voice"))
         sentCounter += 1
+        if (groupKey != null) {
+            thread(name = "voice-send-group") {
+                val sent = sendGroupFile(groupKey, file.name, "audio/mp4", bytes)
+                runOnUiThread {
+                    localMessage.status = if (sent) MessageStatus.DELIVERED else MessageStatus.FAILED
+                    persistChatMessageIdentity(localMessage)
+                    chatAdapter.notifyDataSetChanged()
+                    showImageProgress(if (sent) tr("voice_sent") else tr("voice_send_failed"))
+                    mainHandler.postDelayed({ hideImageProgress() }, 1_200)
+                }
+            }
+            return
+        }
         thread(name = "voice-send") {
             var result: SendResult = SendResult.Failed("send not attempted")
             val attempts = if (targetId == null) 1 else VOICE_SEND_ATTEMPTS
@@ -1650,7 +1736,7 @@ class MainActivity : Activity() {
                     localMessage.status = null
                     persistChatMessageIdentity(localMessage)
                     failedCounter += 1
-                    addMessage("mesh", result.toUiText(), false)
+                    addMessage("mesh", sendFailureText(result), false)
                 } else if (result is SendResult.Sent && targetId != null) {
                     localMessage.messageId = result.messageId
                     persistChatMessageIdentity(localMessage)
@@ -1678,6 +1764,14 @@ class MainActivity : Activity() {
             }
         }
         actionButton.textSize = if (messageInput.text.toString().isBlank() || isRecordingVoice) 16f else 22f
+        // Icon-only button: tell screen readers what it does right now.
+        actionButton.contentDescription = tr(
+            when {
+                isRecordingVoice -> "a11y_recording"
+                messageInput.text.toString().isBlank() -> "a11y_record_voice"
+                else -> "send"
+            }
+        )
         updateRecordingUi()
     }
 
@@ -1704,6 +1798,17 @@ class MainActivity : Activity() {
                 typeface = AppFonts.bold
                 setTextColor(BERRY_TEXT)
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(terminalAction("+ ${tr("group_new")}").apply {
+                textSize = 14f
+                setTextColor(Color.WHITE)
+                background = roundedDrawable(STRAWBERRY_RED, dp(18))
+                setPadding(dp(14), dp(8), dp(14), dp(8))
+                minHeight = dp(40)
+                setOnClickListener {
+                    dialog.dismiss()
+                    showCreateGroupDialog()
+                }
+            })
         }
         root.addView(header)
 
@@ -1886,6 +1991,10 @@ class MainActivity : Activity() {
             typeface = AppFonts.bold
             setTextColor(if (selected) Color.WHITE else BERRY_TEXT_DIM)
             background = roundedDrawable(if (selected) STRAWBERRY_RED else Color.TRANSPARENT, dp(12))
+            // Min height instead of a fixed one: grows with the system font size.
+            minHeight = dp(46)
+            setPadding(dp(4), dp(6), dp(4), dp(6))
+            isSelected = selected
             setOnClickListener { onClick() }
         }
 
@@ -1902,20 +2011,49 @@ class MainActivity : Activity() {
             setPadding(dp(6), dp(8), dp(6), dp(8))
             background = roundedDrawable(INPUT_SURFACE, dp(14), SOFT_PINK_STROKE)
 
-            addView(chatListBottomItem(tr("nav_nearby"), selected == PageTab.NEW_CONTACTS, onNewContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+            addView(chatListBottomItem(tr("nav_nearby"), selected == PageTab.NEW_CONTACTS, onNewContacts), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 marginEnd = dp(4)
             })
-            addView(chatListBottomItem(tr("chats"), selected == PageTab.CONTACTS, onContacts), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+            // Chats tab carries the total unread count (persisted per chat in the database).
+            val totalUnread = runCatching { chatStore.totalUnread() }.getOrDefault(0)
+            addView(FrameLayout(this@MainActivity).apply {
+                clipChildren = false
+                addView(chatListBottomItem(tr("chats"), selected == PageTab.CONTACTS, onContacts), FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                ))
+                if (totalUnread > 0) {
+                    addView(unreadBadge(totalUnread), FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        Gravity.TOP or Gravity.END
+                    ).apply { topMargin = -dp(4) })
+                }
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 marginStart = dp(4)
                 marginEnd = dp(4)
             })
-            addView(chatListBottomItem(tr("profile"), selected == PageTab.PROFILE, onProfile), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+            addView(chatListBottomItem(tr("profile"), selected == PageTab.PROFILE, onProfile), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 marginStart = dp(4)
                 marginEnd = dp(4)
             })
-            addView(chatListBottomItem(tr("settings"), selected == PageTab.SETTINGS, onSettings), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+            addView(chatListBottomItem(tr("settings"), selected == PageTab.SETTINGS, onSettings), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 marginStart = dp(4)
             })
+        }
+
+    /** Red pill with the unread count ("99+" above 99). */
+    private fun unreadBadge(count: Int): TextView =
+        terminalText(if (count > 99) "99+" else count.toString()).apply {
+            textSize = 11f
+            typeface = AppFonts.bold
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            minWidth = dp(20)
+            minHeight = dp(20)
+            background = roundedDrawable(STRAWBERRY_RED, dp(10))
+            setPadding(dp(6), 0, dp(6), 0)
+            contentDescription = tr("unread_count").format(count)
         }
 
     private fun chatSummaryRow(
@@ -1951,7 +2089,7 @@ class MainActivity : Activity() {
                 AvatarView(
                     context = this@MainActivity,
                     label = displayTitle,
-                    imagePath = null,
+                    imagePath = PeerAvatars.pathFor(this@MainActivity, summary.peerId),
                     accentColor = avatarAccent(displayTitle),
                     verified = summary.verified
                 )
@@ -1995,9 +2133,7 @@ class MainActivity : Activity() {
                 marginEnd = if (summary.unreadCount > 0) dp(8) else 0
             })
             if (summary.unreadCount > 0) {
-                addView(View(this@MainActivity).apply {
-                    background = circleDrawable(STRAWBERRY_RED)
-                }, LinearLayout.LayoutParams(if (compact) dp(8) else dp(10), if (compact) dp(8) else dp(10)))
+                addView(unreadBadge(summary.unreadCount))
             }
             setOnClickListener { onClick() }
             setOnLongClickListener {
@@ -2073,7 +2209,7 @@ class MainActivity : Activity() {
                     triggerMeshScan()
                     Toast.makeText(this@MainActivity, tr("status_searching_nearby"), Toast.LENGTH_SHORT).show()
                 }
-            }, LinearLayout.LayoutParams(dp(46), dp(46)))
+            }, LinearLayout.LayoutParams(dp(48), dp(48)))
         })
 
         // --- Radio status line ----------------------------------------------------------------
@@ -2122,6 +2258,7 @@ class MainActivity : Activity() {
             setPadding(dp(18), 0, dp(6), 0)
             // Fixed "@" prefix makes it obvious that people are found by their tag.
             addView(terminalText("@").apply {
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                 textSize = 18f
                 typeface = AppFonts.bold
                 setTextColor(STRAWBERRY_RED)
@@ -2207,6 +2344,7 @@ class MainActivity : Activity() {
                 (nodeId != null && nodeId.toString().startsWith(query))
 
             val nearby = meshService?.knownPeers().orEmpty()
+                .filterNot { BlockList.isBlocked(this, it.nodeId) }
                 .filter { it.hopCount <= meshMaxHops || it.isDirect }
                 .filter { matches(it.displayName ?: "", it.nodeId) }
             val isDirect = { peer: mesh.PeerInfo -> peer.isDirect || peer.hopCount <= 1 }
@@ -2274,7 +2412,8 @@ class MainActivity : Activity() {
                             tag = tag,
                             subtitle = subtitle,
                             dotColor = if (isDirect(peer)) LEAF_GREEN else STRAWBERRY_RED,
-                            verified = chatStore.getPeer(peer.nodeId.toString())?.verified == true
+                            verified = chatStore.getPeer(peer.nodeId.toString())?.verified == true,
+                            nodeId = peer.nodeId.toString()
                         ) { openChatWith(peer.nodeId, tag) },
                         LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                             bottomMargin = dp(8)
@@ -2293,7 +2432,8 @@ class MainActivity : Activity() {
                             tag = title.prefixAt(),
                             subtitle = "${tr("last_seen_prefix")} ${formatPeerPresence(stored?.lastSeen ?: 0L)}",
                             dotColor = BERRY_TEXT_DIM,
-                            verified = stored?.verified == true
+                            verified = stored?.verified == true,
+                            nodeId = id.toString()
                         ) { openChatWith(id, title) },
                         LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                             bottomMargin = dp(8)
@@ -2395,6 +2535,7 @@ class MainActivity : Activity() {
         subtitle: String,
         dotColor: Int,
         verified: Boolean,
+        nodeId: String? = null,
         onClick: () -> Unit
     ): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
@@ -2404,7 +2545,7 @@ class MainActivity : Activity() {
         addView(AvatarView(
             context = this@MainActivity,
             label = tag,
-            imagePath = null,
+            imagePath = PeerAvatars.pathFor(this@MainActivity, nodeId),
             accentColor = avatarAccent(tag),
             verified = verified
         ), LinearLayout.LayoutParams(dp(46), dp(46)).apply { marginEnd = dp(12) })
@@ -2671,7 +2812,8 @@ class MainActivity : Activity() {
             mine = mine,
             audioPath = audioPath,
             timestamp = timestamp,
-            status = status
+            status = status,
+            listened = mine
         )
         val actualChatKey = if (author == "system" || author == "mesh") CHAT_EVERYONE else chatKey
         val buffer = messagesForChat(actualChatKey)
@@ -2704,6 +2846,19 @@ class MainActivity : Activity() {
             return
         }
         sender.nodeId?.let { rememberPeer(it, author) }
+        val group = if (sender.isBroadcast) null else GroupProtocol.decodeText(body)
+        if (group != null) {
+            val groupKey = applyGroupEnvelope(group) ?: return
+            if (groupKey != currentChatKey()) chatStore.incrementUnread(groupKey)
+            if (group.body.isBlank()) {
+                // Invite: we were added to the group.
+                addMessage("mesh", tr("group_added").format(author, group.name), false, chatKey = groupKey)
+            } else {
+                addMessage(author, group.body, mine = false, timestamp = timestamp, chatKey = groupKey)
+            }
+            if (groupKey == currentChatKey()) updateChatTitle()
+            return
+        }
         val chatKey = incomingChatKey(sender)
         if (chatKey != currentChatKey()) chatStore.incrementUnread(chatKey)
         addMessage(author, body, mine = false, timestamp = timestamp, chatKey = chatKey)
@@ -2892,10 +3047,217 @@ class MainActivity : Activity() {
         showChatMessages(CHAT_EVERYONE)
     }
 
+    // ==================== Group chats ====================
+
+    /** Members of a group, excluding ourselves. */
+    private fun groupMembers(chatKey: String): List<UUID> {
+        val self = meshService?.nodeId
+        return chatStore.getGroupMembers(chatKey)
+            .mapNotNull { runCatching { UUID.fromString(it) }.getOrNull() }
+            .filter { it != self }
+    }
+
+    private fun groupTitle(chatKey: String): String =
+        chatStore.listChats().firstOrNull { it.chatKey == chatKey }?.title ?: tr("group")
+
+    private fun groupEnvelope(chatKey: String, body: String): String? {
+        val groupId = GroupProtocol.groupIdFromChatKey(chatKey) ?: return null
+        val self = meshService?.nodeId ?: return null
+        return GroupProtocol.encodeText(groupId, groupTitle(chatKey), listOf(self) + groupMembers(chatKey), body)
+    }
+
+    /**
+     * Sends a group text to every member over their private encrypted channel. Returns the
+     * id of the first member's copy, which the bubble's delivery status follows.
+     */
+    private fun sendGroupText(chatKey: String, body: String, recipients: List<UUID> = groupMembers(chatKey)): UUID? {
+        val envelope = groupEnvelope(chatKey, body) ?: return null
+        var trackId: UUID? = null
+        recipients.forEach { member ->
+            meshService?.prepareChatWith(member.toString())
+            val id = when (val result = meshService?.sendMessage(member.toString(), envelope)) {
+                is SendResult.Sent -> result.messageId
+                is SendResult.Queued -> result.messageId
+                else -> null
+            }
+            if (trackId == null) trackId = id
+        }
+        return trackId
+    }
+
+    /** Sends a photo/voice file to every member; true if at least one transfer started. */
+    private fun sendGroupFile(chatKey: String, fileName: String, mimeType: String, bytes: ByteArray): Boolean {
+        val groupId = GroupProtocol.groupIdFromChatKey(chatKey) ?: return false
+        val wireName = GroupProtocol.encodeFileName(groupId, fileName)
+        var anySent = false
+        groupMembers(chatKey).forEach { member ->
+            meshService?.prepareChatWith(member.toString())
+            if (meshService?.sendImage(member.toString(), wireName, mimeType, bytes) is SendResult.Sent) {
+                anySent = true
+            }
+        }
+        return anySent
+    }
+
+    private fun leftGroups(): Set<String> =
+        getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+            .getStringSet(UI_SETTINGS_LEFT_GROUPS, emptySet()).orEmpty()
+
+    private fun setGroupLeft(groupId: UUID, left: Boolean) {
+        val updated = leftGroups().toMutableSet().apply {
+            if (left) add(groupId.toString()) else remove(groupId.toString())
+        }
+        getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+            .edit().putStringSet(UI_SETTINGS_LEFT_GROUPS, updated).apply()
+    }
+
+    /** Creates or refreshes a group from an incoming envelope; null if the user left it. */
+    private fun applyGroupEnvelope(envelope: GroupProtocol.Envelope): String? {
+        if (envelope.groupId.toString() in leftGroups()) return null
+        val chatKey = GroupProtocol.chatKey(envelope.groupId)
+        val self = meshService?.nodeId
+        chatStore.upsertGroup(chatKey, envelope.name, envelope.members.filter { it != self }.map { it.toString() })
+        return chatKey
+    }
+
+    /** A group photo/voice can arrive before any text: create a placeholder group for it. */
+    private fun ensureGroupForFile(groupId: UUID, senderId: UUID?): String {
+        val chatKey = GroupProtocol.chatKey(groupId)
+        if (chatStore.listChats().none { it.chatKey == chatKey }) {
+            chatStore.upsertGroup(chatKey, tr("group"), listOfNotNull(senderId?.toString()))
+        }
+        return chatKey
+    }
+
+    /** Contacts that can be added to a group: known peers with a private chat. */
+    private fun groupCandidates(): List<Pair<UUID, String>> =
+        chatStore.listChats()
+            .filter { it.kind == ChatKind.PEER.name }
+            .mapNotNull { summary ->
+                val id = summary.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() } ?: return@mapNotNull null
+                if (BlockList.isBlocked(this, id)) return@mapNotNull null
+                id to summaryDisplayTitle(summary)
+            }
+
+    /** Checkbox list of contacts; [preselected] are shown checked and can't be removed. */
+    private fun showMemberPicker(
+        title: String,
+        excluded: Set<UUID>,
+        nameInput: EditText?,
+        onConfirm: (name: String?, members: List<UUID>) -> Unit
+    ) {
+        val candidates = groupCandidates().filter { it.first !in excluded }
+        if (candidates.isEmpty()) {
+            Toast.makeText(this, tr("group_no_contacts"), Toast.LENGTH_LONG).show()
+            return
+        }
+        val checks = mutableListOf<Pair<UUID, CheckBox>>()
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+            nameInput?.let {
+                addView(it, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    bottomMargin = dp(10)
+                })
+            }
+            addView(terminalText(tr("group_pick_members")).apply {
+                textSize = 13f
+                setTextColor(BERRY_TEXT_DIM)
+                setPadding(0, 0, 0, dp(4))
+            })
+            candidates.forEach { (id, label) ->
+                val box = CheckBox(this@MainActivity).apply {
+                    text = label
+                    textSize = 16f
+                    setTextColor(BERRY_TEXT)
+                    typeface = AppFonts.regular
+                    minHeight = dp(48)
+                }
+                checks += id to box
+                addView(box)
+            }
+        }
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(ScrollView(this).apply { addView(content) })
+            .setPositiveButton(tr("done")) { _, _ ->
+                val chosen = checks.filter { it.second.isChecked }.map { it.first }.take(GroupProtocol.MAX_MEMBERS - 1)
+                val name = nameInput?.text?.toString()?.trim()?.take(GroupProtocol.MAX_NAME_LENGTH)
+                if (chosen.isEmpty() || (nameInput != null && name.isNullOrBlank())) {
+                    Toast.makeText(this, tr("group_need_name_members"), Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                onConfirm(name, chosen)
+            }
+            .setNegativeButton(tr("cancel"), null)
+            .show()
+    }
+
+    private fun showCreateGroupDialog() {
+        val nameInput = EditText(this).apply {
+            hint = tr("group_name_hint")
+            setSingleLine(true)
+            textSize = 16f
+            typeface = AppFonts.regular
+            setTextColor(BERRY_TEXT)
+            setHintTextColor(BERRY_TEXT_DIM)
+            filters = arrayOf(InputFilter.LengthFilter(GroupProtocol.MAX_NAME_LENGTH))
+        }
+        showMemberPicker(tr("group_new"), emptySet(), nameInput) { name, members ->
+            val groupId = UUID.randomUUID()
+            val chatKey = GroupProtocol.chatKey(groupId)
+            setGroupLeft(groupId, false)
+            chatStore.upsertGroup(chatKey, name ?: tr("group"), members.map { it.toString() })
+            // Empty body = invite: the group appears on members' phones right away.
+            sendGroupText(chatKey, "")
+            selectChat(chatKey, name ?: tr("group"), null)
+        }
+    }
+
+    private fun showGroupProfile(chatKey: String) {
+        val members = groupMembers(chatKey)
+        val names = members.map { id ->
+            chatStore.getPeer(id.toString())?.alias?.toDisplayTitle() ?: "@${id.toString().take(8)}"
+        }
+        val list = (listOf("${contactDisplayName()} (${tr("you")})") + names).joinToString("\n") { "• $it" }
+        AlertDialog.Builder(this)
+            .setTitle(groupTitle(chatKey))
+            .setMessage("${tr("group_members_count").format(members.size + 1)}\n\n$list")
+            .setPositiveButton(tr("group_add_members")) { _, _ ->
+                showMemberPicker(tr("group_add_members"), members.toSet(), null) { _, added ->
+                    chatStore.upsertGroup(chatKey, groupTitle(chatKey), (members + added).map { it.toString() })
+                    // New members get an invite with the full list; everyone else learns the
+                    // new list with the next group message.
+                    sendGroupText(chatKey, "", added)
+                    updateChatTitle()
+                }
+            }
+            .setNegativeButton(tr("group_leave")) { _, _ ->
+                AlertDialog.Builder(this)
+                    .setMessage(tr("group_leave_confirm"))
+                    .setPositiveButton(tr("group_leave")) { _, _ -> leaveGroup(chatKey) }
+                    .setNegativeButton(tr("cancel"), null)
+                    .show()
+            }
+            .setNeutralButton(tr("close"), null)
+            .show()
+    }
+
+    private fun leaveGroup(chatKey: String) {
+        val groupId = GroupProtocol.groupIdFromChatKey(chatKey) ?: return
+        setGroupLeft(groupId, true)
+        chatStore.deleteChat(chatKey, null)
+        peerMessages.remove(chatKey)
+        Toast.makeText(this, tr("group_left"), Toast.LENGTH_SHORT).show()
+        selectChat(CHAT_EVERYONE, "everyone", null)
+        showChatList()
+    }
+
     private fun selectChat(chatKey: String, title: String, peerId: UUID?) {
         exitMessageSelection()
         savedMessagesSelected = chatKey == CHAT_SAVED
-        selectedRecipientId = peerId
+        selectedGroupKey = chatKey.takeIf { it.startsWith(GroupProtocol.CHAT_KEY_PREFIX) }
+        selectedRecipientId = if (selectedGroupKey != null) null else peerId
         clearReplyTarget()
         selectedRecipientLabel = when {
             chatKey == CHAT_SAVED -> "saved"
@@ -2947,6 +3309,7 @@ class MainActivity : Activity() {
 
     private fun currentChatKey(): String = when {
         savedMessagesSelected -> CHAT_SAVED
+        selectedGroupKey != null -> selectedGroupKey!!
         selectedRecipientId != null -> peerChatKey(selectedRecipientId!!)
         else -> CHAT_EVERYONE
     }
@@ -2991,12 +3354,17 @@ class MainActivity : Activity() {
         val parts = raw.split("|")
         val label = parts.firstOrNull().orEmpty().ifBlank { "@peer" }
         val nodeId = parts.getOrNull(1)?.let { runCatching { UUID.fromString(it) }.getOrNull() }
-        val isBroadcast = parts.getOrNull(2) == "broadcast"
-        return IncomingSender(label, nodeId, isBroadcast)
+        val scope = parts.getOrNull(2).orEmpty()
+        val isBroadcast = scope == "broadcast"
+        val groupId = GroupProtocol.groupIdFromChatKey(scope)
+        return IncomingSender(label, nodeId, isBroadcast, groupId)
     }
 
     private fun parseIncomingMeta(meta: String): IncomingMeta {
-        val atIndex = meta.lastIndexOf(" at ")
+        // "<alias>|<nodeId>|<scope> at <ts>: <payload>". Search " at " after the scope, not
+        // from the end: the payload itself may contain " at " ("see you at 5").
+        val scopeStart = meta.indexOf('|', meta.indexOf('|') + 1)
+        val atIndex = meta.indexOf(" at ", maxOf(scopeStart, 0))
         if (atIndex <= 0) {
             return IncomingMeta("@peer", System.currentTimeMillis(), meta)
         }
@@ -3014,8 +3382,11 @@ class MainActivity : Activity() {
     private fun isSelfSender(nodeId: UUID?): Boolean =
         nodeId != null && nodeId == meshService?.nodeId
 
-    private fun incomingChatKey(sender: IncomingSender): String =
-        if (sender.isBroadcast || sender.nodeId == null) CHAT_EVERYONE else peerChatKey(sender.nodeId)
+    private fun incomingChatKey(sender: IncomingSender): String = when {
+        sender.groupId != null -> ensureGroupForFile(sender.groupId, sender.nodeId)
+        sender.isBroadcast || sender.nodeId == null -> CHAT_EVERYONE
+        else -> peerChatKey(sender.nodeId)
+    }
 
     private fun loadStoredMessages() {
         chatStore.ensureBaseChats()
@@ -3114,7 +3485,8 @@ class MainActivity : Activity() {
             reaction = reaction,
             timestamp = timestamp,
             meshMessageId = messageId?.toString(),
-            status = status?.name
+            status = status?.name,
+            listened = listened
         )
 
     private fun StoredMessage.toChatMessage(defaultStatus: MessageStatus?): ChatMessage =
@@ -3128,7 +3500,8 @@ class MainActivity : Activity() {
             timestamp = timestamp,
             messageId = meshMessageId?.let { runCatching { UUID.fromString(it) }.getOrNull() },
             status = status?.let { runCatching { MessageStatus.valueOf(it) }.getOrNull() } ?: defaultStatus,
-            localId = id
+            localId = id,
+            listened = listened
         )
 
     private fun estimateLegacyTimestamp(): Long =
@@ -3161,6 +3534,7 @@ class MainActivity : Activity() {
     private fun updateRecipientHint() {
         messageInput.hint = when {
             savedMessagesSelected -> tr("hint_save_message")
+            selectedGroupKey != null -> "${tr("hint_message")} $selectedRecipientLabel..."
             selectedRecipientId == null -> tr("hint_type_message")
             else -> "${tr("hint_message")} $selectedRecipientLabel..."
         }
@@ -3178,6 +3552,40 @@ class MainActivity : Activity() {
         replyBar.visibility = View.VISIBLE
     }
 
+    /**
+     * Finds the message a reply quotes ("↪ author: preview") above the reply and scrolls to
+     * it with a short highlight. The quote has no id (it's plain text on the wire), so match
+     * by preview: photo / voice placeholder or the start of the original text.
+     */
+    private fun scrollToReplyOriginal(reply: ChatMessage, quoteLine: String) {
+        val preview = quoteLine.removePrefix(REPLY_MARK).substringAfter(": ", "").trim()
+        val replyIndex = messages.indexOfFirst { it === reply }.takeIf { it >= 0 } ?: messages.size
+        val targetIndex = (replyIndex - 1 downTo 0).firstOrNull { index ->
+            val candidate = messages[index]
+            when {
+                candidate.author == "system" || candidate.author == "mesh" -> false
+                preview == tr("photo") && candidate.imagePath != null -> true
+                preview == tr("voice_message") && candidate.audioPath != null -> true
+                preview.isNotEmpty() -> candidate.body.startsWith(preview)
+                else -> false
+            }
+        }
+        if (targetIndex == null) {
+            Toast.makeText(this, tr("reply_original_missing"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        val target = messages[targetIndex]
+        highlightedMessage = target
+        chatAdapter.notifyDataSetChanged()
+        chatList.post { chatList.setSelectionFromTop(targetIndex, dp(80)) }
+        mainHandler.postDelayed({
+            if (highlightedMessage === target) {
+                highlightedMessage = null
+                chatAdapter.notifyDataSetChanged()
+            }
+        }, 1_600L)
+    }
+
     private fun clearReplyTarget() {
         replyTarget = null
         if (::replyBar.isInitialized) {
@@ -3193,7 +3601,7 @@ class MainActivity : Activity() {
             else -> target.body.take(40)
         }
         clearReplyTarget()
-        return "↪ ${target.displayAuthor()}: $preview\n$raw"
+        return "$REPLY_MARK${target.displayAuthor()}: $preview\n$raw"
     }
 
     private fun updateChatTitle() {
@@ -3204,6 +3612,7 @@ class MainActivity : Activity() {
         if (::networkStatusView.isInitialized) {
             networkStatusView.text = when {
                 savedMessagesSelected -> tr("saved_messages")
+                selectedGroupKey != null -> tr("group_members_count").format(groupMembers(selectedGroupKey!!).size + 1)
                 selectedRecipientId != null -> {
                     if (isPeerOnline(selectedRecipientId)) {
                         tr("online_now")
@@ -3218,6 +3627,7 @@ class MainActivity : Activity() {
     }
 
     private fun updateNetworkStatusFromLog(line: String) {
+        if (selectedGroupKey != null) return // the group subtitle shows the member count
         if (selectedRecipientId != null && !savedMessagesSelected) {
             if (::networkStatusView.isInitialized) {
                 networkStatusView.text = if (isPeerOnline(selectedRecipientId)) {
@@ -3387,6 +3797,122 @@ class MainActivity : Activity() {
         }
     }
 
+    // ==================== Block / report / community rules ====================
+
+    private fun confirmBlockPeer(peerId: UUID, label: String) {
+        AlertDialog.Builder(this)
+            .setTitle(tr("block_user"))
+            .setMessage(tr("block_confirm").format(label))
+            .setPositiveButton(tr("block_user")) { _, _ -> setPeerBlocked(peerId, true) }
+            .setNegativeButton(tr("cancel"), null)
+            .show()
+    }
+
+    private fun setPeerBlocked(peerId: UUID, blocked: Boolean) {
+        BlockList.setBlocked(this, peerId, blocked)
+        Toast.makeText(this, tr(if (blocked) "user_blocked" else "user_unblocked"), Toast.LENGTH_SHORT).show()
+        updateChatTitle()
+    }
+
+    /** True (and explains why) when the open private chat is with a blocked user. */
+    private fun blockedChatGuard(): Boolean {
+        val peer = selectedRecipientId ?: return false
+        if (!BlockList.isBlocked(this, peer)) return false
+        Toast.makeText(this, tr("blocked_cannot_send"), Toast.LENGTH_SHORT).show()
+        return true
+    }
+
+    private fun reportPeer(peerId: UUID, label: String) {
+        val reasons = listOf("report_reason_spam", "report_reason_harassment", "report_reason_inappropriate", "report_reason_other")
+        AlertDialog.Builder(this)
+            .setTitle(tr("report_title"))
+            .setItems(reasons.map { tr(it) }.toTypedArray()) { _, which ->
+                sendAbuseReport(peerId, label, tr(reasons[which]))
+            }
+            .setNegativeButton(tr("cancel"), null)
+            .show()
+    }
+
+    /**
+     * Opens the user's mail app with a prefilled report (reason, ids, the reported user's last
+     * messages). Nothing is sent automatically: the user reviews and sends it themselves.
+     */
+    private fun sendAbuseReport(peerId: UUID, label: String, reason: String) {
+        val recent = messagesForChat(peerChatKey(peerId))
+            .filter { !it.mine && it.author != "system" && it.author != "mesh" }
+            .takeLast(10)
+            .joinToString("\n") { message ->
+                val content = when {
+                    message.imagePath != null -> "[photo]"
+                    message.audioPath != null -> "[voice message]"
+                    else -> message.body.take(300)
+                }
+                "[${SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(java.util.Date(message.timestamp))}] $content"
+            }
+            .ifBlank { "-" }
+        val version = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull() ?: "?"
+        val body = buildString {
+            appendLine("Reason: $reason")
+            appendLine("Reported user: $label")
+            appendLine("Reported node id: $peerId")
+            appendLine("Reported key fingerprint: ${meshService?.getPeerFingerprint(peerId) ?: "-"}")
+            appendLine("Reporter node id: ${meshService?.nodeId ?: "-"}")
+            appendLine("App version: $version")
+            appendLine()
+            appendLine("Last messages from this user:")
+            append(recent)
+        }
+        val subject = "Truskawka report: $label"
+        val intent = if (SUPPORT_EMAIL.isNotBlank()) {
+            Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:")).apply {
+                putExtra(Intent.EXTRA_EMAIL, arrayOf(SUPPORT_EMAIL))
+                putExtra(Intent.EXTRA_SUBJECT, subject)
+                putExtra(Intent.EXTRA_TEXT, body)
+            }
+        } else {
+            Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_SUBJECT, subject)
+                putExtra(Intent.EXTRA_TEXT, body)
+            }
+        }
+        runCatching { startActivity(Intent.createChooser(intent, tr("report_title"))) }
+            .onFailure { Toast.makeText(this, tr("report_no_app"), Toast.LENGTH_LONG).show() }
+        if (!BlockList.isBlocked(this, peerId)) {
+            AlertDialog.Builder(this)
+                .setMessage(tr("report_also_block").format(label))
+                .setPositiveButton(tr("block_user")) { _, _ -> setPeerBlocked(peerId, true) }
+                .setNegativeButton(tr("cancel"), null)
+                .show()
+        }
+    }
+
+    private fun showBlockedUsers() {
+        val blocked = BlockList.blockedIds(this).mapNotNull { runCatching { UUID.fromString(it) }.getOrNull() }
+        if (blocked.isEmpty()) {
+            Toast.makeText(this, tr("blocked_list_empty"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        showStyledActionDialog(actions = blocked.map { id ->
+            val label = chatStore.getPeer(id.toString())?.alias?.toDisplayTitle() ?: "@${id.toString().take(8)}"
+            StyledActionItem(tr("unblock_named").format(label)) { setPeerBlocked(id, false) }
+        })
+    }
+
+    /** One-time acceptance of the community rules (Play policy for user-generated content). */
+    private fun showCommunityRulesIfNeeded() {
+        val prefs = getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+        if (prefs.getBoolean(UI_SETTINGS_RULES_ACCEPTED, false)) return
+        AlertDialog.Builder(this)
+            .setTitle(tr("rules_title"))
+            .setMessage(tr("rules_body"))
+            .setCancelable(false)
+            .setPositiveButton(tr("rules_accept")) { _, _ ->
+                prefs.edit().putBoolean(UI_SETTINGS_RULES_ACCEPTED, true).apply()
+            }
+            .show()
+    }
+
     /** "key changed: <alias>|<nodeId>" from the service: warn, drop the verified mark, ask. */
     private fun handlePeerKeyChanged(payload: String) {
         val peerId = runCatching { UUID.fromString(payload.substringAfterLast('|').trim()) }.getOrNull() ?: return
@@ -3417,6 +3943,10 @@ class MainActivity : Activity() {
     }
 
     private fun showCurrentChatProfile() {
+        selectedGroupKey?.let {
+            showGroupProfile(it)
+            return
+        }
         val title = if (selectedRecipientId != null) {
             selectedRecipientLabel.toDisplayTitle().removePrefix("@")
         } else {
@@ -3557,6 +4087,34 @@ class MainActivity : Activity() {
                         launchIdentityScanner(peerId)
                     }
                 }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            }
+            // Safety actions required for chatting with strangers: block and report.
+            if (peerId != null) {
+                val blocked = BlockList.isBlocked(this@MainActivity, peerId)
+                addView(terminalAction(tr(if (blocked) "unblock_user" else "block_user")).apply {
+                    textSize = 16f
+                    gravity = Gravity.CENTER
+                    setTextColor(if (blocked) BERRY_TEXT else STRAWBERRY_RED)
+                    background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                    setOnClickListener {
+                        dialog.dismiss()
+                        if (blocked) setPeerBlocked(peerId, false) else confirmBlockPeer(peerId, title)
+                    }
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    topMargin = dp(10)
+                })
+                addView(terminalAction(tr("report_user")).apply {
+                    textSize = 16f
+                    gravity = Gravity.CENTER
+                    setTextColor(STRAWBERRY_RED)
+                    background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                    setOnClickListener {
+                        dialog.dismiss()
+                        reportPeer(peerId, title)
+                    }
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    topMargin = dp(10)
+                })
             }
         }
         dialog.setContentView(FrameLayout(this).apply {
@@ -3884,7 +4442,7 @@ class MainActivity : Activity() {
                         dialog.dismiss()
                         if (group != null) showSettingsPage()
                     }
-                }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginEnd = dp(6) })
+                }, LinearLayout.LayoutParams(dp(48), dp(48)).apply { marginEnd = dp(6) })
                 // A section page shows its title in the hero below, so the bar keeps only the arrow.
                 if (group == null) {
                     addView(terminalText(tr("settings")).apply {
@@ -4095,7 +4653,8 @@ class MainActivity : Activity() {
                 val segment = terminalText(label).apply {
                     textSize = 14f
                     gravity = Gravity.CENTER
-                    maxLines = 1
+                    minHeight = dp(36)
+                    setPadding(dp(4), dp(6), dp(4), dp(6))
                     isClickable = true
                     setOnClickListener {
                         paint(key)
@@ -4103,7 +4662,7 @@ class MainActivity : Activity() {
                     }
                 }
                 segments[key] = segment
-                track.addView(segment, LinearLayout.LayoutParams(0, dp(36), 1f))
+                track.addView(segment, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             }
             paint(selectedKey)
             host.addView(track, LinearLayout.LayoutParams(
@@ -4244,6 +4803,9 @@ class MainActivity : Activity() {
                     applySettingsNow()
                 }
             }
+            addToolAction("settings_blocked_users", "settings_blocked_users_desc") {
+                showBlockedUsers()
+            }
             addChoiceChips(
                 "settings_lock_timeout",
                 listOf("1" to "1 min", "5" to "5 min", "15" to "15 min", "60" to "1 h"),
@@ -4287,6 +4849,10 @@ class MainActivity : Activity() {
             // "radio health" dialog that showed a subset of the same data.
             addToolAction("settings_connection_diag", "settings_connection_diag_desc") {
                 showConnectionDiagnostics()
+            }
+            addToggle("settings_tech_log", "settings_tech_log_desc", technicalLogEnabled) {
+                technicalLogEnabled = it
+                applySettingsNow()
             }
         }
 
@@ -5137,6 +5703,7 @@ class MainActivity : Activity() {
         use24HourFormat = prefs.getBoolean(UI_SETTINGS_TIME_24H, true)
         shortDateFormatEnabled = prefs.getBoolean(UI_SETTINGS_DATE_SHORT, false)
         meshAggressiveMode = prefs.getBoolean(UI_SETTINGS_MESH_AGGRESSIVE, true)
+        technicalLogEnabled = prefs.getBoolean(UI_SETTINGS_TECH_LOG, false)
         meshMaxHops = prefs.getInt(UI_SETTINGS_MESH_MAX_HOPS, 8).coerceIn(1, 8)
     }
 
@@ -5158,6 +5725,7 @@ class MainActivity : Activity() {
             .putBoolean(UI_SETTINGS_TIME_24H, use24HourFormat)
             .putBoolean(UI_SETTINGS_DATE_SHORT, shortDateFormatEnabled)
             .putBoolean(UI_SETTINGS_MESH_AGGRESSIVE, meshAggressiveMode)
+            .putBoolean(UI_SETTINGS_TECH_LOG, technicalLogEnabled)
             .putInt(UI_SETTINGS_MESH_MAX_HOPS, meshMaxHops)
             .apply()
     }
@@ -5448,18 +6016,23 @@ class MainActivity : Activity() {
             ChatKind.SAVED.name -> tr("saved_messages")
             ChatKind.EVERYONE.name -> tr("everyone")
             ChatKind.PEER.name -> summary.title.toDisplayTitle().removePrefix("@")
+            ChatKind.GROUP.name -> summary.title
             else -> summary.title.toDisplayTitle()
         }
     }
 
     private fun summaryPresence(summary: ChatSummary): Pair<String, Boolean> {
         if (summary.kind == ChatKind.SAVED.name) return tr("local") to true
+        if (summary.kind == ChatKind.GROUP.name) {
+            return tr("group_members_count").format(groupMembers(summary.chatKey).size + 1) to false
+        }
         if (summary.kind == ChatKind.EVERYONE.name) {
             val hasPeers = (meshService?.peerCount() ?: 0) > 0
             return if (hasPeers) tr("online") to true else tr("offline") to false
         }
         val peerId = summary.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
             ?: return tr("offline") to false
+        if (BlockList.isBlocked(this, peerId)) return tr("blocked_label") to false
         val active = meshService?.knownPeers().orEmpty().any { it.nodeId == peerId }
         if (active) return tr("online") to true
 
@@ -6351,6 +6924,10 @@ class MainActivity : Activity() {
         root.requestApplyInsets()
     }
 
+    /** Friendly failure text; the raw transport error only with the technical log on. */
+    private fun sendFailureText(result: SendResult): String =
+        if (technicalLogEnabled) result.toUiText() else tr("send_failed_friendly")
+
     private fun SendResult.toUiText(): String = when (this) {
         is SendResult.Sent -> "sent: $messageId"
         is SendResult.Queued -> "queued: $reason"
@@ -6458,9 +7035,23 @@ class MainActivity : Activity() {
         }
         activePlayer = player
         activePlayingPath = audioPath
+        markVoiceListened(audioPath)
         player.setOnCompletionListener { releaseAudioPlayer() }
         refreshVoicePlayback(audioPath)
         mainHandler.post(playbackTicker)
+    }
+
+    /** First playback clears the "not listened" dot, in memory and in storage. */
+    private fun markVoiceListened(audioPath: String) {
+        var changed = false
+        (listOf(meshMessages, savedMessages, messages) + peerMessages.values).forEach { buffer ->
+            buffer.filter { it.audioPath == audioPath && !it.listened }.forEach { message ->
+                message.listened = true
+                if (message.localId > 0L) chatStore.setMessageListened(message.localId)
+                changed = true
+            }
+        }
+        if (changed) chatAdapter.notifyDataSetChanged()
     }
 
     private fun bindVoicePlayback(path: String, views: VoicePlaybackViews) {
@@ -6476,6 +7067,7 @@ class MainActivity : Activity() {
         val player = activePlayer?.takeIf { activePlayingPath == path }
         if (player == null) {
             views.button.playing = false
+            views.button.contentDescription = tr("play")
             views.waveform.progress = 0f
             views.timeLabel.text = audioDurationLabel(path)
             return
@@ -6483,6 +7075,7 @@ class MainActivity : Activity() {
         val duration = runCatching { player.duration }.getOrDefault(0)
         val position = runCatching { player.currentPosition }.getOrDefault(0)
         views.button.playing = runCatching { player.isPlaying }.getOrDefault(false)
+        views.button.contentDescription = tr(if (views.button.playing) "a11y_pause" else "play")
         views.waveform.progress = if (duration > 0) position.toFloat() / duration else 0f
         val seconds = (position / 1000).coerceAtLeast(0)
         views.timeLabel.text = "%02d:%02d".format(seconds / 60, seconds % 60)

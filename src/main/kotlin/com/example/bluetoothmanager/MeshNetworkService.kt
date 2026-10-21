@@ -31,6 +31,7 @@ class MeshNetworkService : Service() {
     private val binder = LocalBinder()
     private val listeners = CopyOnWriteArrayList<(String) -> Unit>()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val avatarExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
 
     private lateinit var meshManager: MeshManager
     private lateinit var chatStore: ChatStore
@@ -105,37 +106,69 @@ class MeshNetworkService : Service() {
             if (senderId == localNodeId) {
                 return@setMessageListener
             }
+            if (BlockList.isBlocked(this, senderId)) return@setMessageListener
             val scope = if (isBroadcast) "broadcast" else "private"
             val isControl = message.startsWith(CONTROL_PREFIX)
-            if (!isControl) {
-                showIncomingNotification(
+            val group = if (isBroadcast) null else GroupProtocol.decodeText(message)
+            val alias = meshManager.getAlias(senderId)
+            when {
+                isControl -> Unit
+                group != null -> if (group.body.isNotBlank() && !isGroupLeft(group.groupId)) {
+                    showIncomingNotification(
+                        isBroadcast = false,
+                        senderId = senderId,
+                        title = "${group.name}: $alias",
+                        body = group.body,
+                        notificationId = senderId.hashCode() xor timestamp.toInt(),
+                        chatKey = GroupProtocol.chatKey(group.groupId),
+                        chatTitle = group.name
+                    )
+                }
+                else -> showIncomingNotification(
                     isBroadcast = isBroadcast,
                     senderId = senderId,
-                    title = if (isBroadcast) "Broadcast from ${meshManager.getAlias(senderId)}" else meshManager.getAlias(senderId),
+                    title = if (isBroadcast) tr("notif_broadcast_from").format(alias) else alias,
                     body = message,
                     notificationId = senderId.hashCode() xor timestamp.toInt()
                 )
             }
-            publish("message from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: $message")
+            publish("message from $alias|$senderId|$scope at $timestamp: $message")
         }
         meshManager.setFileListener { senderId, fileName, mimeType, bytes, timestamp, isBroadcast ->
             if (senderId == localNodeId) {
                 return@setFileListener
             }
-            val file = writeIncomingFile(fileName, mimeType, bytes)
-            val scope = if (isBroadcast) "broadcast" else "private"
+            if (BlockList.isBlocked(this, senderId)) return@setFileListener
+            // A contact's profile photo: store it, don't show it as a chat message.
+            if (!isBroadcast && PeerAvatars.isAvatarFileName(fileName)) {
+                if (PeerAvatars.saveIncoming(this, senderId, bytes)) {
+                    publish("avatar updated: $senderId")
+                }
+                return@setFileListener
+            }
+            // Group photo/voice: the file name carries the group id ("g~<id>~name").
+            val group = if (isBroadcast) null else GroupProtocol.decodeFileName(fileName)
+            if (group != null && isGroupLeft(group.first)) return@setFileListener
+            val file = writeIncomingFile(group?.second ?: fileName, mimeType, bytes)
+            val scope = when {
+                group != null -> "group:${group.first}"
+                isBroadcast -> "broadcast"
+                else -> "private"
+            }
             val isAudio = mimeType.startsWith("audio/", ignoreCase = true)
+            val alias = meshManager.getAlias(senderId)
             showIncomingNotification(
                 isBroadcast = isBroadcast,
                 senderId = senderId,
-                title = if (isBroadcast) "Broadcast from ${meshManager.getAlias(senderId)}" else meshManager.getAlias(senderId),
-                body = if (isAudio) "sent a voice message" else "sent an image",
-                notificationId = senderId.hashCode() xor timestamp.toInt()
+                title = if (isBroadcast) tr("notif_broadcast_from").format(alias) else alias,
+                body = tr(if (isAudio) "notif_sent_voice" else "notif_sent_photo"),
+                notificationId = senderId.hashCode() xor timestamp.toInt(),
+                chatKey = group?.let { GroupProtocol.chatKey(it.first) }
             )
             if (isAudio) {
-                publish("audio from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: ${file.absolutePath}|$mimeType")
+                publish("audio from $alias|$senderId|$scope at $timestamp: ${file.absolutePath}|$mimeType")
             } else {
-                publish("image from ${meshManager.getAlias(senderId)}|$senderId|$scope at $timestamp: ${file.absolutePath}|$mimeType")
+                publish("image from $alias|$senderId|$scope at $timestamp: ${file.absolutePath}|$mimeType")
             }
         }
         meshManager.setFileTransferProgressListener(::persistTransferProgress)
@@ -144,6 +177,9 @@ class MeshNetworkService : Service() {
                 // Parsed by MainActivity: "key changed: <alias>|<nodeId>"
                 publish("key changed: ${meshManager.getAlias(nodeId)}|$nodeId")
                 return@setPeerListener
+            }
+            if (event == PeerEvent.SESSION_ESTABLISHED) {
+                shareAvatarWith(nodeId)
             }
             val label = when (event) {
                 PeerEvent.DISCOVERED -> "discovered"
@@ -179,6 +215,7 @@ class MeshNetworkService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
+        avatarExecutor.shutdownNow()
         if (::meshManager.isInitialized) {
             meshManager.stop()
         }
@@ -210,6 +247,29 @@ class MeshNetworkService : Service() {
 
     fun markPeerVerified(peerId: UUID) {
         meshManager.markPeerAsVerified(peerId)
+    }
+
+    /**
+     * Sends our profile photo to a peer once per photo version (tracked by content hash).
+     * Runs off the radio callback thread: the transfer is sent chunk by chunk.
+     */
+    fun shareAvatarWith(nodeId: UUID) {
+        avatarExecutor.execute {
+            val (hash, bytes) = PeerAvatars.prepareOwn(this) ?: return@execute
+            val prefs = getSharedPreferences(AVATAR_SHARED_PREFS, Context.MODE_PRIVATE)
+            if (prefs.getString(nodeId.toString(), null) == hash) return@execute
+            val result = runCatching {
+                meshManager.sendImage(nodeId, "${PeerAvatars.FILE_PREFIX}$hash.jpg", "image/jpeg", bytes)
+            }.getOrNull()
+            if (result is SendResult.Sent) {
+                prefs.edit().putString(nodeId.toString(), hash).apply()
+            }
+        }
+    }
+
+    /** After the user changes their photo: push it to everyone currently reachable. */
+    fun shareAvatarWithNearbyPeers() {
+        knownPeers().forEach { shareAvatarWith(it.nodeId) }
     }
 
     fun hasPendingKeyChange(peerId: UUID): Boolean = meshManager.hasPendingKeyChange(peerId)
@@ -523,7 +583,7 @@ class MeshNetworkService : Service() {
     private fun startMeshForeground() {
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Truskawka")
-            .setContentText("mesh radio online")
+            .setContentText(tr("notif_mesh_online"))
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setOngoing(true)
             .build()
@@ -543,12 +603,12 @@ class MeshNetworkService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val meshChannel = NotificationChannel(
                 CHANNEL_ID,
-                "Mesh network",
+                tr("notif_channel_mesh"),
                 NotificationManager.IMPORTANCE_LOW
             )
             val messagesChannel = NotificationChannel(
                 MESSAGES_CHANNEL_ID,
-                "Messages",
+                tr("notif_channel_messages"),
                 NotificationManager.IMPORTANCE_DEFAULT
             )
             getSystemService(NotificationManager::class.java).apply {
@@ -558,7 +618,29 @@ class MeshNetworkService : Service() {
         }
     }
 
-    private fun showIncomingNotification(isBroadcast: Boolean, senderId: UUID, title: String, body: String, notificationId: Int) {
+    /** UI language chosen in the app (notifications are built here, outside the activity). */
+    private fun tr(key: String): String {
+        val code = getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+            .getString(UI_SETTINGS_LANGUAGE, AppLanguage.EN.code)
+        return Translations.tr(AppLanguage.fromCode(code), key)
+    }
+
+    /** Groups the user left are ignored instead of being re-created by new messages. */
+    private fun isGroupLeft(groupId: UUID): Boolean =
+        getSharedPreferences(UI_SETTINGS_PREFS, Context.MODE_PRIVATE)
+            .getStringSet(UI_SETTINGS_LEFT_GROUPS, emptySet())
+            .orEmpty()
+            .contains(groupId.toString())
+
+    private fun showIncomingNotification(
+        isBroadcast: Boolean,
+        senderId: UUID,
+        title: String,
+        body: String,
+        notificationId: Int,
+        chatKey: String? = null,
+        chatTitle: String? = null
+    ) {
         if (!notificationsEnabled) return
         if (isBroadcast && !notificationBroadcastEnabled) return
         val manager = getSystemService(NotificationManager::class.java)
@@ -570,10 +652,13 @@ class MeshNetworkService : Service() {
 
         val openIntent = Intent(this, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            val chatKey = if (isBroadcast) CHAT_EVERYONE else "peer:$senderId"
-            putExtra(EXTRA_OPEN_CHAT_KEY, chatKey)
-            if (!isBroadcast) putExtra(EXTRA_OPEN_PEER_ID, senderId.toString())
-            putExtra(EXTRA_OPEN_CHAT_TITLE, if (isBroadcast) "Everyone" else meshManager.getAlias(senderId))
+            val targetChat = chatKey ?: if (isBroadcast) CHAT_EVERYONE else "peer:$senderId"
+            putExtra(EXTRA_OPEN_CHAT_KEY, targetChat)
+            if (!isBroadcast && chatKey == null) putExtra(EXTRA_OPEN_PEER_ID, senderId.toString())
+            putExtra(
+                EXTRA_OPEN_CHAT_TITLE,
+                chatTitle ?: if (isBroadcast) tr("everyone") else meshManager.getAlias(senderId)
+            )
         }
         val pendingIntent = PendingIntent.getActivity(
             this,
@@ -584,7 +669,7 @@ class MeshNetworkService : Service() {
 
         val notification = Notification.Builder(this, MESSAGES_CHANNEL_ID)
             .setContentTitle(title)
-            .setContentText(if (notificationPreviewEnabled) body else "New message")
+            .setContentText(if (notificationPreviewEnabled) body else tr("notif_new_message"))
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
@@ -595,7 +680,7 @@ class MeshNetworkService : Service() {
         manager.notify(notificationId, notification)
         val summary = Notification.Builder(this, MESSAGES_CHANNEL_ID)
             .setContentTitle("Truskawka")
-            .setContentText("New nearby messages")
+            .setContentText(tr("notif_new_messages_summary"))
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setGroup(MESSAGES_GROUP_KEY)
             .setGroupSummary(true)
@@ -663,6 +748,7 @@ class MeshNetworkService : Service() {
         private const val MESSAGES_SUMMARY_NOTIFICATION_ID = 1002
         private const val MESSAGES_GROUP_KEY = "truskawka_messages"
         private const val UI_SETTINGS_PREFS = "truskawka_ui_settings"
+        private const val AVATAR_SHARED_PREFS = "avatar_shared_with"
         private const val KEY_MESH_AGGRESSIVE = "mesh_aggressive"
         private const val KEY_MESH_MAX_HOPS = "mesh_max_hops"
         private const val KEY_NOTIF_ENABLED = "notif_enabled"

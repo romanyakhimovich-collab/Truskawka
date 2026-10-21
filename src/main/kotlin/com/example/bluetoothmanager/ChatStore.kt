@@ -37,6 +37,51 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
         if (oldVersion < 7) {
             createTransfers(db)
         }
+        if (oldVersion < 8) {
+            // Existing voice notes count as listened so old chats don't light up with dots.
+            addColumnIfMissing(db, "messages", "listened", "INTEGER NOT NULL DEFAULT 1")
+            addColumnIfMissing(db, "chats", "members", "TEXT")
+        }
+    }
+
+    /** Creates or updates a group chat; [members] are node ids (without the local node). */
+    fun upsertGroup(chatKey: String, title: String, members: List<String>) {
+        val meta = getChatMeta(chatKey)
+        val now = System.currentTimeMillis()
+        ensureChat(
+            StoredChat(
+                chatKey = chatKey,
+                title = title,
+                kind = ChatKind.GROUP.name,
+                unreadCount = meta?.unreadCount ?: 0,
+                pinned = meta?.pinned ?: false,
+                createdAt = meta?.createdAt ?: now,
+                updatedAt = meta?.updatedAt ?: now,
+                members = members.distinct().joinToString(",")
+            )
+        )
+    }
+
+    fun getGroupMembers(chatKey: String): List<String> {
+        readableDatabase.query("chats", arrayOf("members"), "chat_key = ?", arrayOf(chatKey), null, null, null).use { cursor ->
+            if (!cursor.moveToFirst()) return emptyList()
+            return cursor.getString(0).orEmpty().split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        }
+    }
+
+    fun setMessageListened(localId: Long) {
+        writableDatabase.update(
+            "messages",
+            ContentValues().apply { put("listened", 1) },
+            "id = ?",
+            arrayOf(localId.toString())
+        )
+    }
+
+    fun totalUnread(): Int {
+        readableDatabase.rawQuery("SELECT COALESCE(SUM(unread_count), 0) FROM chats", emptyArray()).use { cursor ->
+            return if (cursor.moveToFirst()) cursor.getInt(0) else 0
+        }
     }
 
     fun ensureChat(chat: StoredChat) {
@@ -227,6 +272,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             val timestampIndex = cursor.getColumnIndexOrThrow("timestamp")
             val meshIdIndex = cursor.getColumnIndexOrThrow("mesh_message_id")
             val statusIndex = cursor.getColumnIndexOrThrow("status")
+            val listenedIndex = cursor.getColumnIndexOrThrow("listened")
             while (cursor.moveToNext()) {
                 rows += StoredMessage(
                     id = cursor.getLong(idIndex),
@@ -238,7 +284,8 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                     reaction = cursor.getString(reactionIndex),
                     timestamp = cursor.getLong(timestampIndex),
                     meshMessageId = cursor.getString(meshIdIndex),
-                    status = cursor.getString(statusIndex)
+                    status = cursor.getString(statusIndex),
+                    listened = cursor.getInt(listenedIndex) == 1
                 )
             }
         }
@@ -397,7 +444,8 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 reaction TEXT,
                 timestamp INTEGER NOT NULL,
                 mesh_message_id TEXT,
-                status TEXT
+                status TEXT,
+                listened INTEGER NOT NULL DEFAULT 1
             )
             """.trimIndent()
         )
@@ -417,7 +465,8 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
                 unread_count INTEGER NOT NULL DEFAULT 0,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                members TEXT
             )
             """.trimIndent()
         )
@@ -505,6 +554,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             put("timestamp", timestamp)
             put("mesh_message_id", meshMessageId)
             put("status", status)
+            put("listened", if (listened) 1 else 0)
         }
 
     private fun StoredChat.toValues(): ContentValues =
@@ -518,6 +568,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
             put("pinned", if (pinned) 1 else 0)
             put("created_at", createdAt)
             put("updated_at", updatedAt)
+            put("members", members)
         }
 
     private fun StoredPeer.toValues(): ContentValues =
@@ -553,7 +604,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
 
     companion object {
         private const val DB_NAME = "truskawka_chats.db"
-        private const val DB_VERSION = 7
+        private const val DB_VERSION = 8
         const val CHAT_EVERYONE = "everyone"
         const val CHAT_SAVED = "saved"
         private const val LEGACY_CHAT_MESH = "mesh"
@@ -590,6 +641,7 @@ class ChatStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_
 enum class ChatKind {
     SAVED,
     EVERYONE,
+    GROUP,
     PEER
 }
 
@@ -602,7 +654,9 @@ data class StoredChat(
     val unreadCount: Int = 0,
     val pinned: Boolean = false,
     val createdAt: Long = System.currentTimeMillis(),
-    val updatedAt: Long = createdAt
+    val updatedAt: Long = createdAt,
+    /** Comma-separated member node ids, for group chats. */
+    val members: String? = null
 )
 
 data class StoredPeer(
@@ -653,5 +707,6 @@ data class StoredMessage(
     val reaction: String?,
     val timestamp: Long,
     val meshMessageId: String?,
-    val status: String?
+    val status: String?,
+    val listened: Boolean = true
 )

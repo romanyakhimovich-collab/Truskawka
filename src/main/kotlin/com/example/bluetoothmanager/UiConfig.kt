@@ -67,6 +67,12 @@ const val SAVED_MESSAGES_KEY = "items"
 const val UI_SETTINGS_PREFS = "truskawka_ui_settings"
 const val UI_SETTINGS_THEME_DARK = "theme_dark"
 const val UI_SETTINGS_LANGUAGE = "language"
+const val UI_SETTINGS_LEFT_GROUPS = "left_groups"
+const val UI_SETTINGS_TECH_LOG = "technical_log"
+const val UI_SETTINGS_BLOCKED_PEERS = "blocked_peers"
+const val UI_SETTINGS_RULES_ACCEPTED = "community_rules_accepted"
+/** Where in-app abuse reports are e-mailed. Set before release (Play requires a working channel). */
+const val SUPPORT_EMAIL = "support@truskawka.app"
 const val UI_SETTINGS_APP_LOCK_ENABLED = "app_lock_enabled"
 const val UI_SETTINGS_APP_LOCK_PIN = "app_lock_pin"
 const val UI_SETTINGS_APP_LOCK_TIMEOUT = "app_lock_timeout_min"
@@ -111,6 +117,9 @@ const val MESSAGE_RETRY_ATTEMPTS = 8
 const val MAX_MEDIA_CACHE_BYTES = 120L * 1024L * 1024L
 const val BUBBLE_WRAP_CHARS = 24
 const val CONTROL_PREFIX = "__truskawka_ctl__:"
+/** Start of a reply: "↪ author: preview
+<text>". */
+const val REPLY_MARK = "↪ "
 const val CONTROL_DELETE_MESSAGE = "dm"
 const val CONTROL_DELETE_CHAT = "dc"
 const val EXTRA_OPEN_CHAT_KEY = "truskawka.open_chat_key"

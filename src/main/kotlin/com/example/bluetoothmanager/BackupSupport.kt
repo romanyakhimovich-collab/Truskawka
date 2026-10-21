@@ -118,14 +118,25 @@ object BackupSupport {
 
     private fun decryptLegacy(context: Context, payload: ByteArray): ByteArray? {
         if (payload.size <= 12) return null
-        return runCatching {
-            val iv = payload.copyOfRange(0, 12)
-            val data = payload.copyOfRange(12, payload.size)
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, backupKey(context), GCMParameterSpec(128, iv))
-            cipher.doFinal(data)
-        }.getOrNull()
+        // Legacy (password-less) backups are keyed by package name; also try the name the app
+        // had before the store applicationId, and without the debug suffix.
+        val packageNames = listOf(
+            context.packageName,
+            context.packageName.removeSuffix(".debug"),
+            LEGACY_PACKAGE_NAME
+        ).distinct()
+        return packageNames.firstNotNullOfOrNull { packageName ->
+            runCatching {
+                val iv = payload.copyOfRange(0, 12)
+                val data = payload.copyOfRange(12, payload.size)
+                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                cipher.init(Cipher.DECRYPT_MODE, backupKey(context, packageName), GCMParameterSpec(128, iv))
+                cipher.doFinal(data)
+            }.getOrNull()
+        }
     }
+
+    private const val LEGACY_PACKAGE_NAME = "com.example.bluetoothmanager"
 
     private fun passwordKey(
         password: CharArray,
@@ -140,12 +151,12 @@ object BackupSupport {
         return SecretKeySpec(bytes, "AES")
     }
 
-    private fun backupKey(context: Context): SecretKeySpec {
+    private fun backupKey(context: Context, packageName: String = context.packageName): SecretKeySpec {
         val androidId = Settings.Secure.getString(
             context.contentResolver,
             Settings.Secure.ANDROID_ID
         ).orEmpty()
-        val seed = "${context.packageName}|$androidId|truskawka_backup_v1"
+        val seed = "$packageName|$androidId|truskawka_backup_v1"
         val digest = MessageDigest.getInstance("SHA-256").digest(seed.toByteArray(StandardCharsets.UTF_8))
         return SecretKeySpec(digest.copyOf(16), "AES")
     }

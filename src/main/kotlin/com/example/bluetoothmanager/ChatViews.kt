@@ -110,6 +110,11 @@ class AvatarView(
     private val accentColor: Int,
     private val verified: Boolean = false
 ) : View(context) {
+    init {
+        // Screen readers announce whose avatar this is instead of skipping it.
+        contentDescription = label
+    }
+
     private val clipPath = Path()
     private val boundsRect = RectF()
     private val imagePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)

@@ -52,7 +52,9 @@ data class ChatMessage(
     val timestamp: Long = System.currentTimeMillis(),
     var messageId: UUID? = null,
     var status: MessageStatus? = null,
-    var localId: Long = 0L
+    var localId: Long = 0L,
+    /** False for incoming voice notes until played (the "not listened" dot). */
+    var listened: Boolean = true
 )
 
 enum class MessageStatus {
@@ -82,7 +84,9 @@ data class PreparedImage(
 data class IncomingSender(
     val label: String,
     val nodeId: UUID?,
-    val isBroadcast: Boolean
+    val isBroadcast: Boolean,
+    /** Set for photos/voice sent to a group ("group:<id>" scope). */
+    val groupId: UUID? = null
 )
 
 data class IncomingMeta(
