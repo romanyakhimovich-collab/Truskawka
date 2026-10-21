@@ -62,6 +62,17 @@ enum class MessageStatus {
     READ
 }
 
+enum class MediaQuality(val storageKey: String) {
+    FAST("fast"),
+    BALANCED("balanced"),
+    ORIGINAL("original");
+
+    companion object {
+        fun fromStorageKey(value: String?): MediaQuality =
+            entries.firstOrNull { it.storageKey == value } ?: BALANCED
+    }
+}
+
 data class PreparedImage(
     val fileName: String,
     val mimeType: String,
@@ -78,4 +89,10 @@ data class IncomingMeta(
     val senderRaw: String,
     val timestamp: Long,
     val payload: String
+)
+
+data class ScannedIdentity(
+    val nodeId: UUID,
+    val fingerprint: String,
+    val name: String?
 )

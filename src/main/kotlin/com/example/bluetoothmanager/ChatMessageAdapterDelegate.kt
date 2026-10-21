@@ -11,6 +11,7 @@ interface ChatMessageAdapterDelegate {
     val selectedRecipientId: UUID?
     val activePlayingPath: String?
     val cropChatImages: Boolean
+    val selectionMode: Boolean
 
     fun dp(value: Int): Int
     fun tr(key: String): String
@@ -25,6 +26,10 @@ interface ChatMessageAdapterDelegate {
     fun showImagePreview(imagePath: String)
     fun showMessageActions(message: ChatMessage)
     fun attachReplySwipe(view: View, message: ChatMessage)
-    fun toggleAudioPlayback(path: String?, button: TextView)
+    fun toggleAudioPlayback(path: String?)
+    fun seekAudio(path: String?, fraction: Float)
+    fun bindVoicePlayback(path: String, views: VoicePlaybackViews)
     fun audioDurationLabel(path: String?): String
+    fun isMessageSelected(message: ChatMessage): Boolean
+    fun toggleMessageSelection(message: ChatMessage)
 }

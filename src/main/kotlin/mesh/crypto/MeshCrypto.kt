@@ -59,7 +59,7 @@ import javax.crypto.spec.SecretKeySpec
  *
  * Step 3: Message Encryption
  *   - Use ChaCha20-Poly1305 (or AES-GCM) with session_key
- *   - Include nonce/IV (12 bytes, incremented per message)
+ *   - Include nonce/IV (12 random bytes per message)
  *   - Sign encrypted message with identity key
  *
  * Key Verification (Prevent MITM):
@@ -82,6 +82,8 @@ class MeshCrypto(private val secureStorage: SecureKeyStorage) {
 
     // Pending handshakes
     private val pendingHandshakes = ConcurrentHashMap<UUID, HandshakeState>()
+
+    private val nonceRandom = SecureRandom()
 
     companion object {
         const val NONCE_SIZE = 12
@@ -427,12 +429,14 @@ class MeshCrypto(private val secureStorage: SecureKeyStorage) {
         }
     }
 
-    private fun generateNonce(counter: Long): ByteArray {
-        return ByteBuffer.allocate(NONCE_SIZE)
-            .putLong(counter)
-            .putInt(System.currentTimeMillis().toInt())
-            .array()
-    }
+    /**
+     * Both peers share one session key and both start their counters at 0, so a
+     * counter+time nonce could repeat across directions (fatal for AES-GCM).
+     * A random 96-bit nonce avoids that; [counter] is kept for call-site compatibility.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    private fun generateNonce(counter: Long): ByteArray =
+        ByteArray(NONCE_SIZE).also(nonceRandom::nextBytes)
 
     private fun computeFingerprint(publicKey: ByteArray): String {
         return MessageDigest.getInstance("SHA-256")

@@ -172,7 +172,8 @@ class MeshRouter(
         recipientId: UUID,
         payload: ByteArray,
         signature: ByteArray,
-        requiresAck: Boolean = true
+        requiresAck: Boolean = true,
+        messageId: UUID = UUID.randomUUID()
     ): UUID {
         return sendPacket(
             type = PacketType.MESSAGE,
@@ -182,7 +183,8 @@ class MeshRouter(
             flags = mesh.protocol.PacketFlags(
                 requiresAck = requiresAck,
                 isEncrypted = true
-            )
+            ),
+            messageId = messageId
         )
     }
 
@@ -191,13 +193,14 @@ class MeshRouter(
         recipientId: UUID,
         payload: ByteArray,
         signature: ByteArray,
-        flags: mesh.protocol.PacketFlags
+        flags: mesh.protocol.PacketFlags,
+        messageId: UUID = UUID.randomUUID()
     ): UUID {
         val packet = MeshPacket(
             type = type,
             flags = flags,
             ttl = maxRelayHops,
-            messageId = UUID.randomUUID(),
+            messageId = messageId,
             senderId = localNodeId,
             recipientId = recipientId,
             timestamp = clock(),
@@ -244,13 +247,16 @@ class MeshRouter(
      */
     private fun storePendingMessage(packet: MeshPacket) {
         if (pendingMessages.size >= maxPendingMessages) {
-            pendingMessages.pollFirst() // Remove oldest
+            // Remove oldest, but tell the app so the message doesn't hang in "sending" forever.
+            pendingMessages.pollFirst()?.let { messageHandler.onDeliveryFailed(it.packet.messageId) }
         }
+        val now = clock()
         pendingMessages.add(PendingMessage(
             packet = packet,
-            storedAt = clock(),
+            storedAt = now,
             retryCount = 0,
-            nextRetryAt = clock() + RETRY_BASE_DELAY_MS
+            nextRetryAt = now + RETRY_BASE_DELAY_MS,
+            lastSentAt = now
         ))
     }
 
@@ -262,12 +268,14 @@ class MeshRouter(
 
         // Check pending messages for this neighbor
         pendingMessages.forEach { pending ->
+            // Discovery fires on every DISCOVERY/handshake packet, so throttle these opportunistic
+            // resends and don't count them as retry attempts (that failed messages within ~1 min).
             if (pending.packet.recipientId == neighborId &&
-                now - pending.storedAt < pendingMessageTTL) {
+                now - pending.storedAt < pendingMessageTTL &&
+                now - pending.lastSentAt >= RETRY_BASE_DELAY_MS) {
                 // Found a pending message for this neighbor!
                 transmitter.sendTo(neighborId, pending.packet)
-                pending.retryCount++
-                pending.nextRetryAt = now + retryDelayForAttempt(pending.retryCount)
+                pending.lastSentAt = now
             }
         }
 
@@ -528,6 +536,7 @@ class MeshRouter(
 
             // Check if any neighbor might reach the destination.
             transmitter.broadcast(pending.packet)
+            pending.lastSentAt = now
             pending.retryCount++
             pending.nextRetryAt = now + retryDelayForAttempt(pending.retryCount)
             false
@@ -560,7 +569,8 @@ data class PendingMessage(
     val packet: MeshPacket,
     val storedAt: Long,
     var retryCount: Int,
-    var nextRetryAt: Long
+    var nextRetryAt: Long,
+    var lastSentAt: Long = storedAt
 )
 
 data class RouterDiagnostics(

@@ -110,6 +110,7 @@ class MeshNetworkService : Service() {
             if (!isControl) {
                 showIncomingNotification(
                     isBroadcast = isBroadcast,
+                    senderId = senderId,
                     title = if (isBroadcast) "Broadcast from ${meshManager.getAlias(senderId)}" else meshManager.getAlias(senderId),
                     body = message,
                     notificationId = senderId.hashCode() xor timestamp.toInt()
@@ -126,6 +127,7 @@ class MeshNetworkService : Service() {
             val isAudio = mimeType.startsWith("audio/", ignoreCase = true)
             showIncomingNotification(
                 isBroadcast = isBroadcast,
+                senderId = senderId,
                 title = if (isBroadcast) "Broadcast from ${meshManager.getAlias(senderId)}" else meshManager.getAlias(senderId),
                 body = if (isAudio) "sent a voice message" else "sent an image",
                 notificationId = senderId.hashCode() xor timestamp.toInt()
@@ -543,7 +545,7 @@ class MeshNetworkService : Service() {
         }
     }
 
-    private fun showIncomingNotification(isBroadcast: Boolean, title: String, body: String, notificationId: Int) {
+    private fun showIncomingNotification(isBroadcast: Boolean, senderId: UUID, title: String, body: String, notificationId: Int) {
         if (!notificationsEnabled) return
         if (isBroadcast && !notificationBroadcastEnabled) return
         val manager = getSystemService(NotificationManager::class.java)
@@ -555,6 +557,10 @@ class MeshNetworkService : Service() {
 
         val openIntent = Intent(this, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            val chatKey = if (isBroadcast) CHAT_EVERYONE else "peer:$senderId"
+            putExtra(EXTRA_OPEN_CHAT_KEY, chatKey)
+            if (!isBroadcast) putExtra(EXTRA_OPEN_PEER_ID, senderId.toString())
+            putExtra(EXTRA_OPEN_CHAT_TITLE, if (isBroadcast) "Everyone" else meshManager.getAlias(senderId))
         }
         val pendingIntent = PendingIntent.getActivity(
             this,
@@ -570,9 +576,18 @@ class MeshNetworkService : Service() {
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
             .setCategory(Notification.CATEGORY_MESSAGE)
+            .setGroup(MESSAGES_GROUP_KEY)
             .setVisibility(Notification.VISIBILITY_PRIVATE)
             .build()
         manager.notify(notificationId, notification)
+        val summary = Notification.Builder(this, MESSAGES_CHANNEL_ID)
+            .setContentTitle("Truskawka")
+            .setContentText("New nearby messages")
+            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setGroup(MESSAGES_GROUP_KEY)
+            .setGroupSummary(true)
+            .build()
+        manager.notify(MESSAGES_SUMMARY_NOTIFICATION_ID, summary)
     }
 
     private fun loadRuntimeSettings() {
@@ -632,6 +647,8 @@ class MeshNetworkService : Service() {
         private const val CHANNEL_ID = "mesh_network"
         private const val MESSAGES_CHANNEL_ID = "mesh_messages"
         private const val NOTIFICATION_ID = 1001
+        private const val MESSAGES_SUMMARY_NOTIFICATION_ID = 1002
+        private const val MESSAGES_GROUP_KEY = "truskawka_messages"
         private const val UI_SETTINGS_PREFS = "truskawka_ui_settings"
         private const val KEY_MESH_AGGRESSIVE = "mesh_aggressive"
         private const val KEY_MESH_MAX_HOPS = "mesh_max_hops"

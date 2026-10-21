@@ -28,6 +28,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.text.TextUtils
 import android.location.LocationManager
 import android.media.MediaPlayer
 import android.media.MediaRecorder
@@ -65,6 +66,9 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.integration.android.IntentIntegrator
+import com.google.zxing.qrcode.QRCodeWriter
 import mesh.SendResult
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -107,6 +111,7 @@ class MainActivity : Activity() {
     private var compactChatListEnabled = false
     private var messageTextScale = 1.0f
     private var cropChatImagesEnabled = true
+    private var mediaQuality = MediaQuality.BALANCED
     private var use24HourFormat = true
     private var shortDateFormatEnabled = false
     private var meshAggressiveMode = true
@@ -117,8 +122,20 @@ class MainActivity : Activity() {
     private var recordingStartedAt: Long = 0L
     private var activePlayer: MediaPlayer? = null
     private var activePlayingPath: String? = null
+    // Latest on-screen views per voice file; the adapter rebuilds rows, so the newest wins.
+    private val boundVoiceViews = mutableMapOf<String, VoicePlaybackViews>()
+    private val playbackTicker = object : Runnable {
+        override fun run() {
+            val path = activePlayingPath ?: return
+            refreshVoicePlayback(path)
+            if (runCatching { activePlayer?.isPlaying == true }.getOrDefault(false)) {
+                mainHandler.postDelayed(this, 50L)
+            }
+        }
+    }
     private val audioDurationCache = mutableMapOf<String, String>()
     private var replyTarget: ChatMessage? = null
+    private var pendingQrVerifyPeerId: UUID? = null
     private lateinit var replyBar: LinearLayout
     private lateinit var replyTextView: TextView
     private var sentCounter = 0
@@ -145,6 +162,11 @@ class MainActivity : Activity() {
             get() = this@MainActivity.activePlayingPath
         override val cropChatImages: Boolean
             get() = this@MainActivity.cropChatImagesEnabled
+        override val selectionMode: Boolean
+            get() = selectedChatMessages.isNotEmpty()
+        override fun isMessageSelected(message: ChatMessage): Boolean = message in selectedChatMessages
+        override fun toggleMessageSelection(message: ChatMessage) =
+            this@MainActivity.toggleMessageSelection(message)
 
         override fun dp(value: Int): Int = this@MainActivity.dp(value)
         override fun tr(key: String): String = this@MainActivity.tr(key)
@@ -163,8 +185,12 @@ class MainActivity : Activity() {
         override fun showMessageActions(message: ChatMessage) = this@MainActivity.showMessageActions(message)
         override fun attachReplySwipe(view: View, message: ChatMessage) =
             this@MainActivity.attachReplySwipe(view, message)
-        override fun toggleAudioPlayback(path: String?, button: TextView) =
-            this@MainActivity.toggleAudioPlayback(path, button)
+        override fun toggleAudioPlayback(path: String?) =
+            this@MainActivity.toggleAudioPlayback(path)
+        override fun seekAudio(path: String?, fraction: Float) =
+            this@MainActivity.seekAudio(path, fraction)
+        override fun bindVoicePlayback(path: String, views: VoicePlaybackViews) =
+            this@MainActivity.bindVoicePlayback(path, views)
         override fun audioDurationLabel(path: String?): String = this@MainActivity.audioDurationLabel(path)
     }
 
@@ -172,6 +198,23 @@ class MainActivity : Activity() {
     private lateinit var statusGroup: LinearLayout
     private lateinit var counterView: TextView
     private lateinit var chatTitleView: TextView
+    private lateinit var chatHeaderAvatarSlot: FrameLayout
+    private lateinit var composeGroup: LinearLayout
+    private lateinit var recordingGroup: LinearLayout
+    private lateinit var recordingDot: View
+    private lateinit var recordingTimerView: TextView
+    private lateinit var recordingHintView: TextView
+    private var recordingDotAnimator: android.animation.ObjectAnimator? = null
+    // Multi-select: identity-based, since ChatMessage is a data class and equal copies can exist.
+    private val selectedChatMessages: MutableSet<ChatMessage> =
+        java.util.Collections.newSetFromMap(java.util.IdentityHashMap())
+    private lateinit var chatHeaderRow: LinearLayout
+    private lateinit var selectionHeaderRow: LinearLayout
+    private lateinit var selectionCountView: TextView
+    private lateinit var selectionMoreButton: View
+    private var voiceGestureActive = false
+    private var voiceGestureCanceled = false
+    private var voiceGestureDownX = 0f
     private lateinit var networkStatusView: TextView
     private lateinit var chatList: ListView
     private lateinit var transferStatusView: TextView
@@ -197,8 +240,10 @@ class MainActivity : Activity() {
         override fun run() {
             if (!isRecordingVoice) return
             val elapsed = (System.currentTimeMillis() - recordingStartedAt).coerceAtLeast(0L)
-            showImageProgress("${tr("recording_voice")} ${formatDuration(elapsed)}")
-            mainHandler.postDelayed(this, 220L)
+            if (::recordingTimerView.isInitialized) {
+                recordingTimerView.text = formatRecordingTime(elapsed)
+            }
+            mainHandler.postDelayed(this, 100L)
         }
     }
 
@@ -272,7 +317,8 @@ class MainActivity : Activity() {
         loadStoredMessages()
         cleanupMediaCache()
         buildUi()
-        if (!chatListShownAtStartup) {
+        val openedFromIntent = handleOpenChatIntent(intent)
+        if (!openedFromIntent && !chatListShownAtStartup) {
             chatListShownAtStartup = true
             mainHandler.post { showChatList() }
         }
@@ -284,6 +330,12 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleOpenChatIntent(intent)
+    }
+
     override fun onResume() {
         super.onResume()
         ensureAppUnlocked()
@@ -293,6 +345,12 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        // Finish the voice note while we still own the microphone; in the background Android
+        // silences it and the recorder can't finalize a playable file.
+        voiceGestureActive = false
+        if (isRecordingVoice) {
+            stopVoiceRecordingAndSend(forceSend = false)
+        }
         super.onPause()
         appWentBackgroundAt = System.currentTimeMillis()
     }
@@ -347,7 +405,16 @@ class MainActivity : Activity() {
         root.addView(replyBar)
 
         val inputBar = buildInputBar()
-        root.addView(inputBar)
+        // The bar reaches into the root's 12dp side padding (and pads itself back), so the
+        // enlarged voice button has room to grow without disabling clipping for the chat list.
+        inputBar.setPadding(dp(12), inputBar.paddingTop, dp(12), inputBar.paddingBottom)
+        root.addView(inputBar, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            marginStart = -dp(12)
+            marginEnd = -dp(12)
+        })
         applySafeArea(root, inputBar)
         setContentView(root)
     }
@@ -379,41 +446,84 @@ class MainActivity : Activity() {
     private fun buildHeader(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, dp(12))
+            setPadding(0, 0, 0, dp(10))
 
-            val topRow = FrameLayout(this@MainActivity)
-            val leftGroup = LinearLayout(this@MainActivity).apply {
+            // Header row: round back button + pill with avatar, contact name and presence.
+            val topRow = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-
-                addView(terminalAction("< ${tr("back_to_chats")}").apply {
-                    textSize = 12f
-                    setTextColor(BERRY_TEXT)
-                    background = roundedDrawable(INPUT_SURFACE, dp(10), SOFT_PINK_STROKE)
-                    setPadding(dp(10), dp(6), dp(10), dp(6))
-                    setOnClickListener { showChatList() }
-                }, LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    marginEnd = dp(8)
-                })
             }
-            topRow.addView(leftGroup, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.START or Gravity.CENTER_VERTICAL
-            ))
+            topRow.addView(terminalAction("←").apply {
+                textSize = 24f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setTextColor(BERRY_TEXT)
+                includeFontPadding = false
+                background = circleDrawable(INPUT_SURFACE).apply { setStroke(dp(1), SOFT_PINK_STROKE) }
+                elevation = dp(2).toFloat()
+                contentDescription = tr("back_to_chats")
+                setPadding(0, 0, 0, dp(2))
+                setOnClickListener { showChatList() }
+            }, LinearLayout.LayoutParams(dp(52), dp(52)).apply {
+                marginEnd = dp(8)
+            })
+
+            chatHeaderAvatarSlot = FrameLayout(this@MainActivity)
+            chatTitleView = terminalText(selectedRecipientLabel.toDisplayTitle()).apply {
+                textSize = 18f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            }
+            networkStatusView = terminalText(tr("offline")).apply {
+                textSize = 13f
+                setTextColor(BERRY_TEXT_DIM)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(0, dp(1), 0, 0)
+            }
+            topRow.addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = GradientDrawable(
+                    GradientDrawable.Orientation.LEFT_RIGHT,
+                    intArrayOf(INPUT_SURFACE, ACCENT_PINK)
+                ).apply {
+                    cornerRadius = dp(28).toFloat()
+                    setStroke(dp(1), SOFT_PINK_STROKE)
+                }
+                elevation = dp(2).toFloat()
+                setPadding(dp(6), dp(5), dp(16), dp(5))
+                setOnClickListener { showCurrentChatProfile() }
+                addView(chatHeaderAvatarSlot, LinearLayout.LayoutParams(dp(44), dp(44)).apply {
+                    marginEnd = dp(10)
+                })
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(chatTitleView)
+                    addView(networkStatusView)
+                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            }, LinearLayout.LayoutParams(0, dp(56), 1f))
 
             statusGroup = LinearLayout(this@MainActivity).apply { visibility = View.GONE }
             counterView = terminalText("0")
             statusGroup.addView(counterView)
+            chatHeaderRow = topRow
             addView(topRow, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(42)
+                ViewGroup.LayoutParams.WRAP_CONTENT
             ))
+            selectionHeaderRow = buildSelectionHeader()
+            addView(selectionHeaderRow, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+            updateChatHeaderAvatar()
 
+            // Holds the local nickname used as message author; not shown in the chat header.
             usernameField = EditText(this@MainActivity).apply {
+                visibility = View.GONE
                 setText(contactDisplayName())
                 setSingleLine(true)
                 typeface = Typeface.DEFAULT
@@ -437,40 +547,171 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ))
-
-            chatTitleView = terminalText(selectedRecipientLabel.toDisplayTitle()).apply {
-                textSize = 22f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(BERRY_TEXT)
-                gravity = Gravity.START
-                maxLines = 1
-                setPadding(dp(2), dp(10), dp(2), 0)
-                setOnClickListener { showCurrentChatProfile() }
-            }
-            addView(chatTitleView, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ))
-
-            networkStatusView = terminalText(tr("offline")).apply {
-                textSize = 13f
-                setTextColor(BERRY_TEXT_DIM)
-                gravity = Gravity.START
-                maxLines = 1
-                setPadding(dp(2), dp(4), dp(2), 0)
-            }
-            addView(networkStatusView, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ))
         }
     }
 
+    /** Header shown while messages are selected: close, "N selected", copy / forward / delete. */
+    private fun buildSelectionHeader(): LinearLayout {
+        fun iconButton(icon: ChatIcon, description: String, onClick: () -> Unit): View =
+            View(this).apply {
+                background = ChatIconDrawable(icon, BERRY_TEXT, resources.displayMetrics.density)
+                contentDescription = description
+                isClickable = true
+                setOnClickListener { onClick() }
+            }
+        val pillBackground = { roundedDrawable(INPUT_SURFACE, dp(28), SOFT_PINK_STROKE) }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            addView(View(this@MainActivity).apply {
+                background = circleDrawable(INPUT_SURFACE).apply { setStroke(dp(1), SOFT_PINK_STROKE) }
+                foreground = ChatIconDrawable(ChatIcon.CLOSE, BERRY_TEXT, resources.displayMetrics.density)
+                elevation = dp(2).toFloat()
+                contentDescription = tr("cancel")
+                isClickable = true
+                setOnClickListener { exitMessageSelection() }
+            }, LinearLayout.LayoutParams(dp(52), dp(52)).apply {
+                marginEnd = dp(8)
+            })
+            selectionCountView = terminalText("").apply {
+                textSize = 18f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+                gravity = Gravity.CENTER_VERTICAL
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                background = pillBackground()
+                elevation = dp(2).toFloat()
+                setPadding(dp(18), 0, dp(12), 0)
+            }
+            addView(selectionCountView, LinearLayout.LayoutParams(0, dp(52), 1f).apply {
+                marginEnd = dp(8)
+            })
+            selectionMoreButton = iconButton(ChatIcon.MORE, tr("react")) {
+                selectedChatMessages.singleOrNull()?.let(::showMessageMoreActions)
+            }
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = pillBackground()
+                elevation = dp(2).toFloat()
+                setPadding(dp(6), 0, dp(6), 0)
+                val size = LinearLayout.LayoutParams(dp(42), dp(42))
+                addView(iconButton(ChatIcon.COPY, tr("copy")) { copySelectedMessages() }, LinearLayout.LayoutParams(size))
+                addView(iconButton(ChatIcon.FORWARD, tr("forward_saved")) { forwardSelectedMessages() }, LinearLayout.LayoutParams(size))
+                addView(iconButton(ChatIcon.DELETE, tr("delete")) { confirmDeleteMessages(selectedMessagesInOrder()) }, LinearLayout.LayoutParams(size))
+                addView(selectionMoreButton, LinearLayout.LayoutParams(size))
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)))
+        }
+    }
+
+    private fun startMessageSelection(message: ChatMessage) {
+        if (message.author == "system" || message.author == "mesh") return
+        selectedChatMessages += message
+        updateSelectionUi()
+    }
+
+    private fun toggleMessageSelection(message: ChatMessage) {
+        if (!selectedChatMessages.remove(message)) selectedChatMessages += message
+        updateSelectionUi()
+    }
+
+    private fun exitMessageSelection() {
+        if (selectedChatMessages.isEmpty()) return
+        selectedChatMessages.clear()
+        updateSelectionUi()
+    }
+
+    private fun updateSelectionUi() {
+        if (!::selectionHeaderRow.isInitialized) return
+        // Drop selections that are no longer on screen (deleted, chat switched).
+        selectedChatMessages.retainAll { selected -> messages.any { it === selected } }
+        val active = selectedChatMessages.isNotEmpty()
+        chatHeaderRow.visibility = if (active) View.GONE else View.VISIBLE
+        selectionHeaderRow.visibility = if (active) View.VISIBLE else View.GONE
+        selectionCountView.text = tr("selected_count").format(selectedChatMessages.size)
+        selectionMoreButton.visibility = if (selectedChatMessages.size == 1) View.VISIBLE else View.GONE
+        chatAdapter.notifyDataSetChanged()
+    }
+
+    private fun selectedMessagesInOrder(): List<ChatMessage> =
+        messages.filter { message -> selectedChatMessages.any { it === message } }
+
+    private fun copySelectedMessages() {
+        val text = selectedMessagesInOrder().joinToString("\n") { message ->
+            when {
+                message.imagePath != null -> "[${tr("photo")}]"
+                message.audioPath != null -> "[${tr("voice_message")}]"
+                else -> message.body
+            }
+        }
+        val manager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        manager.setPrimaryClip(ClipData.newPlainText("Truskawka", text))
+        Toast.makeText(this, tr("copied"), Toast.LENGTH_SHORT).show()
+        exitMessageSelection()
+    }
+
+    private fun forwardSelectedMessages() {
+        val targets = selectedMessagesInOrder()
+        exitMessageSelection()
+        targets.forEach { forwardMessageToSaved(it, notify = false) }
+        if (savedMessagesSelected) showSavedMessages()
+        Toast.makeText(this, tr("forwarded_to_saved"), Toast.LENGTH_SHORT).show()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (selectedChatMessages.isNotEmpty()) {
+            exitMessageSelection()
+            return
+        }
+        @Suppress("DEPRECATION")
+        super.onBackPressed()
+    }
+
+    private fun updateChatHeaderAvatar() {
+        if (!::chatHeaderAvatarSlot.isInitialized) return
+        val title = selectedRecipientLabel.toDisplayTitle()
+        val verified = ::chatStore.isInitialized &&
+            selectedRecipientId?.let { chatStore.getPeer(it.toString())?.verified } == true
+        val avatar = if (savedMessagesSelected) {
+            SavedNotesAvatarView(this)
+        } else {
+            AvatarView(
+                context = this,
+                label = title,
+                imagePath = null,
+                accentColor = avatarAccent(title),
+                verified = verified
+            )
+        }
+        chatHeaderAvatarSlot.removeAllViews()
+        chatHeaderAvatarSlot.addView(avatar, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+    }
+
     private fun buildInputBar(): LinearLayout {
+        // Outer bar keeps the safe-area padding (see applySafeArea); the pill inside holds the
+        // text field, the attach icon and the round mic/send button.
+        val pill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = roundedDrawable(INPUT_SURFACE, dp(30), SOFT_PINK_STROKE)
+            elevation = dp(3).toFloat()
+            minimumHeight = dp(58)
+            setPadding(dp(6), dp(5), dp(5), dp(5))
+        }
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(8), 0, dp(6))
+            addView(pill, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
 
             messageInput = EditText(this@MainActivity).apply {
                 hint = tr("hint_type_message")
@@ -478,16 +719,15 @@ class MainActivity : Activity() {
                 maxLines = 4
                 setHorizontallyScrolling(false)
                 typeface = Typeface.DEFAULT
-                textSize = 15f
+                textSize = 16f
                 setTextColor(BERRY_TEXT)
                 setHintTextColor(BERRY_TEXT_DIM)
-                background = roundedDrawable(INPUT_SURFACE, dp(18), PINK_SHADOW_STROKE)
-                elevation = dp(2).toFloat()
+                background = null
                 inputType = InputType.TYPE_CLASS_TEXT or
                     InputType.TYPE_TEXT_FLAG_CAP_SENTENCES or
                     InputType.TYPE_TEXT_FLAG_MULTI_LINE
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(16), dp(12), dp(16), dp(12))
+                setPadding(dp(14), dp(10), dp(6), dp(10))
                 addTextChangedListener(object : TextWatcher {
                     override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
                     override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
@@ -496,67 +736,163 @@ class MainActivity : Activity() {
                     override fun afterTextChanged(s: Editable?) = Unit
                 })
             }
-            addView(messageInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginEnd = dp(8)
-            })
+            // Normal state: text field + attach icon.
+            composeGroup = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(messageInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(View(this@MainActivity).apply {
+                    background = paperclipIconDrawable(BERRY_TEXT_DIM)
+                    contentDescription = tr("photo")
+                    isClickable = true
+                    setOnClickListener { openImagePicker() }
+                }, LinearLayout.LayoutParams(dp(44), dp(44)).apply {
+                    marginEnd = dp(4)
+                })
+            }
+            pill.addView(composeGroup, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
-            addView(terminalAction("\uD83D\uDCCE").apply {
-                textSize = 18f
+            // Recording state: blinking dot, timer and "‹ slide to cancel" hint.
+            recordingDot = View(this@MainActivity).apply {
+                background = circleDrawable(STRAWBERRY_RED)
+            }
+            recordingTimerView = terminalText("0:00,0").apply {
+                textSize = 17f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(BERRY_TEXT)
+                maxLines = 1
+            }
+            recordingHintView = terminalText("‹  ${tr("slide_to_cancel")}").apply {
+                textSize = 16f
+                setTextColor(BERRY_TEXT)
                 gravity = Gravity.CENTER
-                minWidth = dp(44)
-                minHeight = dp(44)
-                background = roundedDrawable(ACCENT_PINK, dp(16), OUTGOING_BUBBLE_STROKE)
-                setPadding(dp(10), dp(8), dp(10), dp(10))
-                setOnClickListener { openImagePicker() }
-            }, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                marginEnd = dp(8)
-            })
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            }
+            recordingGroup = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                visibility = View.GONE
+                minimumHeight = dp(48)
+                setPadding(dp(14), 0, dp(8), 0)
+                addView(recordingDot, LinearLayout.LayoutParams(dp(10), dp(10)).apply {
+                    marginEnd = dp(12)
+                })
+                addView(recordingTimerView, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+                addView(recordingHintView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginStart = dp(8)
+                })
+            }
+            pill.addView(recordingGroup, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+            // Let the enlarged record button spill over the pill like in messengers.
+            pill.clipChildren = false
+            clipChildren = false
 
             actionButton = terminalAction(">").apply {
                 background = circleDrawable(STRAWBERRY_RED)
                 setTextColor(Color.WHITE)
                 textSize = 22f
                 gravity = Gravity.CENTER
-                minWidth = dp(46)
-                minHeight = dp(46)
+                minWidth = dp(48)
+                minHeight = dp(48)
                 setOnClickListener { handleInputAction() }
-                var downX = 0f
-                var canceledBySwipe = false
-                setOnTouchListener { v, event ->
+                setOnTouchListener { _, event ->
                     if (messageInput.text.toString().isNotBlank()) return@setOnTouchListener false
-                    when (event.actionMasked) {
-                        MotionEvent.ACTION_DOWN -> {
-                            downX = event.x
-                            canceledBySwipe = false
-                            startVoiceRecording()
-                            true
-                        }
-                        MotionEvent.ACTION_MOVE -> {
-                            if (isRecordingVoice && event.x < downX - dp(64)) {
-                                canceledBySwipe = true
-                                stopVoiceRecording(cleanupOnly = true)
-                                showImageProgress(tr("voice_canceled"))
-                                mainHandler.postDelayed({ hideImageProgress() }, 900L)
-                            }
-                            true
-                        }
-                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                            v.performClick()
-                            if (isRecordingVoice && !canceledBySwipe) {
-                                stopVoiceRecordingAndSend(forceSend = false)
-                            }
-                            true
-                        }
-                        else -> false
+                    if (event.actionMasked != MotionEvent.ACTION_DOWN) return@setOnTouchListener true
+                    startVoiceRecording()
+                    if (isRecordingVoice) {
+                        // The rest of the gesture (move / release) is tracked in dispatchTouchEvent,
+                        // so it ends the recording even if the button's own events get lost.
+                        voiceGestureActive = true
+                        voiceGestureCanceled = false
+                        voiceGestureDownX = event.rawX
+                    }
+                    true
+                }
+            }
+            pill.addView(actionButton)
+            updateActionButton()
+        }
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (!voiceGestureActive) return super.dispatchTouchEvent(ev)
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_MOVE -> {
+                if (isRecordingVoice && !voiceGestureCanceled) {
+                    val limit = VOICE_CANCEL_SWIPE_DP * resources.displayMetrics.density
+                    val dx = (ev.rawX - voiceGestureDownX).coerceIn(-limit, 0f)
+                    applyRecordingSwipe(dx)
+                    if (dx <= -limit) {
+                        voiceGestureCanceled = true
+                        stopVoiceRecording(cleanupOnly = true)
+                        showImageProgress(tr("voice_canceled"))
+                        mainHandler.postDelayed({ hideImageProgress() }, 900L)
                     }
                 }
             }
-            addView(actionButton)
-            updateActionButton()
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                voiceGestureActive = false
+                if (isRecordingVoice && !voiceGestureCanceled) {
+                    stopVoiceRecordingAndSend(forceSend = false)
+                }
+            }
         }
+        // While holding the record button the whole screen belongs to this gesture.
+        return true
+    }
+
+    /** Switches the input pill between compose and recording layouts and animates the button. */
+    private fun updateRecordingUi() {
+        if (!::recordingGroup.isInitialized) return
+        val recording = isRecordingVoice
+        if (recording == (recordingGroup.visibility == View.VISIBLE)) return
+        composeGroup.visibility = if (recording) View.GONE else View.VISIBLE
+        recordingGroup.visibility = if (recording) View.VISIBLE else View.GONE
+        recordingDotAnimator?.cancel()
+        recordingDotAnimator = null
+        if (recording) {
+            recordingTimerView.text = formatRecordingTime(0L)
+            applyRecordingSwipe(0f)
+            recordingDot.alpha = 1f
+            recordingDotAnimator = android.animation.ObjectAnimator.ofFloat(recordingDot, View.ALPHA, 1f, 0.15f).apply {
+                duration = 600L
+                repeatMode = android.animation.ValueAnimator.REVERSE
+                repeatCount = android.animation.ValueAnimator.INFINITE
+                start()
+            }
+            actionButton.elevation = dp(6).toFloat()
+            actionButton.animate().scaleX(VOICE_BUTTON_SCALE).scaleY(VOICE_BUTTON_SCALE).setDuration(160L).start()
+        } else {
+            actionButton.animate()
+                .scaleX(1f).scaleY(1f).translationX(0f)
+                .setDuration(160L)
+                .withEndAction { actionButton.elevation = 0f }
+                .start()
+            recordingHintView.translationX = 0f
+            recordingHintView.alpha = 1f
+        }
+    }
+
+    /** Moves the button and the hint with the finger while sliding left to cancel. */
+    private fun applyRecordingSwipe(dx: Float) {
+        if (!::recordingHintView.isInitialized) return
+        val limit = VOICE_CANCEL_SWIPE_DP * resources.displayMetrics.density
+        actionButton.translationX = dx
+        recordingHintView.translationX = dx * 0.6f
+        recordingHintView.alpha = 1f - (-dx / limit) * 0.7f
+    }
+
+    private fun formatRecordingTime(elapsedMs: Long): String {
+        val totalTenths = elapsedMs / 100L
+        val minutes = totalTenths / 600L
+        val seconds = (totalTenths / 10L) % 60L
+        val tenths = totalTenths % 10L
+        return String.format(Locale.US, "%d:%02d,%d", minutes, seconds, tenths)
     }
 
     private fun buildTransferStatus(): TextView =
@@ -801,6 +1137,12 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated Android callback is enough for this minimal Activity.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == QR_SCAN_REQUEST) {
+            // parseActivityResult(requestCode, ...) only matches the library's default request
+            // code, so with setRequestCode() we must use the overload without it.
+            handleIdentityQrScan(IntentIntegrator.parseActivityResult(resultCode, data)?.contents)
+            return
+        }
         if (resultCode != RESULT_OK) return
         val uri = data?.data ?: return
         takePersistableUriPermissionIfPossible(uri, data.flags)
@@ -936,12 +1278,24 @@ class MainActivity : Activity() {
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(BERRY_TEXT)
             })
-            addView(ImageView(this@MainActivity).apply {
-                adjustViewBounds = true
-                scaleType = ImageView.ScaleType.CENTER_CROP
-                setImageBitmap(decodeBitmapFromUri(uri, maxDimension = 1280))
+            // The frame draws the border; the photo inside fills it (CENTER_CROP) and is clipped
+            // to its own rounded corners so it can't poke out past the frame's rounded border.
+            addView(FrameLayout(this@MainActivity).apply {
                 background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
                 setPadding(dp(6), dp(6), dp(6), dp(6))
+                addView(ImageView(this@MainActivity).apply {
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    setImageBitmap(decodeBitmapFromUri(uri, maxDimension = 1280))
+                    outlineProvider = object : android.view.ViewOutlineProvider() {
+                        override fun getOutline(view: View, outline: android.graphics.Outline) {
+                            outline.setRoundRect(0, 0, view.width, view.height, dp(13).toFloat())
+                        }
+                    }
+                    clipToOutline = true
+                }, FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                ))
             }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 0,
@@ -992,7 +1346,7 @@ class MainActivity : Activity() {
         showImageProgress(tr("preparing_image"))
 
         thread(name = "image-compress-send") {
-            val prepared = ImageTransferPreparer.prepareForTransfer(contentResolver, uri, fileName)
+            val prepared = ImageTransferPreparer.prepareForTransfer(contentResolver, uri, fileName, mediaQuality)
             if (prepared == null) {
                 runOnUiThread {
                     hideImageProgress()
@@ -1109,7 +1463,16 @@ class MainActivity : Activity() {
             }
             is SendResult.Queued -> {
                 if (targetId != null) {
-                    scheduleTextRetry(localMessage, targetId, payloadText)
+                    val queuedId = result.messageId
+                    if (queuedId != null) {
+                        // The mesh outbox sends it once the session is up; retrying here
+                        // as well delivered the message twice.
+                        localMessage.messageId = queuedId
+                        persistChatMessageIdentity(localMessage)
+                        clearTextRetry(localMessage.localId)
+                    } else {
+                        scheduleTextRetry(localMessage, targetId, payloadText)
+                    }
                 }
             }
         }
@@ -1152,7 +1515,6 @@ class MainActivity : Activity() {
         recordingStartedAt = System.currentTimeMillis()
         isRecordingVoice = true
         updateActionButton()
-        showImageProgress("${tr("recording_voice")} 00:00")
         mainHandler.post(recordingTicker)
         mainHandler.postDelayed(voiceStopRunnable, VOICE_MAX_DURATION_MS)
     }
@@ -1161,7 +1523,16 @@ class MainActivity : Activity() {
         val file = recordingFile
         val duration = System.currentTimeMillis() - recordingStartedAt
         stopVoiceRecording(cleanupOnly = false)
+        recordingFile = null
         if (file == null || !file.exists() || file.length() <= 0L) return
+        // A recorder that failed to stop leaves an MP4 without its index: it can't be played and
+        // reports 00:00, so never send it. (stop() may also "fail" after the recorder already
+        // auto-stopped at max duration with a valid file, so check the file, not the result.)
+        if (readAudioDurationMs(file.absolutePath) <= 0L) {
+            file.delete()
+            Toast.makeText(this, tr("voice_record_failed"), Toast.LENGTH_SHORT).show()
+            return
+        }
         if (!forceSend && duration < VOICE_MIN_DURATION_MS) {
             file.delete()
             Toast.makeText(this, tr("voice_too_short"), Toast.LENGTH_SHORT).show()
@@ -1175,14 +1546,16 @@ class MainActivity : Activity() {
         sendPreparedVoice(file)
     }
 
-    private fun stopVoiceRecording(cleanupOnly: Boolean) {
+    /** @return true when the recorder stopped cleanly and the file is finalized. */
+    private fun stopVoiceRecording(cleanupOnly: Boolean): Boolean {
         mainHandler.removeCallbacks(voiceStopRunnable)
         mainHandler.removeCallbacks(recordingTicker)
         val pendingFile = recordingFile
         val current = recorder
         recorder = null
+        var finalized = false
         if (current != null) {
-            runCatching { current.stop() }
+            finalized = runCatching { current.stop() }.isSuccess
             runCatching { current.reset() }
             current.release()
         }
@@ -1195,10 +1568,11 @@ class MainActivity : Activity() {
                 runCatching { pendingFile.delete() }
             }
             hideImageProgress()
-            return
+            return finalized
         }
         recordingStartedAt = 0L
         hideImageProgress()
+        return finalized
     }
 
     private fun isRecipientWithinHopLimit(targetId: UUID?): Boolean {
@@ -1221,12 +1595,17 @@ class MainActivity : Activity() {
         val author = usernameField.text.toString().prefixAt()
         val timestamp = System.currentTimeMillis()
         if (savedMessagesSelected) {
-            addAudioMessage(
-                author = author,
-                audioPath = file.absolutePath,
-                mine = true,
-                timestamp = timestamp,
-                status = MessageStatus.READ
+            // Same path as saved text/photos: addAudioMessage() skips the on-screen list for
+            // Saved messages, so the note only showed up after reopening the chat.
+            saveLocalMessage(
+                ChatMessage(
+                    author = author,
+                    body = tr("voice_message"),
+                    mine = true,
+                    audioPath = file.absolutePath,
+                    timestamp = timestamp,
+                    status = MessageStatus.READ
+                )
             )
             return
         }
@@ -1281,8 +1660,8 @@ class MainActivity : Activity() {
         actionButton.setCompoundDrawables(null, null, null, null)
         when {
             isRecordingVoice -> {
-                actionButton.text = tr("recording_short")
-                actionButton.background = circleDrawable(STRAWBERRY_RED)
+                actionButton.text = ""
+                actionButton.background = microphoneButtonDrawable()
             }
             messageInput.text.toString().isBlank() -> {
                 actionButton.text = ""
@@ -1294,9 +1673,11 @@ class MainActivity : Activity() {
             }
         }
         actionButton.textSize = if (messageInput.text.toString().isBlank() || isRecordingVoice) 16f else 22f
+        updateRecordingUi()
     }
 
     private fun showChatList() {
+        exitMessageSelection()
         syncKnownPeers()
         chatStore.ensureBaseChats()
         updateLocalizedBaseChatTitles()
@@ -2234,6 +2615,11 @@ class MainActivity : Activity() {
                     persistChatMessageIdentity(message)
                     clearTextRetry(localId)
                 }
+                is SendResult.Queued if result.messageId != null -> {
+                    message.messageId = result.messageId
+                    persistChatMessageIdentity(message)
+                    clearTextRetry(localId)
+                }
                 is SendResult.Failed, is SendResult.Queued -> {
                     if (attempts >= MESSAGE_RETRY_ATTEMPTS) {
                         clearTextRetry(localId)
@@ -2300,6 +2686,7 @@ class MainActivity : Activity() {
     }
 
     private fun selectChat(chatKey: String, title: String, peerId: UUID?) {
+        exitMessageSelection()
         savedMessagesSelected = chatKey == CHAT_SAVED
         selectedRecipientId = peerId
         clearReplyTarget()
@@ -2316,6 +2703,29 @@ class MainActivity : Activity() {
         chatStore.clearUnread(chatKey)
         updateRecipientHint()
         updateChatTitle()
+    }
+
+    private fun handleOpenChatIntent(intent: Intent?): Boolean {
+        val chatKey = intent?.getStringExtra(EXTRA_OPEN_CHAT_KEY)?.takeIf { it.isNotBlank() } ?: return false
+        if (!::chatStore.isInitialized || !::chatAdapter.isInitialized) return false
+        val summary = chatStore.listChats().firstOrNull { it.chatKey == chatKey }
+        // Consume the extras so recreation (rotation, relaunch from recents) doesn't reopen the chat.
+        val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
+        val peerExtra = intent.getStringExtra(EXTRA_OPEN_PEER_ID)
+        val titleExtra = intent.getStringExtra(EXTRA_OPEN_CHAT_TITLE)
+        intent.removeExtra(EXTRA_OPEN_CHAT_KEY)
+        intent.removeExtra(EXTRA_OPEN_PEER_ID)
+        intent.removeExtra(EXTRA_OPEN_CHAT_TITLE)
+        if (fromHistory) return false
+        // The shared "Everyone" chat must never get a recipient, or replies would go out as DMs.
+        val peerId = if (chatKey == CHAT_EVERYONE) null else peerExtra
+            ?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+            ?: summary?.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+        val title = titleExtra
+            ?: summary?.let { summaryDisplayTitle(it) }
+            ?: chatKey.toDisplayTitle()
+        selectChat(chatKey, title, peerId)
+        return true
     }
 
     private fun showChatMessages(chatKey: String) {
@@ -2582,6 +2992,7 @@ class MainActivity : Activity() {
         if (::chatTitleView.isInitialized) {
             chatTitleView.text = selectedRecipientLabel.toDisplayTitle()
         }
+        updateChatHeaderAvatar()
         if (::networkStatusView.isInitialized) {
             networkStatusView.text = when {
                 savedMessagesSelected -> tr("saved_messages")
@@ -2624,6 +3035,137 @@ class MainActivity : Activity() {
         } ?: return
         if (::networkStatusView.isInitialized) {
             networkStatusView.text = status
+        }
+    }
+
+    private fun showOwnIdentityCodeDialog() {
+        val service = meshService ?: run {
+            Toast.makeText(this, tr("mesh_starting"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        val fingerprint = service.getLocalFingerprint()
+        val payload = identityQrPayload(service.nodeId, fingerprint, contactDisplayName())
+        val qrBitmap = runCatching { createQrBitmap(payload, dp(220)) }.getOrNull()
+
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(18), dp(18), dp(14))
+            background = roundedDrawable(SOFT_PINK_PANEL, dp(22), SOFT_PINK_STROKE)
+            addView(terminalText(tr("identity_qr")).apply {
+                textSize = 21f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            if (qrBitmap != null) {
+                addView(ImageView(this@MainActivity).apply {
+                    setImageBitmap(qrBitmap)
+                    setBackgroundColor(Color.WHITE)
+                    setPadding(dp(10), dp(10), dp(10), dp(10))
+                }, LinearLayout.LayoutParams(dp(240), dp(240)).apply {
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    topMargin = dp(14)
+                    bottomMargin = dp(12)
+                })
+            }
+            addView(terminalText(fingerprint.chunked(4).joinToString(" ")).apply {
+                textSize = 16f
+                typeface = Typeface.MONOSPACE
+                gravity = Gravity.CENTER
+                setTextColor(BERRY_TEXT)
+                background = roundedDrawable(INPUT_SURFACE, dp(16), SOFT_PINK_STROKE)
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+
+        AlertDialog.Builder(this)
+            .setView(panel)
+            .setNeutralButton(tr("copy")) { _, _ ->
+                val manager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                manager.setPrimaryClip(ClipData.newPlainText("Truskawka identity", payload))
+                Toast.makeText(this, tr("copied"), Toast.LENGTH_SHORT).show()
+            }
+            .setPositiveButton(tr("close"), null)
+            .show()
+    }
+
+    private fun launchIdentityScanner(peerId: UUID?) {
+        pendingQrVerifyPeerId = peerId
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), CAMERA_REQUEST_CODE)
+            return
+        }
+        IntentIntegrator(this).apply {
+            setRequestCode(QR_SCAN_REQUEST)
+            setDesiredBarcodeFormats(IntentIntegrator.QR_CODE)
+            setPrompt(tr("scan_identity_qr"))
+            setBeepEnabled(false)
+            setOrientationLocked(false)
+        }.initiateScan()
+    }
+
+    private fun handleIdentityQrScan(contents: String?) {
+        val targetPeerId = pendingQrVerifyPeerId
+        pendingQrVerifyPeerId = null
+        if (contents == null) return // scan cancelled
+        val scanned = parseIdentityQrPayload(contents)
+        if (targetPeerId == null || scanned == null) {
+            Toast.makeText(this, tr("identity_qr_invalid"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (scanned.nodeId != targetPeerId) {
+            Toast.makeText(this, tr("identity_qr_wrong_peer"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        // Compare only against a real key fingerprint. Never fall back to peerFingerprint():
+        // it is derived from the public node id, so anyone could forge a matching QR.
+        val expected = (meshService?.getPeerFingerprint(targetPeerId)
+            ?: chatStore.getPeer(targetPeerId.toString())?.fingerprint)
+            ?.filter { it.isLetterOrDigit() }
+        if (expected.isNullOrEmpty()) {
+            Toast.makeText(this, tr("identity_qr_no_session"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!scanned.fingerprint.equals(expected, ignoreCase = true)) {
+            Toast.makeText(this, tr("identity_qr_mismatch"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        rememberPeer(targetPeerId, scanned.name?.ifBlank { selectedRecipientLabel } ?: selectedRecipientLabel)
+        meshService?.markPeerVerified(targetPeerId)
+        chatStore.setPeerVerified(targetPeerId.toString(), true)
+        Toast.makeText(this, tr("contact_verified"), Toast.LENGTH_SHORT).show()
+        updateChatTitle()
+    }
+
+    private fun identityQrPayload(nodeId: UUID, fingerprint: String, name: String): String =
+        Uri.Builder()
+            .scheme("truskawka")
+            .authority("identity")
+            .appendQueryParameter("v", "1")
+            .appendQueryParameter("id", nodeId.toString())
+            .appendQueryParameter("fp", fingerprint)
+            .appendQueryParameter("name", name)
+            .build()
+            .toString()
+
+    private fun parseIdentityQrPayload(value: String?): ScannedIdentity? {
+        val uri = runCatching { Uri.parse(value ?: return null) }.getOrNull() ?: return null
+        if (uri.scheme != "truskawka" || uri.authority != "identity") return null
+        val nodeIdText = uri.getQueryParameter("id") ?: return null
+        val nodeId = runCatching { UUID.fromString(nodeIdText) }.getOrNull() ?: return null
+        val fingerprint = uri.getQueryParameter("fp")?.filter { it.isLetterOrDigit() }?.uppercase(Locale.US)
+            ?: return null
+        if (fingerprint.length < 16) return null
+        return ScannedIdentity(nodeId, fingerprint, uri.getQueryParameter("name"))
+    }
+
+    private fun createQrBitmap(payload: String, size: Int): Bitmap {
+        val matrix = QRCodeWriter().encode(payload, BarcodeFormat.QR_CODE, size, size)
+        return Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565).apply {
+            for (x in 0 until size) {
+                for (y in 0 until size) {
+                    setPixel(x, y, if (matrix[x, y]) Color.BLACK else Color.WHITE)
+                }
+            }
         }
     }
 
@@ -2723,6 +3265,15 @@ class MainActivity : Activity() {
                 }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                     bottomMargin = dp(10)
                 })
+                addView(terminalAction(tr("scan_identity_qr")).apply {
+                    textSize = 16f
+                    gravity = Gravity.CENTER
+                    background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                    setOnClickListener {
+                        dialog.dismiss()
+                        launchIdentityScanner(peerId)
+                    }
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             }
         }
         dialog.setContentView(FrameLayout(this).apply {
@@ -2943,6 +3494,17 @@ class MainActivity : Activity() {
                 setOnClickListener {
                     openProfileAvatarPicker(returnToProfile = true)
                 }
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(12)
+            })
+
+            addView(terminalAction(tr("identity_qr")).apply {
+                textSize = 15f
+                gravity = Gravity.CENTER
+                setTextColor(STRAWBERRY_RED)
+                background = roundedDrawable(INPUT_SURFACE, dp(18), SOFT_PINK_STROKE)
+                setPadding(dp(14), dp(10), dp(14), dp(10))
+                setOnClickListener { showOwnIdentityCodeDialog() }
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 bottomMargin = dp(12)
             })
@@ -3263,7 +3825,7 @@ class MainActivity : Activity() {
                 openProfileAvatarPicker()
             }
             addToolAction("settings_identity_code", "settings_identity_code_desc") {
-                Toast.makeText(this, meshService?.getLocalFingerprint().orEmpty().chunked(4).joinToString(" "), Toast.LENGTH_LONG).show()
+                showOwnIdentityCodeDialog()
             }
         }
 
@@ -3374,6 +3936,15 @@ class MainActivity : Activity() {
                 meshService?.startNearbyDiscovery(silent = false)
                 Toast.makeText(this, tr("status_searching_nearby"), Toast.LENGTH_SHORT).show()
             }
+            addToolAction("settings_network_map", "settings_network_map_desc") {
+                showNetworkMap()
+            }
+            addToolAction("settings_delivery_queue", "settings_delivery_queue_desc") {
+                showDeliveryQueue()
+            }
+            addToolAction("settings_radio_health", "settings_radio_health_desc") {
+                showRadioHealth()
+            }
         }
 
         if (group == SettingsGroup.NOTIFICATIONS) {
@@ -3397,6 +3968,18 @@ class MainActivity : Activity() {
             addToggle("settings_crop_images", "settings_crop_images_desc", cropChatImagesEnabled) {
                 cropChatImagesEnabled = it
                 applySettingsNow(refreshMessages = true)
+            }
+            addChoiceChips(
+                "settings_media_quality",
+                listOf(
+                    MediaQuality.FAST.storageKey to tr("media_quality_fast"),
+                    MediaQuality.BALANCED.storageKey to tr("media_quality_balanced"),
+                    MediaQuality.ORIGINAL.storageKey to tr("media_quality_original")
+                ),
+                mediaQuality.storageKey
+            ) { selected ->
+                mediaQuality = MediaQuality.fromStorageKey(selected)
+                applySettingsNow()
             }
             addToolAction("settings_cleanup_cache", "settings_cleanup_cache_desc") {
                 cleanupMediaCache()
@@ -3424,6 +4007,9 @@ class MainActivity : Activity() {
                     .putBoolean(UI_SETTINGS_QUICK_START_HIDDEN, false)
                     .apply()
                 Toast.makeText(this@MainActivity, tr("quick_start_title"), Toast.LENGTH_SHORT).show()
+            }
+            addToolAction("settings_global_search", "settings_global_search_desc") {
+                showGlobalSearchDialog()
             }
         }
 
@@ -3905,7 +4491,233 @@ class MainActivity : Activity() {
         MediaCacheCleaner.cleanup(filesDir, MAX_MEDIA_CACHE_BYTES)
     }
 
+    private fun showNetworkMap() {
+        val peers = meshService?.knownPeers().orEmpty()
+        val direct = peers.count { it.isDirect || it.hopCount <= 1 }
+        val routed = peers.size - direct
+        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(44), dp(18), dp(18))
+            setBackgroundColor(CREAM_BACKGROUND)
+            addView(terminalText(tr("network_map")).apply {
+                textSize = 24f
+                typeface = Typeface.DEFAULT_BOLD
+            })
+            addView(PatchRadarView(this@MainActivity) { key -> tr(key) }.apply {
+                setPeerCounts(direct, routed)
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(240)).apply {
+                topMargin = dp(12)
+                bottomMargin = dp(12)
+            })
+            val rows = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+            if (peers.isEmpty()) {
+                rows.addView(terminalText(tr("no_direct_peers")).apply {
+                    textSize = 14f
+                    setTextColor(BERRY_TEXT_DIM)
+                })
+            } else {
+                peers.forEach { peer ->
+                    val label = peer.displayName ?: "@${peer.nodeId.toString().take(8)}"
+                    val route = if (peer.isDirect || peer.hopCount <= 1) tr("direct_ble") else "${tr("via")} ${peer.hopCount} ${tr("hops")}"
+                    rows.addView(networkActionRow(label, "$route / ${formatPeerPresence(peer.lastSeen)}", false) {
+                        rememberPeer(peer.nodeId, label)
+                        selectChat(peerChatKey(peer.nodeId), label, peer.nodeId)
+                        dialog.dismiss()
+                    }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                        bottomMargin = dp(8)
+                    })
+                }
+            }
+            addView(ScrollView(this@MainActivity).apply {
+                addView(rows)
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        }
+        dialog.setContentView(root)
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        dialog.show()
+        dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+    }
+
+    private fun showDeliveryQueue() {
+        val chats = chatStore.listChats()
+        val rows = chats.flatMap { chat ->
+            chatStore.loadMessages(chat.chatKey)
+                .filter { it.status == MessageStatus.SENDING.name || it.status == MessageStatus.FAILED.name }
+                .map { chat to it }
+        }
+        val transfers = meshService?.recentTransfers().orEmpty()
+            .filter { it.status == "sending" || it.status == "receiving" || it.status == "failed" }
+        val content = buildString {
+            if (rows.isEmpty() && transfers.isEmpty()) {
+                append(tr("delivery_queue_empty"))
+            }
+            rows.forEach { (chat, message) ->
+                append("${message.status ?: ""} ${summaryDisplayTitle(chat)}: ")
+                append(message.body.ifBlank {
+                    when {
+                        message.imagePath != null -> tr("photo")
+                        message.audioPath != null -> tr("voice_message")
+                        else -> ""
+                    }
+                }.take(80))
+                append("\n")
+            }
+            transfers.forEach { transfer ->
+                val percent = if (transfer.totalBytes <= 0) 0 else ((transfer.receivedBytes * 100f) / transfer.totalBytes).toInt().coerceIn(0, 100)
+                append("${transfer.status} $percent% ${transfer.fileName}\n")
+            }
+        }
+        AlertDialog.Builder(this)
+            .setTitle(tr("delivery_queue"))
+            .setMessage(content)
+            .setPositiveButton(tr("close"), null)
+            .show()
+    }
+
+    private fun showRadioHealth() {
+        val missing = missingPermissionLabels()
+        val report = buildString {
+            append("${tr("radio_health_bluetooth")}: ${bluetoothHealthLabel()}\n")
+            append("${tr("radio_health_ble")}: ${if (packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)) tr("ok") else tr("not_available")}\n")
+            append("${tr("radio_health_permissions")}: ${missing.ifEmpty { listOf(tr("ok")) }.joinToString(", ")}\n")
+            append("${tr("radio_health_service")}: ${if (serviceBound) tr("online") else tr("offline")}\n")
+            append("${tr("radio_health_peers")}: ${meshService?.peerCount() ?: 0}\n")
+            append("${tr("settings_mesh_mode")}: ${if (meshAggressiveMode) tr("mesh_mode_aggressive") else tr("mesh_mode_balanced")}\n")
+            append("${tr("settings_max_hops")}: $meshMaxHops")
+        }
+        AlertDialog.Builder(this)
+            .setTitle(tr("radio_health"))
+            .setMessage(report)
+            .setNegativeButton(tr("settings_restart_mesh")) { _, _ -> meshService?.startNearbyDiscovery(silent = false) }
+            .setPositiveButton(tr("close"), null)
+            .show()
+    }
+
+    private fun showGlobalSearchDialog() {
+        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(18), dp(18), dp(18))
+            setBackgroundColor(SOFT_PINK_PANEL)
+        }
+        val resultsContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val input = EditText(this).apply {
+            hint = tr("global_search_hint")
+            setSingleLine(true)
+            typeface = Typeface.MONOSPACE
+            textSize = 15f
+            setTextColor(BERRY_TEXT)
+            setHintTextColor(BERRY_TEXT_DIM)
+            background = roundedDrawable(INPUT_SURFACE, dp(20), SOFT_PINK_STROKE)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+        }
+        // Load history once per dialog instead of re-reading every chat on each keystroke.
+        val searchable = chatStore.listChats().flatMap { chat ->
+            chatStore.loadMessages(chat.chatKey)
+                .filterNot { it.author == "system" || it.author == "mesh" }
+                .map { chat to it }
+        }
+        fun render() {
+            val query = input.text?.toString().orEmpty().trim().lowercase(Locale.getDefault())
+            resultsContainer.removeAllViews()
+            if (query.isBlank()) {
+                resultsContainer.addView(terminalText(tr("global_search_empty")).apply {
+                    textSize = 14f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setPadding(0, dp(16), 0, 0)
+                })
+                return
+            }
+            val hits = searchable.asSequence()
+                .filter { (chat, it) ->
+                    summaryDisplayTitle(chat).lowercase(Locale.getDefault()).contains(query) ||
+                        it.author.lowercase(Locale.getDefault()).contains(query) ||
+                        it.body.lowercase(Locale.getDefault()).contains(query) ||
+                        (it.imagePath != null && tr("photo").lowercase(Locale.getDefault()).contains(query)) ||
+                        (it.audioPath != null && tr("voice_message").lowercase(Locale.getDefault()).contains(query))
+                }
+                .take(40)
+                .toList()
+            if (hits.isEmpty()) {
+                resultsContainer.addView(terminalText(tr("no_matches")).apply {
+                    textSize = 14f
+                    setTextColor(BERRY_TEXT_DIM)
+                    setPadding(0, dp(16), 0, 0)
+                })
+                return
+            }
+            hits.forEach { (chat, message) ->
+                resultsContainer.addView(searchResultRow(message.toChatMessage(defaultStatus = null)) {
+                    openStoredMessage(chat, message.id)
+                    dialog.dismiss()
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    topMargin = dp(10)
+                })
+            }
+        }
+        root.addView(terminalText(tr("global_search")).apply {
+            textSize = 22f
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        root.addView(input, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(16)
+        })
+        root.addView(ScrollView(this).apply { addView(resultsContainer) }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            0,
+            1f
+        ))
+        input.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = render()
+            override fun afterTextChanged(s: Editable?) = Unit
+        })
+        render()
+        dialog.setContentView(root)
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+        dialog.show()
+        dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+        input.requestFocus()
+        showKeyboard(input)
+    }
+
+    private fun openStoredMessage(chat: ChatSummary, localId: Long) {
+        val peerId = chat.peerId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+        selectChat(chat.chatKey, summaryDisplayTitle(chat), peerId)
+        chatList.post {
+            val index = messages.indexOfFirst { it.localId == localId }
+            if (index >= 0) chatList.setSelection(index)
+        }
+    }
+
+    private fun missingPermissionLabels(): List<String> =
+        MeshPermissionPolicy.missingRequiredPermissions {
+            checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+        }.map { it.substringAfterLast('.') }
+
+    private fun bluetoothHealthLabel(): String {
+        val adapter = getSystemService(BluetoothManager::class.java).adapter ?: return tr("not_available")
+        return runCatching { if (adapter.isEnabled) tr("enabled") else tr("disabled") }
+            .getOrDefault(tr("not_available"))
+    }
+
     private fun showConnectionDiagnostics() {
+        val msg = buildDiagnosticsReport()
+        AlertDialog.Builder(this)
+            .setTitle(tr("connection_diagnostics"))
+            .setMessage(msg)
+            .setNegativeButton(tr("share")) { _, _ -> shareText("Truskawka diagnostics", msg) }
+            .setNeutralButton(tr("copy")) { _, _ ->
+                val manager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                manager.setPrimaryClip(ClipData.newPlainText("Truskawka diagnostics", msg))
+                Toast.makeText(this, tr("copied"), Toast.LENGTH_SHORT).show()
+            }
+            .setPositiveButton(tr("close"), null)
+            .show()
+    }
+
+    private fun buildDiagnosticsReport(): String {
         val peers = meshService?.knownPeers().orEmpty()
         val diagnostics = meshService?.meshDiagnostics()
         val transfers = meshService?.recentTransfers().orEmpty()
@@ -3914,7 +4726,12 @@ class MainActivity : Activity() {
         val ratio = if (sentCounter <= 0) 0 else ((deliveredCounter * 100f) / sentCounter).toInt()
         val avgHops = peers.map { it.hopCount.coerceAtLeast(1) }.average().takeIf { !it.isNaN() } ?: 0.0
         val discoveryMode = if (meshAggressiveMode) tr("mesh_mode_aggressive") else tr("mesh_mode_balanced")
-        val msg = buildString {
+        return buildString {
+            append("Truskawka diagnostics\n")
+            append("Android: ${Build.VERSION.RELEASE} API ${Build.VERSION.SDK_INT}\n")
+            append("${tr("radio_health_bluetooth")}: ${bluetoothHealthLabel()}\n")
+            append("${tr("radio_health_permissions")}: ${missingPermissionLabels().ifEmpty { listOf(tr("ok")) }.joinToString(", ")}\n")
+            append("${tr("radio_health_service")}: ${if (serviceBound) tr("online") else tr("offline")}\n")
             append("${tr("diag_sent")}: $sentCounter\n")
             append("${tr("diag_delivered")}: $deliveredCounter\n")
             append("${tr("diag_read")}: $readCounter\n")
@@ -3947,15 +4764,15 @@ class MainActivity : Activity() {
             }
             append("${tr("diag_last_relay")}: $lastRelayInfo")
         }
-        AlertDialog.Builder(this)
-            .setTitle(tr("connection_diagnostics"))
-            .setMessage(msg)
-            .setNeutralButton(tr("copy")) { _, _ ->
-                val manager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-                manager.setPrimaryClip(ClipData.newPlainText("Truskawka diagnostics", msg))
-                Toast.makeText(this, tr("copied"), Toast.LENGTH_SHORT).show()
-            }
-            .show()
+    }
+
+    private fun shareText(title: String, body: String) {
+        val sendIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, title)
+            putExtra(Intent.EXTRA_TEXT, body)
+        }
+        startActivity(Intent.createChooser(sendIntent, title))
     }
 
     private fun loadUiSettings() {
@@ -3974,6 +4791,7 @@ class MainActivity : Activity() {
         compactChatListEnabled = prefs.getBoolean(UI_SETTINGS_CHAT_COMPACT, false)
         messageTextScale = prefs.getFloat(UI_SETTINGS_CHAT_TEXT_SCALE, 1.0f).coerceIn(0.9f, 1.3f)
         cropChatImagesEnabled = prefs.getBoolean(UI_SETTINGS_CHAT_IMAGE_CROP, true)
+        mediaQuality = MediaQuality.fromStorageKey(prefs.getString(UI_SETTINGS_MEDIA_QUALITY, MediaQuality.BALANCED.storageKey))
         use24HourFormat = prefs.getBoolean(UI_SETTINGS_TIME_24H, true)
         shortDateFormatEnabled = prefs.getBoolean(UI_SETTINGS_DATE_SHORT, false)
         meshAggressiveMode = prefs.getBoolean(UI_SETTINGS_MESH_AGGRESSIVE, true)
@@ -3994,6 +4812,7 @@ class MainActivity : Activity() {
             .putBoolean(UI_SETTINGS_CHAT_COMPACT, compactChatListEnabled)
             .putFloat(UI_SETTINGS_CHAT_TEXT_SCALE, messageTextScale)
             .putBoolean(UI_SETTINGS_CHAT_IMAGE_CROP, cropChatImagesEnabled)
+            .putString(UI_SETTINGS_MEDIA_QUALITY, mediaQuality.storageKey)
             .putBoolean(UI_SETTINGS_TIME_24H, use24HourFormat)
             .putBoolean(UI_SETTINGS_DATE_SHORT, shortDateFormatEnabled)
             .putBoolean(UI_SETTINGS_MESH_AGGRESSIVE, meshAggressiveMode)
@@ -4343,12 +5162,19 @@ class MainActivity : Activity() {
         chatAdapter.notifyDataSetChanged()
     }
 
+    /** Long-press: enter multi-select (or extend it). */
     private fun showMessageActions(message: ChatMessage) {
+        if (selectedChatMessages.isEmpty()) startMessageSelection(message) else toggleMessageSelection(message)
+    }
+
+    /** Extra actions for a single selected message (the "⋮" button in the selection header). */
+    private fun showMessageMoreActions(message: ChatMessage) {
         if (message.author == "system" || message.author == "mesh") return
+        exitMessageSelection()
         val actions = mutableListOf(
             StyledActionItem(tr("react")) { showReactionPicker(message) },
             StyledActionItem(tr("forward_saved")) { forwardMessageToSaved(message) },
-            StyledActionItem(tr("delete"), destructive = true) { confirmDeleteMessage(message) }
+            StyledActionItem(tr("delete"), destructive = true) { confirmDeleteMessages(listOf(message)) }
         )
         if (message.imagePath == null && message.audioPath == null) {
             actions += StyledActionItem(tr("edit")) { editMessage(message) }
@@ -4373,7 +5199,7 @@ class MainActivity : Activity() {
         showStyledActionDialog(actions = actions)
     }
 
-    private fun forwardMessageToSaved(message: ChatMessage) {
+    private fun forwardMessageToSaved(message: ChatMessage, notify: Boolean = true) {
         val author = usernameField.text.toString().prefixAt()
         when {
             message.imagePath != null -> {
@@ -4396,10 +5222,11 @@ class MainActivity : Activity() {
             }
             else -> saveLocalMessage(ChatMessage(author, message.body, true, status = MessageStatus.READ))
         }
-        Toast.makeText(this, tr("forwarded_to_saved"), Toast.LENGTH_SHORT).show()
+        if (notify) Toast.makeText(this, tr("forwarded_to_saved"), Toast.LENGTH_SHORT).show()
     }
 
-    private fun confirmDeleteMessage(target: ChatMessage) {
+    private fun confirmDeleteMessages(targets: List<ChatMessage>) {
+        if (targets.isEmpty()) return
         val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
         val checkbox = CheckBox(this).apply {
             text = tr("delete_for_everyone_q")
@@ -4439,7 +5266,8 @@ class MainActivity : Activity() {
                     ).apply { marginStart = dp(8) }
                     setOnClickListener {
                         dialog.dismiss()
-                        deleteMessage(target, deleteForEveryone = checkbox.isChecked)
+                        targets.forEach { deleteMessage(it, deleteForEveryone = checkbox.isChecked) }
+                        exitMessageSelection()
                     }
                 })
             })
@@ -4907,6 +5735,16 @@ class MainActivity : Activity() {
             }
             return
         }
+        if (requestCode == CAMERA_REQUEST_CODE) {
+            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                launchIdentityScanner(pendingQrVerifyPeerId)
+            } else {
+                pendingQrVerifyPeerId = null
+                Toast.makeText(this, tr("camera_permission_needed"), Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
         if (requestCode != MESH_PERMISSIONS_REQUEST_CODE) return
 
         if (hasRequiredPermissions()) {
@@ -5044,6 +5882,51 @@ class MainActivity : Activity() {
         GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             setColor(color)
+        }
+
+    /** Outline paperclip, tilted 45°, drawn centered in the bounds. */
+    private fun paperclipIconDrawable(color: Int): Drawable =
+        object : Drawable() {
+            private val density = resources.displayMetrics.density
+            private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                this.color = color
+                style = Paint.Style.STROKE
+                strokeWidth = 2f * density
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+            }
+            private val clip = android.graphics.Path().apply {
+                fun d(v: Float) = v * density
+                // Inner leg down, small bottom loop, long left side, top loop,
+                // long right side, wide bottom loop, short left leg up.
+                moveTo(d(1.5f), d(-4f))
+                lineTo(d(1.5f), d(5f))
+                arcTo(RectF(d(-4.5f), d(2f), d(1.5f), d(8f)), 0f, 180f, false)
+                lineTo(d(-4.5f), d(-7f))
+                arcTo(RectF(d(-4.5f), d(-11f), d(4.5f), d(-3f)), 180f, 180f, false)
+                lineTo(d(4.5f), d(7f))
+                arcTo(RectF(d(-7.5f), d(1f), d(4.5f), d(13f)), 0f, 180f, false)
+                lineTo(d(-7.5f), d(-1f))
+            }
+
+            override fun draw(canvas: Canvas) {
+                val save = canvas.save()
+                canvas.translate(bounds.exactCenterX(), bounds.exactCenterY() - density)
+                canvas.rotate(45f)
+                canvas.drawPath(clip, paint)
+                canvas.restoreToCount(save)
+            }
+
+            override fun setAlpha(alpha: Int) {
+                paint.alpha = alpha
+            }
+
+            override fun setColorFilter(colorFilter: ColorFilter?) {
+                paint.colorFilter = colorFilter
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
         }
 
     private fun microphoneButtonDrawable(): Drawable =
@@ -5192,57 +6075,113 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun toggleAudioPlayback(path: String?, button: TextView) {
+    /** Play / pause / resume. Starting another voice note stops the current one. */
+    private fun toggleAudioPlayback(path: String?) {
         val audioPath = path?.takeIf { it.isNotBlank() } ?: return
-        if (!File(audioPath).exists()) return
-        if (activePlayingPath == audioPath) {
-            releaseAudioPlayer()
-            button.text = tr("play")
+        val current = activePlayer
+        if (activePlayingPath == audioPath && current != null) {
+            runCatching { if (current.isPlaying) current.pause() else current.start() }
+            refreshVoicePlayback(audioPath)
+            if (current.isPlaying) mainHandler.post(playbackTicker)
             return
         }
+        startAudioPlayback(audioPath, startFraction = 0f)
+    }
+
+    private fun seekAudio(path: String?, fraction: Float) {
+        val audioPath = path?.takeIf { it.isNotBlank() } ?: return
+        val current = activePlayer
+        if (activePlayingPath == audioPath && current != null) {
+            runCatching { current.seekTo((current.duration * fraction).toInt()) }
+            refreshVoicePlayback(audioPath)
+            return
+        }
+        startAudioPlayback(audioPath, startFraction = fraction)
+    }
+
+    private fun startAudioPlayback(audioPath: String, startFraction: Float) {
+        if (!File(audioPath).exists()) return
         releaseAudioPlayer()
         val player = MediaPlayer()
         runCatching {
             player.setDataSource(audioPath)
             player.prepare()
+            if (startFraction > 0f) player.seekTo((player.duration * startFraction).toInt())
             player.start()
         }.onFailure {
             player.release()
-            button.text = tr("play")
+            refreshVoicePlayback(audioPath)
+            Toast.makeText(this, tr("voice_read_failed"), Toast.LENGTH_SHORT).show()
             return
         }
         activePlayer = player
         activePlayingPath = audioPath
-        button.text = tr("stop")
-        player.setOnCompletionListener {
-            releaseAudioPlayer()
-            chatAdapter.notifyDataSetChanged()
+        player.setOnCompletionListener { releaseAudioPlayer() }
+        refreshVoicePlayback(audioPath)
+        mainHandler.post(playbackTicker)
+    }
+
+    private fun bindVoicePlayback(path: String, views: VoicePlaybackViews) {
+        boundVoiceViews[path] = views
+        applyVoicePlaybackState(path, views)
+    }
+
+    private fun refreshVoicePlayback(path: String) {
+        boundVoiceViews[path]?.let { applyVoicePlaybackState(path, it) }
+    }
+
+    private fun applyVoicePlaybackState(path: String, views: VoicePlaybackViews) {
+        val player = activePlayer?.takeIf { activePlayingPath == path }
+        if (player == null) {
+            views.button.playing = false
+            views.waveform.progress = 0f
+            views.timeLabel.text = audioDurationLabel(path)
+            return
         }
+        val duration = runCatching { player.duration }.getOrDefault(0)
+        val position = runCatching { player.currentPosition }.getOrDefault(0)
+        views.button.playing = runCatching { player.isPlaying }.getOrDefault(false)
+        views.waveform.progress = if (duration > 0) position.toFloat() / duration else 0f
+        val seconds = (position / 1000).coerceAtLeast(0)
+        views.timeLabel.text = "%02d:%02d".format(seconds / 60, seconds % 60)
     }
 
     private fun audioDurationLabel(path: String?): String {
         val audioPath = path?.takeIf { it.isNotBlank() } ?: return "00:00"
         audioDurationCache[audioPath]?.let { return it }
-        val durationMs = runCatching {
-            val probe = MediaPlayer()
-            probe.setDataSource(audioPath)
-            probe.prepare()
-            val d = probe.duration
-            probe.release()
-            d
-        }.getOrDefault(0)
-        val totalSec = (durationMs / 1000).coerceAtLeast(0)
+        val durationMs = readAudioDurationMs(audioPath)
+        // Round up so a short note shows 00:01, not 00:00.
+        val totalSec = ((durationMs + 999L) / 1000L).toInt()
         val label = "%02d:%02d".format(totalSec / 60, totalSec % 60)
-        audioDurationCache[audioPath] = label
+        // Don't cache failures: the file may still be being written/received.
+        if (durationMs > 0L) audioDurationCache[audioPath] = label
         return label
     }
 
+    /** Reads the container duration without preparing a player; 0 if unreadable. */
+    private fun readAudioDurationMs(path: String): Long {
+        if (!File(path).exists()) return 0L
+        val retriever = android.media.MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(path)
+            retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+        } catch (_: Exception) {
+            0L
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
     private fun releaseAudioPlayer() {
+        mainHandler.removeCallbacks(playbackTicker)
+        val stoppedPath = activePlayingPath
         runCatching { activePlayer?.stop() }
         runCatching { activePlayer?.reset() }
         runCatching { activePlayer?.release() }
         activePlayer = null
         activePlayingPath = null
+        stoppedPath?.let(::refreshVoicePlayback)
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()

@@ -169,14 +169,11 @@ class MeshManager(
 
         // Check if we have an established session
         if (!crypto.hasSessionWith(recipientId)) {
-            // Queue message and initiate handshake
-            val added = queuePendingMessage(recipientId, messageBytes)
+            // Queue message and initiate handshake. The message id is assigned now so the
+            // caller can track delivery without re-sending (re-sending caused duplicates).
+            val messageId = queuePendingMessage(recipientId, messageBytes)
             initiateHandshake(recipientId)
-            return if (added) {
-                SendResult.Queued("No session, handshake initiated")
-            } else {
-                SendResult.Queued("No session, already queued")
-            }
+            return SendResult.Queued("No session, handshake initiated", messageId)
         }
 
         return sendEncryptedMessage(recipientId, messageBytes)
@@ -314,7 +311,9 @@ class MeshManager(
             type = type,
             flags = PacketFlags(
                 isEncrypted = !isBroadcast,
-                requiresAck = !isBroadcast
+                // Only metadata needs router-level ACK/retry: lost chunks are recovered by
+                // FILE_CHUNK_REQUEST, and per-chunk ACKs would flood the router retry queue.
+                requiresAck = !isBroadcast && type == PacketType.FILE_META
             ),
             ttl = maxRelayHops.toByte(),
             messageId = UUID.randomUUID(),
@@ -338,7 +337,11 @@ class MeshManager(
         return true
     }
 
-    private fun sendEncryptedMessage(recipientId: UUID, plaintext: ByteArray): SendResult {
+    private fun sendEncryptedMessage(
+        recipientId: UUID,
+        plaintext: ByteArray,
+        messageId: UUID = UUID.randomUUID()
+    ): SendResult {
         // Encrypt message
         val encrypted = crypto.encryptMessage(recipientId, plaintext)
             ?: return SendResult.Failed("Encryption failed")
@@ -348,49 +351,71 @@ class MeshManager(
         val payload = encodeEncryptedPayload(encrypted)
         val signature = crypto.sign(payload)
 
-        val messageId = router.sendMessage(recipientId, payload, signature, requiresAck = true)
+        // Track before sending: a direct-link ACK can arrive before sendMessage returns.
         trackedMessageDeliveries.add(messageId)
+        router.sendMessage(recipientId, payload, signature, requiresAck = true, messageId = messageId)
         return SendResult.Sent(messageId)
     }
 
-    private fun queuePendingMessage(recipientId: UUID, message: ByteArray): Boolean {
-        val queue = pendingOutbox.computeIfAbsent(recipientId) {
-            Collections.synchronizedList(mutableListOf())
-        }
-        synchronized(queue) {
-            if (queue.any { it.payload.contentEquals(message) }) {
-                return false
+    private fun queuePendingMessage(recipientId: UUID, message: ByteArray): UUID {
+        val pending = PendingOutboxMessage(message, System.currentTimeMillis())
+        while (true) {
+            val queue = pendingOutbox.computeIfAbsent(recipientId) {
+                Collections.synchronizedList(mutableListOf())
             }
-            if (queue.size >= MAX_PENDING_OUTBOX_PER_PEER) {
-                queue.removeAt(0)
+            var evicted: PendingOutboxMessage? = null
+            val added = synchronized(queue) {
+                // The queue may have been flushed and detached concurrently; retry with a fresh one.
+                if (pendingOutbox[recipientId] !== queue) return@synchronized false
+                if (queue.size >= MAX_PENDING_OUTBOX_PER_PEER) {
+                    evicted = queue.removeAt(0)
+                }
+                queue.add(pending)
+                true
             }
-            queue.add(PendingOutboxMessage(message, System.currentTimeMillis()))
+            if (added) {
+                evicted?.let { messageStatusListener?.invoke(it.messageId, MessageDeliveryStatus.FAILED) }
+                return pending.messageId
+            }
         }
-        return true
+    }
+
+    private fun flushPendingOutbox(recipientId: UUID) {
+        val queue = pendingOutbox[recipientId] ?: return
+        val snapshot = synchronized(queue) {
+            pendingOutbox.remove(recipientId, queue)
+            queue.toList().also { queue.clear() }
+        }
+        snapshot.forEach { pending ->
+            if (sendEncryptedMessage(recipientId, pending.payload, pending.messageId) is SendResult.Failed) {
+                messageStatusListener?.invoke(pending.messageId, MessageDeliveryStatus.FAILED)
+            }
+        }
     }
 
     private fun retryPendingMessages() {
         val now = System.currentTimeMillis()
 
-        pendingOutbox.forEach { (recipientId, messages) ->
+        pendingOutbox.keys.toList().forEach { recipientId ->
             if (crypto.hasSessionWith(recipientId)) {
                 // Session established, send pending messages
-                val snapshot = synchronized(messages) { messages.toList() }
-                snapshot.forEach { pending ->
-                    sendEncryptedMessage(recipientId, pending.payload)
+                flushPendingOutbox(recipientId)
+                return@forEach
+            }
+            val messages = pendingOutbox[recipientId] ?: return@forEach
+            val expired = mutableListOf<PendingOutboxMessage>()
+            val hasPending = synchronized(messages) {
+                messages.removeIf { pending ->
+                    (now - pending.queuedAt > PENDING_OUTBOX_MAX_AGE_MS).also { if (it) expired += pending }
                 }
-                pendingOutbox.remove(recipientId)
-            } else {
-                // Remove expired messages (older than 24 hours)
-                val hasPending = synchronized(messages) {
-                    messages.removeIf { now - it.queuedAt > 24 * 3600 * 1000 }
-                    messages.isNotEmpty()
-                }
+                if (messages.isEmpty()) pendingOutbox.remove(recipientId, messages)
+                messages.isNotEmpty()
+            }
+            expired.forEach { messageStatusListener?.invoke(it.messageId, MessageDeliveryStatus.FAILED) }
 
-                // Retry handshake
-                if (hasPending) {
-                    initiateHandshake(recipientId)
-                }
+            // Retry handshake
+            if (hasPending) {
+                initiateHandshake(recipientId)
             }
         }
     }
@@ -467,8 +492,18 @@ class MeshManager(
             require(totalBytes in 1..MAX_IMAGE_BYTES)
             require(chunkSize in 1..FILE_CHUNK_SIZE)
             require(chunkCount in 1..MAX_IMAGE_CHUNKS)
+            require(chunkCount.toLong() * chunkSize >= totalBytes)
             val mimeType = ByteArray(mimeLength).also { buffer.get(it) }.toString(Charsets.UTF_8)
             val fileName = ByteArray(nameLength).also { buffer.get(it) }.toString(Charsets.UTF_8)
+            val existing = incomingFiles[transferId]
+            if (existing != null) {
+                // A replayed/re-sent META must not wipe chunks that already arrived.
+                return@runCatching existing.senderId == packet.senderId
+            }
+            cleanupIncomingFiles()
+            if (incomingFiles.size >= MAX_CONCURRENT_INCOMING_TRANSFERS) {
+                return@runCatching false
+            }
             incomingFiles[transferId] = IncomingFileTransfer(
                 senderId = packet.senderId,
                 fileName = fileName,
@@ -480,6 +515,7 @@ class MeshManager(
             )
             persistIncomingFileMeta(transferId, incomingFiles[transferId]!!)
             orphanFileChunks.remove(transferId)?.let { orphan ->
+                if (orphan.senderId != packet.senderId) return@let
                 val transfer = incomingFiles[transferId] ?: return@let
                 orphan.chunks.forEachIndexed { index, chunk ->
                     if (index in transfer.chunks.indices && chunk != null) {
@@ -506,13 +542,16 @@ class MeshManager(
             val chunk = ByteArray(buffer.remaining()).also { buffer.get(it) }
             val transfer = incomingFiles[transferId]
             if (transfer == null) {
-                storeOrphanFileChunk(transferId, index, totalChunks, chunk)
+                storeOrphanFileChunk(packet.senderId, transferId, index, totalChunks, chunk)
                 return@runCatching true
             }
+            // Only the original sender may contribute chunks to a transfer.
+            require(packet.senderId == transfer.senderId)
             require(totalChunks == transfer.chunks.size)
             require(index in transfer.chunks.indices)
             require(chunk.size <= FILE_CHUNK_SIZE)
             transfer.chunks[index] = chunk
+            transfer.updatedAt = System.currentTimeMillis()
             persistIncomingFileChunk(transferId, index, chunk)
 
             notifyIncomingFileProgress(transferId, transfer)
@@ -523,14 +562,18 @@ class MeshManager(
             true
         }.getOrDefault(false)
 
-    private fun storeOrphanFileChunk(transferId: UUID, index: Int, totalChunks: Int, chunk: ByteArray) {
+    private fun storeOrphanFileChunk(senderId: UUID, transferId: UUID, index: Int, totalChunks: Int, chunk: ByteArray) {
         require(totalChunks in 1..MAX_IMAGE_CHUNKS)
         require(index in 0 until totalChunks)
         require(chunk.size <= FILE_CHUNK_SIZE)
         cleanupOrphanFileChunks()
+        if (!orphanFileChunks.containsKey(transferId) && orphanFileChunks.size >= MAX_CONCURRENT_INCOMING_TRANSFERS) {
+            return
+        }
         val orphan = orphanFileChunks.compute(transferId) { _, existing ->
-            existing ?: OrphanFileChunks(arrayOfNulls(totalChunks), System.currentTimeMillis())
+            existing ?: OrphanFileChunks(senderId, arrayOfNulls(totalChunks), System.currentTimeMillis())
         } ?: return
+        if (orphan.senderId != senderId) return
         if (orphan.chunks.size != totalChunks) {
             orphanFileChunks.remove(transferId)
             return
@@ -621,6 +664,34 @@ class MeshManager(
         orphanFileChunks.entries.removeIf { now - it.value.createdAt > FILE_TRANSFER_TIMEOUT_MS }
     }
 
+    /**
+     * Drops incoming transfers that stopped making progress. The sender keeps outgoing chunks
+     * only for FILE_TRANSFER_TIMEOUT_MS, so a stalled transfer can never complete afterwards;
+     * without this it would leak memory/disk and send chunk requests forever.
+     */
+    private fun cleanupIncomingFiles() {
+        val now = System.currentTimeMillis()
+        incomingFiles.entries.toList().forEach { (transferId, transfer) ->
+            if (now - transfer.updatedAt <= FILE_TRANSFER_TIMEOUT_MS) return@forEach
+            if (!incomingFiles.remove(transferId, transfer)) return@forEach
+            deleteTransferDirectory("incoming", transferId)
+            notifyFileProgress(
+                FileTransferProgress(
+                    transferId = transferId,
+                    sentChunks = transfer.chunks.count { it != null },
+                    totalChunks = transfer.chunks.size,
+                    totalBytes = transfer.totalBytes,
+                    fileName = transfer.fileName,
+                    mimeType = transfer.mimeType,
+                    recipientId = transfer.senderId,
+                    isBroadcast = transfer.isBroadcast,
+                    direction = TransferDirection.INCOMING,
+                    status = TransferStatus.FAILED
+                )
+            )
+        }
+    }
+
     private fun cleanupOutgoingFiles() {
         val now = System.currentTimeMillis()
         outgoingFiles.entries.removeIf { now - it.value.createdAt > FILE_TRANSFER_TIMEOUT_MS }
@@ -632,6 +703,7 @@ class MeshManager(
     }
 
     private fun requestMissingFileChunks() {
+        cleanupIncomingFiles()
         incomingFiles.keys.forEach(::requestMissingFileChunks)
         cleanupOrphanFileChunks()
         cleanupOutgoingFiles()
@@ -731,7 +803,8 @@ class MeshManager(
                 totalBytes = meta.getProperty("totalBytes")?.toIntOrNull() ?: return@forEach,
                 chunks = chunks,
                 timestamp = meta.getProperty("timestamp")?.toLongOrNull() ?: System.currentTimeMillis(),
-                isBroadcast = meta.getProperty("isBroadcast").toBoolean()
+                isBroadcast = meta.getProperty("isBroadcast").toBoolean(),
+                updatedAt = dir.walkTopDown().maxOfOrNull { it.lastModified() } ?: dir.lastModified()
             )
             incomingFiles[transferId] = transfer
             notifyIncomingFileProgress(transferId, transfer)
@@ -861,9 +934,12 @@ class MeshManager(
     }
 
     private fun verifyOptionalPublicSignature(packet: MeshPacket): Boolean {
-        if (packet.signature.isEmpty()) return true
+        // Without a session we don't know the sender's identity key and cannot verify.
         val peerIdentity = crypto.getSessionInfo(packet.senderId)?.peerIdentity ?: return true
-        return crypto.verifySignature(packet.payload, packet.signature, peerIdentity)
+        // Our peers always sign public packets, so an unsigned one claiming a known
+        // sender id is a spoofing attempt.
+        return packet.signature.isNotEmpty() &&
+            crypto.verifySignature(packet.payload, packet.signature, peerIdentity)
     }
 
     private fun decodeEncryptedPayload(payload: ByteArray): EncryptedMessage? {
@@ -960,6 +1036,7 @@ class MeshManager(
 
                 // Notify peer listener
                 peerListener?.invoke(nodeId, PeerEvent.SESSION_ESTABLISHED)
+                flushPendingOutbox(nodeId)
                 requestMissingFileChunks()
             }
             is HandshakeResult.Failed -> {
@@ -975,10 +1052,7 @@ class MeshManager(
                 peerListener?.invoke(nodeId, PeerEvent.SESSION_ESTABLISHED)
 
                 // Send any pending messages
-                val queued = pendingOutbox[nodeId]
-                val snapshot = if (queued != null) synchronized(queued) { queued.toList() } else emptyList()
-                snapshot.forEach { pending -> sendEncryptedMessage(nodeId, pending.payload) }
-                pendingOutbox.remove(nodeId)
+                flushPendingOutbox(nodeId)
                 requestMissingFileChunks()
             }
             is HandshakeResult.Failed -> {
@@ -1178,7 +1252,8 @@ data class PeerInfo(
 
 data class PendingOutboxMessage(
     val payload: ByteArray,
-    val queuedAt: Long
+    val queuedAt: Long,
+    val messageId: UUID = UUID.randomUUID()
 )
 
 data class IncomingFileTransfer(
@@ -1189,10 +1264,12 @@ data class IncomingFileTransfer(
     val chunks: Array<ByteArray?>,
     val timestamp: Long,
     val isBroadcast: Boolean,
-    var lastChunkRequestAt: Long = 0L
+    var lastChunkRequestAt: Long = 0L,
+    var updatedAt: Long = System.currentTimeMillis()
 )
 
 data class OrphanFileChunks(
+    val senderId: UUID,
     val chunks: Array<ByteArray?>,
     val createdAt: Long
 )
@@ -1256,7 +1333,8 @@ enum class MessageDeliveryStatus {
 
 sealed class SendResult {
     data class Sent(val messageId: UUID) : SendResult()
-    data class Queued(val reason: String) : SendResult()
+    /** Waiting for a secure session; [messageId] is the id the message will be sent with. */
+    data class Queued(val reason: String, val messageId: UUID? = null) : SendResult()
     data class Failed(val error: String) : SendResult()
 }
 
@@ -1271,6 +1349,8 @@ private const val FILE_CHUNK_REQUEST_INTERVAL_MS = 2_500L
 private const val MAX_CHUNK_REQUEST_INDEXES = 96
 private const val KNOWN_PEER_MAX_AGE_MS = 60_000L
 private const val MAX_PENDING_OUTBOX_PER_PEER = 96
+private const val PENDING_OUTBOX_MAX_AGE_MS = 24 * 3600 * 1000L
+private const val MAX_CONCURRENT_INCOMING_TRANSFERS = 16
 
 private fun ByteArray.asIterableChunks(size: Int): List<ByteArray> =
     indices.step(size).map { start ->

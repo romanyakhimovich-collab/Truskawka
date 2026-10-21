@@ -21,6 +21,49 @@ import java.util.Calendar
         override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
             val item = getItem(position)
             val isServiceLog = item.author == "system" || item.author == "mesh"
+            val content = buildMessageContent(position, item, isServiceLog)
+            val outer = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+            // Date header stays outside the selectable row, like in the reference design.
+            if (shouldShowDateHeader(position)) {
+                outer.addView(dateHeader(item), LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    topMargin = delegate.dp(5)
+                    bottomMargin = delegate.dp(3)
+                })
+            }
+            if (!delegate.selectionMode || isServiceLog) {
+                outer.addView(content, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+                return outer
+            }
+            val selected = delegate.isMessageSelected(item)
+            outer.addView(SelectableRowLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                if (selected) setBackgroundColor((OUTGOING_BUBBLE and 0x00FFFFFF) or 0x2E000000)
+                addView(SelectionCheckView(
+                    context,
+                    checked = selected,
+                    ringColor = BERRY_TEXT_DIM,
+                    checkedColor = LEAF_GREEN
+                ), LinearLayout.LayoutParams(delegate.dp(26), delegate.dp(26)).apply {
+                    marginStart = delegate.dp(8)
+                })
+                addView(content, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                setOnClickListener { delegate.toggleMessageSelection(item) }
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+            return outer
+        }
+
+        private fun buildMessageContent(position: Int, item: ChatMessage, isServiceLog: Boolean): LinearLayout {
             return LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = when {
@@ -29,15 +72,6 @@ import java.util.Calendar
                     else -> Gravity.START
                 }
                 setPadding(delegate.dp(8), delegate.dp(5), delegate.dp(8), delegate.dp(5))
-                if (shouldShowDateHeader(position)) {
-                    addView(dateHeader(item), LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT
-                    ).apply {
-                        gravity = Gravity.CENTER_HORIZONTAL
-                        bottomMargin = delegate.dp(8)
-                    })
-                }
                 if (shouldShowSenderLabel(position, item, isServiceLog)) {
                     addView(senderLabel(item), LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -221,32 +255,60 @@ import java.util.Calendar
                 } else {
                     delegate.roundedDrawable(INCOMING_BUBBLE, delegate.dp(18), INCOMING_BUBBLE_STROKE)
                 }
-                setPadding(delegate.dp(16), delegate.dp(10), delegate.dp(14), delegate.dp(8))
+                setPadding(delegate.dp(10), delegate.dp(10), delegate.dp(14), delegate.dp(8))
+                val path = item.audioPath.orEmpty()
+                // Outgoing: white button/bars on the accent bubble; incoming: accent on light bubble.
+                val accent = if (item.mine) Color.WHITE else STRAWBERRY_RED
+                val playButton = VoicePlayButtonView(
+                    context,
+                    circleColor = accent,
+                    iconColor = if (item.mine) OUTGOING_BUBBLE else Color.WHITE
+                ).apply {
+                    contentDescription = delegate.tr("play")
+                    isClickable = true
+                    setOnClickListener { delegate.toggleAudioPlayback(item.audioPath) }
+                }
+                val waveform = VoiceWaveformView(
+                    context,
+                    activeColor = accent,
+                    idleColor = (accent and 0x00FFFFFF) or 0x66000000
+                ).apply {
+                    peaks = VoiceWaveforms.cached(path)
+                    if (peaks == null && path.isNotBlank()) {
+                        VoiceWaveforms.load(path) { peaks = it }
+                    }
+                    onSeek = { fraction -> delegate.seekAudio(item.audioPath, fraction) }
+                }
+                val timeLabel = delegate.terminalText(delegate.audioDurationLabel(item.audioPath)).apply {
+                    textSize = 13f
+                    setTextColor(if (item.mine) 0xE6FFFFFF.toInt() else BERRY_TEXT_DIM)
+                }
                 addView(LinearLayout(context).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER_VERTICAL
-                    val action = delegate.terminalAction(
-                        if (delegate.activePlayingPath == item.audioPath) delegate.tr("stop") else delegate.tr("play")
-                    ).apply {
-                        textSize = 12f
-                        setTextColor(if (item.mine) Color.WHITE else INCOMING_TEXT)
-                        background = delegate.roundedDrawable(
-                            if (item.mine) 0x40FFFFFF else 0x22FF4359,
-                            delegate.dp(10),
-                            if (item.mine) 0x55FFFFFF else SOFT_PINK_STROKE
-                        )
-                        setPadding(delegate.dp(10), delegate.dp(6), delegate.dp(10), delegate.dp(6))
-                        setOnClickListener {
-                            delegate.toggleAudioPlayback(item.audioPath, this)
-                        }
-                    }
-                    addView(action)
-                    addView(delegate.terminalText(delegate.audioDurationLabel(item.audioPath)).apply {
-                        textSize = 12f
-                        setTextColor(if (item.mine) 0xE6FFFFFF.toInt() else BERRY_TEXT_DIM)
-                        setPadding(delegate.dp(10), 0, 0, 0)
+                    addView(playButton, LinearLayout.LayoutParams(delegate.dp(48), delegate.dp(48)).apply {
+                        marginEnd = delegate.dp(10)
                     })
-                })
+                    addView(LinearLayout(context).apply {
+                        orientation = LinearLayout.VERTICAL
+                        addView(waveform, LinearLayout.LayoutParams(delegate.dp(170), delegate.dp(30)))
+                        addView(timeLabel, LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT
+                        ).apply {
+                            topMargin = delegate.dp(2)
+                        })
+                    }, LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ))
+                }, LinearLayout.LayoutParams(
+                    // Explicit WRAP_CONTENT: the default (MATCH_PARENT) inside this WRAP_CONTENT
+                    // bubble is ignored when sizing it, so the bubble shrank to the time row.
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+                delegate.bindVoicePlayback(path, VoicePlaybackViews(playButton, waveform, timeLabel))
                 addView(messageTimeView(item, overOutgoing = item.mine), LinearLayout.LayoutParams(
                     // keep shared time style with message scaling
                     ViewGroup.LayoutParams.WRAP_CONTENT,

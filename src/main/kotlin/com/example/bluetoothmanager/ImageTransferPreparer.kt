@@ -30,8 +30,19 @@ object ImageTransferPreparer {
     fun prepareForTransfer(
         contentResolver: ContentResolver,
         uri: Uri,
-        originalName: String
+        originalName: String,
+        quality: MediaQuality = MediaQuality.BALANCED
     ): PreparedImage? {
+        val maxDimension = when (quality) {
+            MediaQuality.FAST -> 960
+            MediaQuality.BALANCED -> MAX_IMAGE_DIMENSION
+            MediaQuality.ORIGINAL -> 1920
+        }
+        val targetBytes = when (quality) {
+            MediaQuality.FAST -> FAST_IMAGE_BYTES
+            MediaQuality.BALANCED -> BALANCED_IMAGE_BYTES
+            MediaQuality.ORIGINAL -> ORIGINAL_IMAGE_BYTES
+        }
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         val boundsStream = contentResolver.openInputStream(uri) ?: return null
         boundsStream.use {
@@ -39,8 +50,8 @@ object ImageTransferPreparer {
         }
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
             return decodeImageWithImageDecoder(contentResolver, uri)?.let { bitmap ->
-                val scaled = scaleBitmapIfNeeded(bitmap, MAX_IMAGE_DIMENSION)
-                val compressed = compressBitmap(scaled)
+                val scaled = scaleBitmapIfNeeded(bitmap, maxDimension)
+                val compressed = compressBitmap(scaled, targetBytes, quality)
                 if (scaled !== bitmap && !scaled.isRecycled) scaled.recycle()
                 if (!bitmap.isRecycled) bitmap.recycle()
                 PreparedImage("${originalName.substringBeforeLast('.', "image")}.jpg", "image/jpeg", compressed)
@@ -48,14 +59,14 @@ object ImageTransferPreparer {
         }
 
         val options = BitmapFactory.Options().apply {
-            inSampleSize = calculateInSampleSize(bounds, MAX_IMAGE_DIMENSION)
+            inSampleSize = calculateInSampleSize(bounds, maxDimension)
         }
         val bitmap = contentResolver.openInputStream(uri)?.use {
             BitmapFactory.decodeStream(it, null, options)
         } ?: decodeImageWithImageDecoder(contentResolver, uri) ?: return null
 
-        val scaled = scaleBitmapIfNeeded(bitmap, MAX_IMAGE_DIMENSION)
-        val compressed = compressBitmap(scaled)
+        val scaled = scaleBitmapIfNeeded(bitmap, maxDimension)
+        val compressed = compressBitmap(scaled, targetBytes, quality)
         if (scaled !== bitmap && !scaled.isRecycled) scaled.recycle()
         if (!bitmap.isRecycled) bitmap.recycle()
         val safeName = originalName
@@ -101,15 +112,24 @@ object ImageTransferPreparer {
         return sampleSize
     }
 
-    private fun compressBitmap(bitmap: Bitmap): ByteArray {
-        var quality = 82
+    private fun compressBitmap(bitmap: Bitmap, targetBytes: Int, mediaQuality: MediaQuality): ByteArray {
+        var quality = when (mediaQuality) {
+            MediaQuality.FAST -> 72
+            MediaQuality.BALANCED -> 82
+            MediaQuality.ORIGINAL -> 92
+        }
+        val minQuality = when (mediaQuality) {
+            MediaQuality.FAST -> 42
+            MediaQuality.BALANCED -> 50
+            MediaQuality.ORIGINAL -> 70
+        }
         var bytes: ByteArray
         do {
             val output = ByteArrayOutputStream()
             bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)
             bytes = output.toByteArray()
             quality -= 8
-        } while (bytes.size > TARGET_IMAGE_BYTES && quality >= 50)
+        } while (bytes.size > targetBytes && quality >= minQuality)
         return bytes
     }
 }

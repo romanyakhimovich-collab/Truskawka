@@ -213,6 +213,71 @@ class MeshManagerTest {
         })
     }
 
+    @Test
+    fun `queued messages are sent once with their queued ids after handshake`() {
+        val nodeA = UUID.randomUUID()
+        val nodeB = UUID.randomUUID()
+        val transportA = CapturingTransport()
+        val transportB = CapturingTransport()
+        val managerA = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeA), transportA, nodeA)
+        val managerB = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeB), transportB, nodeB)
+        val received = mutableListOf<String>()
+        managerA.initialize()
+        managerB.initialize()
+        managerB.setMessageListener { _, message, _, _ -> received += message }
+
+        val first = managerA.sendMessage(nodeB, "ok")
+        val second = managerA.sendMessage(nodeB, "ok")
+
+        val firstId = assertNotNull((first as SendResult.Queued).messageId)
+        val secondId = assertNotNull((second as SendResult.Queued).messageId)
+        assertTrue(firstId != secondId)
+
+        transportA.takeAll().last { it.type == PacketType.HANDSHAKE }.let(managerB::onWifiDirectPacketReceived)
+        transportB.takeSingle(PacketType.HANDSHAKE_ACK).let(managerA::onWifiDirectPacketReceived)
+
+        val sent = transportA.takeAll().filter { it.type == PacketType.MESSAGE }
+        assertEquals(listOf(firstId, secondId), sent.map { it.messageId })
+        sent.forEach(managerB::onWifiDirectPacketReceived)
+        assertEquals(listOf("ok", "ok"), received)
+        assertEquals(0, managerA.getDiagnostics().pendingHandshakeMessages)
+    }
+
+    @Test
+    fun `unsigned broadcast impersonating a known peer is rejected`() {
+        val nodeA = UUID.randomUUID()
+        val nodeB = UUID.randomUUID()
+        val transportA = CapturingTransport()
+        val transportB = CapturingTransport()
+        val managerA = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeA), transportA, nodeA)
+        val managerB = MeshManager(InMemorySecureKeyStorage(), FakeBleTransport(nodeB), transportB, nodeB)
+        val received = mutableListOf<String>()
+        managerA.initialize()
+        managerB.initialize()
+        managerB.setMessageListener { _, message, _, _ -> received += message }
+
+        managerA.initiateHandshakeWith(nodeB)
+        transportA.takeSingle(PacketType.HANDSHAKE).let(managerB::onWifiDirectPacketReceived)
+        transportB.takeSingle(PacketType.HANDSHAKE_ACK).let(managerA::onWifiDirectPacketReceived)
+
+        managerB.onWifiDirectPacketReceived(
+            MeshPacket(
+                type = PacketType.MESSAGE,
+                flags = mesh.protocol.PacketFlags(isEncrypted = false),
+                messageId = UUID.randomUUID(),
+                senderId = nodeA,
+                recipientId = MeshPacket.BROADCAST_ID,
+                timestamp = System.currentTimeMillis(),
+                payload = "forged".toByteArray(),
+                signature = ByteArray(0)
+            )
+        )
+        managerA.broadcastMessage("genuine")
+        transportA.takeAll().filter { it.type == PacketType.MESSAGE }.forEach(managerB::onWifiDirectPacketReceived)
+
+        assertEquals(listOf("genuine"), received)
+    }
+
     private class CapturingTransport : OpportunisticPacketTransmitter {
         private val packets = mutableListOf<MeshPacket>()
 
